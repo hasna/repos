@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { SqliteAdapter } from "@hasna/cloud";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
