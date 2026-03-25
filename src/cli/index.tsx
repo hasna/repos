@@ -4,9 +4,7 @@ import chalk from "chalk";
 import {
   listRepos,
   getRepo,
-  searchRepos,
   listCommits,
-  searchCommits,
   listBranches,
   listTags,
   listPullRequests,
