@@ -1,6 +1,6 @@
 {
   "name": "@hasna/git",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local git intelligence platform for AI agents — track all repos, search commits, PRs, branches across your machine. CLI + MCP + Web dashboard.",
   "type": "module",
   "main": "dist/index.js",
