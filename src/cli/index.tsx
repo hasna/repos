@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { execSync } from "node:child_process";
+import { basename } from "node:path";
 import { program } from "commander";
 import chalk from "chalk";
 import {
@@ -13,11 +14,22 @@ import {
   getGlobalStats,
   getRepoStats,
 } from "../db/repos.js";
-import { scanRepos } from "../lib/scanner.js";
+import { scanRepos, watchRepos } from "../lib/scanner.js";
+import { getFilterAlias } from "../lib/config.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getCrossOrgAuthors, getGraphStats } from "../lib/graph.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg } from "../lib/utils.js";
+
+const ORG_ALIASES: Record<string, string> = {
+  oss: "hasna",
+  xyz: "hasnaxyz",
+  studio: "hasnastudio",
+  tools: "hasnatools",
+  ai: "hasnaai",
+  education: "hasnaeducation",
+  family: "hasnafamily",
+};
 
 program
   .name("repos")
@@ -29,11 +41,23 @@ program
   .command("scan")
   .description("Scan directories to discover and index git repos")
   .option("--root <paths...>", "Root directories to scan")
+  .option("--filter <name>", "Use a saved filter alias to get root paths")
   .option("--full", "Full re-scan (not incremental)")
+  .option("-w, --workers <n>", "Number of parallel workers", "4")
   .option("--json", "Output as JSON")
-  .action((opts) => {
-    const result = scanRepos(opts.root, {
+  .action(async (opts) => {
+    const alias = opts.filter ? getFilterAlias(opts.filter) : undefined;
+    if (opts.filter && !alias) {
+      console.log(chalk.red(`Filter '${opts.filter}' not found in config. Define aliases in ~/.hasna/repos/config.json`));
+      process.exit(1);
+    }
+    const roots = alias?.paths ?? opts.root;
+    if (opts.filter && !roots?.length) {
+      console.log(chalk.yellow(`Filter '${opts.filter}' has no paths defined`));
+    }
+    const result = await scanRepos(roots, {
       full: opts.full,
+      workers: parseInt(opts.workers),
       onProgress: opts.json ? undefined : (msg: string) => console.log(chalk.dim(msg)),
     });
     if (opts.json) {
@@ -47,16 +71,64 @@ program
     }
   });
 
+// ── Watch ──
+program
+  .command("watch")
+  .description("Watch repos for changes and re-index on changes")
+  .option("--root <paths...>", "Root directories to watch")
+  .option("--filter <name>", "Use a saved filter alias to get root paths")
+  .option("--full", "Full re-index on change (not incremental)")
+  .action((opts) => {
+    const alias = opts.filter ? getFilterAlias(opts.filter) : undefined;
+    if (opts.filter && !alias) {
+      console.log(chalk.red(`Filter '${opts.filter}' not found in config.`));
+      process.exit(1);
+    }
+    const roots = alias?.paths ?? opts.root;
+    console.log(chalk.blue("Starting watch mode..."));
+    const watcher = watchRepos(roots, {
+      full: opts.full,
+      onProgress: (msg) => console.log(chalk.dim(msg)),
+      onRepoChanged: async (repoPath) => {
+        console.log(chalk.yellow(`\n→ Re-scanning ${basename(repoPath)}...`));
+        await scanRepos([repoPath], {
+          full: opts.full,
+          onProgress: (msg) => console.log(chalk.dim(`  ${msg}`)),
+        });
+      },
+    });
+
+    process.on("SIGINT", () => {
+      watcher.stop();
+      process.exit(0);
+    });
+  });
+
 // ── Repos ──
 program
   .command("repos")
   .description("List repositories")
-  .option("--org <org>", "Filter by org")
+  .option("--filter <name>", "Use a saved filter alias from config")
+  .option("--org <org>", "Filter by org (also: --oss, --xyz, --studio, --tools, --ai, --education, --family)")
+  .option("--oss", "Filter by hasna org (shorthand)")
+  .option("--xyz", "Filter by hasnaxyz org (shorthand)")
+  .option("--studio", "Filter by hasnastudio org (shorthand)")
+  .option("--tools", "Filter by hasnatools org (shorthand)")
+  .option("--ai", "Filter by hasnaai org (shorthand)")
+  .option("--education", "Filter by hasnaeducation org (shorthand)")
+  .option("--family", "Filter by hasnafamily org (shorthand)")
   .option("-q, --query <query>", "Filter by name")
   .option("-n, --limit <n>", "Max results", "50")
   .option("--json", "Output as JSON")
   .action((opts) => {
-    const repos = listRepos({ org: opts.org, query: opts.query, limit: parseInt(opts.limit) });
+    const alias = opts.filter ? getFilterAlias(opts.filter) : undefined;
+    if (opts.filter && !alias) {
+      console.log(chalk.red(`Filter '${opts.filter}' not found in config. Define aliases in ~/.hasna/repos/config.json`));
+      process.exit(1);
+    }
+    const org = alias?.org ?? (opts.oss ? "hasna" : opts.xyz ? "hasnaxyz" : opts.studio ? "hasnastudio" : opts.tools ? "hasnatools" : opts.ai ? "hasnaai" : opts.education ? "hasnaeducation" : opts.family ? "hasnafamily" : (opts.org ? ORG_ALIASES[opts.org] ?? opts.org : undefined));
+    const query = alias?.query ?? opts.query;
+    const repos = listRepos({ org, query, limit: parseInt(opts.limit) });
     if (opts.json) {
       console.log(JSON.stringify(repos, null, 2));
     } else {
@@ -789,5 +861,118 @@ graph
       }
     }
   });
+
+// ── Shell Completions ──
+const completions = program.command("completions").description("Output shell completion script");
+
+completions
+  .command("bash", { isDefault: true })
+  .description("Generate bash completion script")
+  .action(() => {
+    const cmds = collectCommands(program);
+    const subs = cmds.filter((c) => !c.startsWith("graph ")).map((c) => `"${c}"`).join(" ");
+    console.log(`#!/usr/bin/env bash
+_repos()
+{
+  local cur="\${3}"
+  local cmds="${subs}"
+  COMPREPLY=(\$(compgen -W "\${cmds}" -- "\${cur}"))
+}
+complete -F _repos repos`);
+  });
+
+completions
+  .command("zsh")
+  .description("Generate zsh completion script")
+  .action(() => {
+    const cmds = collectCommands(program).map((c) => `"${c}"`).join("\n");
+    console.log(`#compdef repos
+local -a cmds=(
+${cmds}
+)
+_describe 'command' cmds`);
+  });
+
+completions
+  .command("fish")
+  .description("Generate fish completion script")
+  .action(() => {
+    const cmds = collectCommands(program).map((c) => `    ${c}`).join("\n");
+    console.log(`# fish completion for repos
+complete -c repos -f -a '
+${cmds}
+'`);
+  });
+
+// ── Backup ──
+program
+  .command("backup [path]")
+  .description("Backup the repos database to a file (default: repos-backup-{date}.db)")
+  .option("--json", "Output as JSON")
+  .action(async (path, opts) => {
+    const { getDbPath } = await import("../db/database.js");
+    const { dirname, join } = await import("node:path");
+    const { existsSync, copyFileSync, mkdirSync } = await import("node:fs");
+    const src = getDbPath();
+    const dest = path || join(
+      dirname(src),
+      `repos-backup-${new Date().toISOString().slice(0, 10)}.db`
+    );
+    const destDir = dirname(dest);
+    if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
+    copyFileSync(src, dest);
+    if (opts.json) {
+      console.log(JSON.stringify({ ok: true, source: src, backup: dest }));
+    } else {
+      console.log(chalk.green(`✓ Backed up ${src} → ${dest}`));
+    }
+  });
+
+// ── Restore ──
+program
+  .command("restore <path>")
+  .description("Restore the repos database from a backup file")
+  .option("--force", "Overwrite existing database without prompting")
+  .option("--json", "Output as JSON")
+  .action(async (src, opts) => {
+    const { getDbPath } = await import("../db/database.js");
+    const { existsSync, copyFileSync } = await import("node:fs");
+    if (!existsSync(src)) {
+      const msg = `Backup file not found: ${src}`;
+      if (opts.json) console.log(JSON.stringify({ ok: false, error: msg }));
+      else console.error(chalk.red(msg));
+      process.exit(1);
+    }
+    const dest = getDbPath();
+    if (existsSync(dest) && !opts.force) {
+      process.stdout.write(chalk.yellow(`This will overwrite ${dest}. Continue? [y/N] `));
+      const answer = await new Promise<string>((resolve) => {
+        process.stdin.once("data", (d) => resolve(d.toString().trim()));
+      });
+      if (answer.toLowerCase() !== "y") {
+        if (opts.json) console.log(JSON.stringify({ ok: false, cancelled: true }));
+        else console.log(chalk.yellow("Restore cancelled."));
+        process.exit(0);
+      }
+    }
+    copyFileSync(src, dest);
+    if (opts.json) {
+      console.log(JSON.stringify({ ok: true, restored: dest, from: src }));
+    } else {
+      console.log(chalk.green(`✓ Restored ${dest} from ${src}`));
+    }
+  });
+
+function collectCommands(cmd: any, prefix = ""): string[] {
+  const results: string[] = [];
+  if (cmd.commands) {
+    for (const sub of cmd.commands) {
+      const name = prefix + sub.name();
+      results.push(name);
+      results.push(...collectCommands(sub, name + " "));
+    }
+  }
+  return results;
+}
 
 program.parse();

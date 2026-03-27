@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Search, GitBranch, GitCommit, GitPullRequest, FolderGit2, BarChart3, RefreshCw, ArrowLeft, Tag, Clock } from "lucide-react";
+import { Search, GitBranch, GitCommit, GitPullRequest, FolderGit2, BarChart3, RefreshCw, ArrowLeft, Tag, Clock, AlertTriangle, ArrowUp, ArrowDown, Calendar } from "lucide-react";
 
 const API = "/api";
 
@@ -55,7 +55,14 @@ interface SearchResult {
   date: string | null;
 }
 
-type View = "repos" | "search" | "stats" | "repo-detail" | "timeline";
+interface HealthReport {
+  dirty: Array<{ repo_name: string; modified: number; untracked: number; staged: number }>;
+  unpushed: Array<{ repo_name: string; ahead: number; branch: string }>;
+  behind: Array<{ repo_name: string; behind: number; branch: string }>;
+  stale: Array<{ repo_name: string; days_stale: number }>;
+}
+
+type View = "repos" | "search" | "stats" | "repo-detail" | "timeline" | "health";
 
 export function App() {
   const [view, setView] = useState<View>("repos");
@@ -70,10 +77,30 @@ export function App() {
   const [repoBranches, setRepoBranches] = useState<Branch[]>([]);
   const [repoDetail, setRepoDetail] = useState<any>(null);
   const [timeline, setTimeline] = useState<Commit[]>([]);
+  const [healthReport, setHealthReport] = useState<HealthReport | null>(null);
 
   useEffect(() => {
     fetch(`${API}/repos?limit=500`).then((r) => r.json()).then(setRepos);
     fetch(`${API}/stats`).then((r) => r.json()).then(setStats);
+    fetch(`${API}/health`).then((r) => r.json()).then(setHealthReport);
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${protocol}//${window.location.host}`);
+    ws.onmessage = (evt) => {
+      try {
+        const { event } = JSON.parse(evt.data);
+        if (event === "scan:complete") {
+          Promise.all([fetch(`${API}/repos?limit=500`), fetch(`${API}/stats`)]).then(
+            ([r1, r2]) => Promise.all([r1.json(), r2.json()])
+          ).then(([reposData, statsData]) => {
+            setRepos(reposData);
+            setStats(statsData);
+          });
+          setScanning(false);
+        }
+      } catch { /* ignore */ }
+    };
+    return () => ws.close();
   }, []);
 
   const doSearch = async () => {
@@ -86,10 +113,6 @@ export function App() {
   const doScan = async () => {
     setScanning(true);
     await fetch(`${API}/scan`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    const [reposRes, statsRes] = await Promise.all([fetch(`${API}/repos?limit=500`), fetch(`${API}/stats`)]);
-    setRepos(await reposRes.json());
-    setStats(await statsRes.json());
-    setScanning(false);
   };
 
   const openRepo = async (repo: Repo) => {
@@ -148,6 +171,7 @@ export function App() {
         {[
           { key: "repos" as View, label: "Repos", icon: FolderGit2, count: stats?.total_repos },
           { key: "timeline" as View, label: "Timeline", icon: Clock },
+          { key: "health" as View, label: "Health", icon: AlertTriangle },
           { key: "search" as View, label: "Search", icon: Search },
           { key: "stats" as View, label: "Stats", icon: BarChart3 },
         ].map(({ key, label, icon: Icon, count }) => (
@@ -310,6 +334,94 @@ export function App() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Health View */}
+      {view === "health" && healthReport && (
+        <div className="space-y-6">
+          {healthReport.dirty.length > 0 && (
+            <div className="p-4 rounded border" style={{ background: "var(--card)", borderColor: "#ef4444" }}>
+              <h3 className="font-medium mb-3 flex items-center gap-2" style={{ color: "#ef4444" }}>
+                <AlertTriangle className="w-4 h-4" /> Dirty Repos ({healthReport.dirty.length})
+              </h3>
+              <div className="space-y-2">
+                {healthReport.dirty.map((r) => (
+                  <div key={r.repo_name} className="text-sm p-2 rounded" style={{ background: "var(--bg)" }}>
+                    <div className="font-medium">{r.repo_name}</div>
+                    <div className="text-xs flex gap-3 mt-1" style={{ color: "var(--muted)" }}>
+                      {r.modified > 0 && <span style={{ color: "#f97316" }}>{r.modified} modified</span>}
+                      {r.untracked > 0 && <span style={{ color: "#eab308" }}>{r.untracked} untracked</span>}
+                      {r.staged > 0 && <span style={{ color: "#22c55e" }}>{r.staged} staged</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {healthReport.unpushed.length > 0 && (
+            <div className="p-4 rounded border" style={{ background: "var(--card)", borderColor: "#f97316" }}>
+              <h3 className="font-medium mb-3 flex items-center gap-2" style={{ color: "#f97316" }}>
+                <ArrowUp className="w-4 h-4" /> Unpushed Repos ({healthReport.unpushed.length})
+              </h3>
+              <div className="space-y-2">
+                {healthReport.unpushed.map((r) => (
+                  <div key={r.repo_name} className="text-sm p-2 rounded flex items-center justify-between" style={{ background: "var(--bg)" }}>
+                    <span className="font-medium">{r.repo_name}</span>
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-mono px-1.5 py-0.5 rounded" style={{ background: "#f9731620", color: "#f97316" }}>{r.branch}</span>
+                      <span style={{ color: "#f97316" }}>{r.ahead} ahead</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {healthReport.behind.length > 0 && (
+            <div className="p-4 rounded border" style={{ background: "var(--card)", borderColor: "#eab308" }}>
+              <h3 className="font-medium mb-3 flex items-center gap-2" style={{ color: "#eab308" }}>
+                <ArrowDown className="w-4 h-4" /> Behind Remote ({healthReport.behind.length})
+              </h3>
+              <div className="space-y-2">
+                {healthReport.behind.map((r) => (
+                  <div key={r.repo_name} className="text-sm p-2 rounded flex items-center justify-between" style={{ background: "var(--bg)" }}>
+                    <span className="font-medium">{r.repo_name}</span>
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-mono px-1.5 py-0.5 rounded" style={{ background: "#eab30820", color: "#eab308" }}>{r.branch}</span>
+                      <span style={{ color: "#eab308" }}>{r.behind} behind</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {healthReport.stale.length > 0 && (
+            <div className="p-4 rounded border" style={{ background: "var(--card)", borderColor: "#a855f7" }}>
+              <h3 className="font-medium mb-3 flex items-center gap-2" style={{ color: "#a855f7" }}>
+                <Calendar className="w-4 h-4" /> Stale Repos ({healthReport.stale.length})
+              </h3>
+              <div className="space-y-2">
+                {healthReport.stale.map((r) => (
+                  <div key={r.repo_name} className="text-sm p-2 rounded flex items-center justify-between" style={{ background: "var(--bg)" }}>
+                    <span className="font-medium">{r.repo_name}</span>
+                    <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "#a855f720", color: "#a855f7" }}>
+                      {r.days_stale} days inactive
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {healthReport.dirty.length === 0 && healthReport.unpushed.length === 0 && healthReport.behind.length === 0 && healthReport.stale.length === 0 && (
+            <div className="p-8 text-center rounded border" style={{ background: "var(--card)", borderColor: "var(--border)" }}>
+              <p className="text-lg font-medium" style={{ color: "#22c55e" }}>All repos healthy</p>
+              <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>No dirty, unpushed, behind, or stale repos</p>
+            </div>
+          )}
         </div>
       )}
 

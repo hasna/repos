@@ -16,7 +16,7 @@ function findNearestReposDb(startDir: string): string | null {
   return null;
 }
 
-function getDbPath(): string {
+export function getDbPath(): string {
   if (process.env["HASNA_REPOS_DB_PATH"]) {
     return process.env["HASNA_REPOS_DB_PATH"];
   }

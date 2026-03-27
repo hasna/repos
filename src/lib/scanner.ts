@@ -1,7 +1,9 @@
 import { execSync } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync, watch } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import cliProgress from "cli-progress";
 import { getDb } from "../db/database.js";
+import { getConfig } from "./config.js";
 import {
   upsertRepo,
   bulkInsertCommits,
@@ -28,36 +30,35 @@ function isGitRepo(dir: string): boolean {
   return existsSync(join(dir, ".git"));
 }
 
-function discoverRepos(rootDirs: string[], maxDepth = 5): string[] {
+function discoverRepos(rootDirs: string[], maxDepth?: number): string[] {
+  const cfg = getConfig();
+  const depth = maxDepth ?? cfg.scanDepth ?? 5;
+  const excluded = new Set(cfg.excludedPaths ?? ["node_modules", "dist", "vendor", ".git"]);
   const repos: string[] = [];
   const visited = new Set<string>();
 
-  function walk(dir: string, depth: number) {
-    if (depth > maxDepth) return;
+  function walk(dir: string, d: number) {
+    if (d > depth) return;
     const realDir = resolve(dir);
     if (visited.has(realDir)) return;
     visited.add(realDir);
 
     if (isGitRepo(realDir)) {
       repos.push(realDir);
-      return; // Don't recurse into git repos (skip submodules for now)
+      return;
     }
 
     try {
       const entries = readdirSync(realDir);
       for (const entry of entries) {
-        if (entry.startsWith(".") || entry === "node_modules" || entry === "dist" || entry === "vendor") continue;
+        if (entry.startsWith(".") || excluded.has(entry)) continue;
         const full = join(realDir, entry);
         try {
           const stat = statSync(full);
-          if (stat.isDirectory()) walk(full, depth + 1);
-        } catch {
-          // Permission denied, broken symlink, etc.
-        }
+          if (stat.isDirectory()) walk(full, d + 1);
+        } catch { /* permission denied, broken symlink */ }
       }
-    } catch {
-      // Can't read directory
-    }
+    } catch { /* can't read directory */ }
   }
 
   for (const root of rootDirs) {
@@ -96,7 +97,8 @@ function indexRepo(repoPath: string, full = false): {
   const isNew = !existing;
 
   // Get commit count limit — full scan gets all, incremental gets last 100
-  const commitLimit = full || isNew ? 5000 : 100;
+  const cfg = getConfig();
+  const commitLimit = full || isNew ? (cfg.commitLimit ?? 5000) : (cfg.incrementalCommitLimit ?? 100);
   const sinceClause = !full && existing?.last_scanned
     ? `--since="${existing.last_scanned}"`
     : "";
@@ -164,13 +166,32 @@ function indexRepo(repoPath: string, full = false): {
     for (const line of branchOutput.split("\n")) {
       const parts = line.replace(/'/g, "").split("|");
       if (!parts[0]) continue;
+      const branchName = parts[0];
+      const isRemote = branchName.startsWith("origin/") || branchName.includes("/");
+      let ahead = 0;
+      let behind = 0;
+
+      if (!isRemote && !branchName.startsWith("HEAD")) {
+        const trackingBranch = branchName === defaultBranch
+          ? `origin/${defaultBranch}`
+          : null;
+        if (trackingBranch) {
+          const revlist = git(repoPath, `rev-list --left-right --count ${branchName}...${trackingBranch}`);
+          if (revlist) {
+            const counts = revlist.split("\t");
+            ahead = parseInt(counts[0] ?? "0", 10) || 0;
+            behind = parseInt(counts[1] ?? "0", 10) || 0;
+          }
+        }
+      }
+
       branchEntries.push({
-        name: parts[0],
-        is_remote: parts[0].startsWith("origin/") || parts[0].includes("/"),
+        name: branchName,
+        is_remote: isRemote,
         last_commit_sha: parts[1] || null,
         last_commit_date: parts[2] || null,
-        ahead: 0,
-        behind: 0,
+        ahead,
+        behind,
       });
     }
   }
@@ -234,18 +255,28 @@ function indexRepo(repoPath: string, full = false): {
   return { commits: commitsInserted, branches: branchesInserted, tags: tagsInserted, isNew };
 }
 
-export function scanRepos(
+export async function scanRepos(
   rootDirs?: string[],
-  opts: { full?: boolean; onProgress?: (msg: string) => void } = {}
-): ScanResult {
+  opts: { full?: boolean; onProgress?: (msg: string) => void; workers?: number } = {}
+): Promise<ScanResult> {
   const start = Date.now();
   const home = process.env["HOME"] || process.env["USERPROFILE"] || "~";
   const roots = rootDirs || [join(home, "Workspace")];
-  const { full = false, onProgress } = opts;
+  const { full = false, onProgress, workers: maxWorkers = 4 } = opts;
 
   onProgress?.(`Discovering repos in: ${roots.join(", ")}`);
   const repoPaths = discoverRepos(roots);
-  onProgress?.(`Found ${repoPaths.length} repositories`);
+  onProgress?.(`Found ${repoPaths.length} repositories (using ${maxWorkers} workers)`);
+
+  const progressBar = new cliProgress.SingleBar({
+    format: "  indexing [{bar}] {percentage}% | {value}/{total} | {filename}",
+    hideCursor: true,
+    noTTYOutput: !!onProgress,
+  });
+
+  if (repoPaths.length > 0) {
+    progressBar.start(repoPaths.length, 0, { filename: "" });
+  }
 
   let repos_new = 0;
   let repos_updated = 0;
@@ -253,21 +284,30 @@ export function scanRepos(
   let branches_indexed = 0;
   let tags_indexed = 0;
 
-  for (let i = 0; i < repoPaths.length; i++) {
-    const repoPath = repoPaths[i]!;
-    onProgress?.(`[${i + 1}/${repoPaths.length}] Indexing ${basename(repoPath)}...`);
+  const chunks: string[][] = [];
+  for (let i = 0; i < repoPaths.length; i += maxWorkers) {
+    chunks.push(repoPaths.slice(i, i + maxWorkers));
+  }
 
-    try {
-      const result = indexRepo(repoPath, full);
-      if (result.isNew) repos_new++;
-      else repos_updated++;
-      commits_indexed += result.commits;
-      branches_indexed += result.branches;
-      tags_indexed += result.tags;
-    } catch (err) {
-      onProgress?.(`  ⚠ Failed to index ${repoPath}: ${err}`);
+  let completed = 0;
+  for (const chunk of chunks) {
+    const results = await Promise.allSettled(
+      chunk.map((repoPath) => indexRepo(repoPath, full))
+    );
+    for (const result of results) {
+      completed++;
+      if (result.status === "fulfilled") {
+        if (result.value.isNew) repos_new++;
+        else repos_updated++;
+        commits_indexed += result.value.commits;
+        branches_indexed += result.value.branches;
+        tags_indexed += result.value.tags;
+      }
+      progressBar.increment({ filename: basename(repoPaths[completed - 1]!) });
     }
   }
+
+  progressBar.stop();
 
   return {
     repos_found: repoPaths.length,
@@ -277,5 +317,58 @@ export function scanRepos(
     branches_indexed,
     tags_indexed,
     duration_ms: Date.now() - start,
+  };
+}
+
+export function watchRepos(
+  rootDirs?: string[],
+  opts: {
+    full?: boolean;
+    onProgress?: (msg: string) => void;
+    onRepoChanged?: (repoPath: string) => Promise<void> | void;
+  } = {}
+): { stop: () => void } {
+  const home = process.env["HOME"] || process.env["USERPROFILE"] || "~";
+  const roots = rootDirs || [join(home, "Workspace")];
+
+  const repoPaths = discoverRepos(roots);
+  const watchedDirs = new Set<string>();
+
+  for (const repoPath of repoPaths) {
+    watchedDirs.add(repoPath);
+    watch(repoPath, { recursive: true }, (_eventType, filename) => {
+      if (filename && !filename.includes(".git/objects")) {
+        opts.onProgress?.(`[change] ${filename} in ${basename(repoPath)}`);
+        const cb = opts.onRepoChanged?.(repoPath);
+        if (cb instanceof Promise) cb.catch(() => {});
+      }
+    });
+  }
+
+  for (const root of roots) {
+    watch(root, { recursive: true }, (_eventType, filename) => {
+      if (filename && filename.endsWith(".git") && !watchedDirs.has(resolve(root, filename))) {
+        const newRepoPath = resolve(root, filename.replace("/.git", ""));
+        if (existsSync(newRepoPath)) {
+          opts.onProgress?.(`[new] Discovered new repo: ${basename(newRepoPath)}`);
+          watchedDirs.add(newRepoPath);
+          watch(newRepoPath, { recursive: true }, (et, fn) => {
+            if (fn && !fn.includes(".git/objects")) {
+              opts.onProgress?.(`[${et}] ${fn} in ${basename(newRepoPath)}`);
+              const cb = opts.onRepoChanged?.(newRepoPath);
+              if (cb instanceof Promise) cb.catch(() => {});
+            }
+          });
+        }
+      }
+    });
+  }
+
+  opts.onProgress?.(`Watching ${repoPaths.length} repos for changes...`);
+
+  return {
+    stop: () => {
+      opts.onProgress?.("Stopped watching repos");
+    },
   };
 }

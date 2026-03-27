@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { ServerWebSocket } from "bun";
 import {
   listRepos,
   getRepo,
@@ -15,8 +16,18 @@ import {
   getRepoStats,
 } from "../db/repos.js";
 import { scanRepos } from "../lib/scanner.js";
+import { getHealthReport } from "../lib/utils.js";
 
 const PORT = parseInt(process.env["REPOS_PORT"] || "19450");
+
+const clients = new Set<ServerWebSocket>();
+
+function broadcast(event: string, data?: unknown) {
+  const msg = JSON.stringify({ event, data });
+  for (const ws of clients) {
+    ws.send(msg);
+  }
+}
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -42,6 +53,21 @@ const dashboardDir = join(import.meta.dir, "../../dashboard/dist");
 
 Bun.serve({
   port: PORT,
+  websocket: {
+    open(ws) {
+      clients.add(ws);
+      ws.send(JSON.stringify({ event: "connected", data: { status: "ok" } }));
+    },
+    close(ws) {
+      clients.delete(ws);
+    },
+    message(ws, msg: string | Buffer) {
+      try {
+        const { event } = JSON.parse(msg.toString());
+        if (event === "ping") ws.send(JSON.stringify({ event: "pong" }));
+      } catch { /* ignore malformed */ }
+    },
+  },
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -122,9 +148,14 @@ Bun.serve({
       return json(getGlobalStats());
     }
 
+    if (path === "/api/health" && req.method === "GET") {
+      return json(getHealthReport());
+    }
+
     if (path === "/api/scan" && req.method === "POST") {
       const body = req.headers.get("content-type")?.includes("json") ? await req.json() : {};
-      const result = scanRepos(body.roots, { full: body.full });
+      const result = await scanRepos(body.roots, { full: body.full });
+      broadcast("scan:complete", result);
       return json(result);
     }
 

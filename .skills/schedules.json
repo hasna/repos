@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "schedules": [
+    {
+      "id": "reminder-open-repos-1774525588630",
+      "name": "open-repos reminder",
+      "skill": "reminder-open-repos",
+      "cron": "* * * * *",
+      "enabled": true,
+      "createdAt": "2026-03-26T11:46:28.630Z",
+      "nextRun": "2026-03-26T11:47:00.000Z"
+    }
+  ]
+}
