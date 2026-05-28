@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { buildServer, prepareMcpLifecycle, VERSION } from "./server.js";
-import { isHttpMode, resolveMcpHttpPort, startMcpHttpServer } from "./http.js";
+import { isStdioMode, resolveMcpHttpPort, startMcpHttpServer } from "./http.js";
 
 function handleCliFlags(argv: string[]): boolean {
   if (argv.includes("--help") || argv.includes("-h")) {
@@ -37,14 +37,14 @@ if (handleCliFlags(argv)) {
 async function main() {
   await prepareMcpLifecycle();
 
-  if (isHttpMode(argv)) {
-    startMcpHttpServer({ port: resolveMcpHttpPort(argv) });
+  if (isStdioMode(argv)) {
+    const server = buildServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
     return;
   }
-
-  const server = buildServer();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // Default: shared Streamable HTTP server (one process per MCP, many agents).
+  startMcpHttpServer({ port: resolveMcpHttpPort(argv) });
 }
 
 main().catch(console.error);
