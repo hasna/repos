@@ -296,11 +296,21 @@ server.tool("list_agents", "List registered agents", {}, async () => {
 }
 
 export async function prepareMcpLifecycle(): Promise<{ stop: () => void }> {
-  const worker = await startAutoIndexWorker(undefined, {
-    onProgress: (msg) => console.error(`[auto-index] ${msg}`),
-  });
-  const stop = () => worker.stop();
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
-  return { stop };
+  if (process.env.REPOS_DISABLE_AUTO_INDEX === "1") {
+    return { stop: () => {} };
+  }
+  try {
+    const worker = await startAutoIndexWorker(undefined, {
+      onProgress: (msg) => console.error(`[auto-index] ${msg}`),
+    });
+    const stop = () => worker.stop();
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+    return { stop };
+  } catch (err) {
+    // Auto-index is best-effort — broken symlinks in the workspace must not
+    // take down the MCP server. Log and continue.
+    console.error(`[auto-index] disabled due to error: ${err instanceof Error ? err.message : String(err)}`);
+    return { stop: () => {} };
+  }
 }
