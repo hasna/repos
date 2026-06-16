@@ -1,6 +1,6 @@
 {
   "name": "@hasna/repos",
-  "version": "0.1.9",
+  "version": "0.1.11",
   "description": "Local repo intelligence platform for AI agents — track all repos, search commits, PRs, branches across your machine. CLI + MCP + Web dashboard.",
   "type": "module",
   "main": "dist/index.js",
@@ -67,7 +67,8 @@
   "author": "Andrei Hasna <andrei@hasna.com>",
   "license": "Apache-2.0",
   "dependencies": {
-    "@hasna/cloud": "^0.1.8",
+    "@hasna/cloud": "0.1.8",
+    "@hasna/events": "^0.1.6",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "chalk": "^5.4.1",
     "cli-progress": "^3.12.0",

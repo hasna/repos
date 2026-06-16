@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { registerEventsCommands } from "@hasna/events/commander";
 import { execSync } from "node:child_process";
 import { program } from "commander";
 import { getCliVersion } from "./version.js";
@@ -1032,4 +1033,5 @@ function collectCommands(cmd: any, prefix = ""): string[] {
 }
 
 await bootstrapCliIfNeeded(process.argv.slice(2));
+registerEventsCommands(program, { source: "repos" });
 await program.parseAsync(process.argv);
