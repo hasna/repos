@@ -4,6 +4,8 @@ export { ensureWorkspaceBootstrap, startAutoIndexWorker, syncRepoCatalog } from 
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
 export { discoverRepos, scanRepoPaths, scanRepos, watchRepos } from "./lib/scanner.js";
 export { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "./lib/github.js";
+export { getReposStatus } from "./lib/status.js";
+export type { ReposStatusContract } from "./lib/status.js";
 export {
   listRepos,
   getRepo,

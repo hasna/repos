@@ -18,6 +18,7 @@ import {
 } from "../db/repos.js";
 import { ensureWorkspaceBootstrap, startAutoIndexWorker } from "../lib/auto-index.js";
 import { getFilterAlias } from "../lib/config.js";
+import { getReposStatus } from "../lib/status.js";
 import { formatRepoNotFoundMessage } from "./messages.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
@@ -416,6 +417,26 @@ program
         }
       }
     }
+  });
+
+// ── Status ──
+program
+  .command("status")
+  .description("Show metadata-only workspace inventory status")
+  .option("--json", "Output as JSON")
+  .action((opts) => {
+    const status = getReposStatus();
+    if (opts.json) {
+      console.log(JSON.stringify(status, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold("Workspace Inventory Status"));
+    console.log(`  Package:  ${status.package.version}`);
+    console.log(`  Repos:    ${status.counts.repos.total} (${status.counts.repos.scanned} scanned, ${status.counts.repos.unscanned} unscanned)`);
+    console.log(`  Remotes:  ${status.counts.repos.withRemote} configured, ${status.counts.repos.withCredentialLikeRemote} credential-like`);
+    console.log(`  Commits:  ${status.counts.commits}`);
+    console.log(`  Branches: ${status.counts.branches.total}`);
   });
 
 // ── Analytics ──
