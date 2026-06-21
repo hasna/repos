@@ -1,11 +1,11 @@
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getDb } from "../db/database.js";
 
-function git(repoPath: string, args: string, timeout = 10_000): string {
+function git(repoPath: string, args: string[], timeout = 10_000): string {
   try {
-    return execSync(`git -C "${repoPath}" ${args}`, {
+    return execFileSync("git", ["-C", repoPath, ...args], {
       encoding: "utf-8",
       timeout,
       maxBuffer: 10 * 1024 * 1024,
@@ -28,7 +28,7 @@ export function findFile(filename: string, limit = 50): Array<{
   const results: Array<{ repo_name: string; repo_path: string; matches: string[] }> = [];
 
   for (const repo of repos) {
-    const output = git(repo.path, `ls-files "*${filename}*"`, 5000);
+    const output = git(repo.path, ["ls-files", `*${filename}*`], 5000);
     if (output) {
       const matches = output.split("\n").filter(Boolean);
       if (matches.length > 0) {
@@ -149,7 +149,7 @@ export function getDirtyRepos(): Array<{
   const dirty: Array<{ repo_name: string; repo_path: string; modified: number; untracked: number; staged: number }> = [];
 
   for (const repo of repos) {
-    const status = git(repo.path, "status --porcelain", 5000);
+    const status = git(repo.path, ["status", "--porcelain"], 5000);
     if (!status) continue;
 
     let modified = 0, untracked = 0, staged = 0;
@@ -180,9 +180,9 @@ export function getUnpushedRepos(): Array<{
   const unpushed: Array<{ repo_name: string; repo_path: string; ahead: number; branch: string }> = [];
 
   for (const repo of repos) {
-    const branch = git(repo.path, "symbolic-ref --short HEAD", 3000);
+    const branch = git(repo.path, ["symbolic-ref", "--short", "HEAD"], 3000);
     if (!branch) continue;
-    const aheadStr = git(repo.path, `rev-list --count @{upstream}..HEAD`, 3000);
+    const aheadStr = git(repo.path, ["rev-list", "--count", "@{upstream}..HEAD"], 3000);
     const ahead = parseInt(aheadStr) || 0;
     if (ahead > 0) {
       unpushed.push({ repo_name: repo.name, repo_path: repo.path, ahead, branch });
@@ -205,10 +205,10 @@ export function getBehindRepos(fetch = false): Array<{
   const behindRepos: Array<{ repo_name: string; repo_path: string; behind: number; branch: string }> = [];
 
   for (const repo of repos) {
-    if (fetch) git(repo.path, "fetch --quiet", 10000);
-    const branch = git(repo.path, "symbolic-ref --short HEAD", 3000);
+    if (fetch) git(repo.path, ["fetch", "--quiet"], 10000);
+    const branch = git(repo.path, ["symbolic-ref", "--short", "HEAD"], 3000);
     if (!branch) continue;
-    const behindStr = git(repo.path, `rev-list --count HEAD..@{upstream}`, 3000);
+    const behindStr = git(repo.path, ["rev-list", "--count", "HEAD..@{upstream}"], 3000);
     const behind = parseInt(behindStr) || 0;
     if (behind > 0) {
       behindRepos.push({ repo_name: repo.name, repo_path: repo.path, behind, branch });
@@ -307,7 +307,7 @@ export function getChurn(days = 30, limit = 20): Array<{
   const fileChanges = new Map<string, { repo_name: string; count: number }>();
 
   for (const repo of repos) {
-    const output = git(repo.path, `log --since="${days} days ago" --name-only --pretty=format: --diff-filter=M`, 10000);
+    const output = git(repo.path, ["log", `--since=${days} days ago`, "--name-only", "--pretty=format:", "--diff-filter=M"], 10000);
     if (!output) continue;
     for (const file of output.split("\n").filter(Boolean)) {
       const key = `${repo.name}:${file}`;
@@ -377,8 +377,11 @@ export function importFromOrg(org: string, targetDir: string, opts: { onProgress
 
   let output: string;
   try {
-    output = execSync(`gh repo list ${org} --limit 500 --json name,sshUrl,isArchived --no-archived`, {
-      encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"],
+    output = execFileSync("gh", ["repo", "list", org, "--limit", "500", "--json", "name,sshUrl,isArchived", "--no-archived"], {
+      encoding: "utf-8",
+      timeout: 30000,
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["pipe", "pipe", "pipe"],
     }).trim();
   } catch {
     return { cloned: 0, skipped: 0, errors: ["Failed to list repos from GitHub"] };
@@ -396,7 +399,7 @@ export function importFromOrg(org: string, targetDir: string, opts: { onProgress
     }
     opts.onProgress?.(`  Cloning ${ghRepo.name}...`);
     try {
-      execSync(`git clone "${ghRepo.sshUrl}" "${dest}"`, { timeout: 60000, stdio: ["pipe", "pipe", "pipe"] });
+      execFileSync("git", ["clone", ghRepo.sshUrl, dest], { timeout: 60000, stdio: ["pipe", "pipe", "pipe"] });
       cloned++;
     } catch (err) {
       errors.push(`${ghRepo.name}: ${err}`);
