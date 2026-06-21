@@ -1,8 +1,13 @@
 export function parseIntOption(value: string, flagName: string, min = 0): number {
-  const parsed = Number.parseInt(value, 10);
+  const normalized = value.trim();
 
-  if (!Number.isFinite(parsed) || Number.isNaN(parsed)) {
+  if (!/^-?\d+$/.test(normalized)) {
     throw new Error(`Invalid value for ${flagName}: '${value}' is not an integer`);
+  }
+
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`Invalid value for ${flagName}: '${value}' is not a safe integer`);
   }
 
   if (parsed < min) {
