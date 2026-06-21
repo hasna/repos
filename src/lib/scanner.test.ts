@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterAll } from "bun:test";
 import { execSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
 import { scanRepos } from "./scanner";
@@ -131,6 +131,22 @@ describe("scanner", () => {
     const result = await scanRepos([TEST_DIR]);
     expect(result.repos_found).toBe(1);
     expect(result.commits_indexed).toBe(0);
+  });
+
+  it("should scan repos whose paths contain shell metacharacters without executing them", async () => {
+    const markerName = `scanner-injection-marker-${process.pid}`;
+    const markerPath = join(process.cwd(), markerName);
+    const repoName = `quoted"; touch ${markerName}; #`;
+    createTestRepo(repoName, 1);
+
+    try {
+      const result = await scanRepos([TEST_DIR]);
+      expect(result.repos_found).toBe(1);
+      expect(result.commits_indexed).toBe(1);
+      expect(existsSync(markerPath)).toBe(false);
+    } finally {
+      rmSync(markerPath, { force: true });
+    }
   });
 
   it("should set default branch", async () => {

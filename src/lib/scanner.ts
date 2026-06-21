@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, statSync, watch } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import cliProgress from "cli-progress";
@@ -13,9 +13,9 @@ import {
 } from "../db/repos.js";
 import type { ScanResult } from "../types/index.js";
 
-function git(repoPath: string, args: string): string {
+function git(repoPath: string, args: string[]): string {
   try {
-    return execSync(`git -C "${repoPath}" ${args}`, {
+    return execFileSync("git", ["-C", repoPath, ...args], {
       encoding: "utf-8",
       timeout: 30_000,
       maxBuffer: 50 * 1024 * 1024,
@@ -88,8 +88,8 @@ function indexRepo(repoPath: string, full = false): {
   const name = basename(repoPath);
 
   // Get remote URL and default branch
-  const remoteUrl = git(repoPath, "remote get-url origin") || null;
-  const defaultBranch = git(repoPath, "symbolic-ref --short HEAD") || "main";
+  const remoteUrl = git(repoPath, ["remote", "get-url", "origin"]) || null;
+  const defaultBranch = git(repoPath, ["symbolic-ref", "--short", "HEAD"]) || "main";
   const org = extractOrg(remoteUrl);
 
   // Check if repo already exists
@@ -99,9 +99,9 @@ function indexRepo(repoPath: string, full = false): {
   // Get commit count limit — full scan gets all, incremental gets last 100
   const cfg = getConfig();
   const commitLimit = full || isNew ? (cfg.commitLimit ?? 5000) : (cfg.incrementalCommitLimit ?? 100);
-  const sinceClause = !full && existing?.last_scanned
-    ? `--since="${existing.last_scanned}"`
-    : "";
+  const sinceArgs = !full && existing?.last_scanned
+    ? [`--since=${existing.last_scanned}`]
+    : [];
 
   // Upsert repo
   const repo = upsertRepo({
@@ -114,7 +114,14 @@ function indexRepo(repoPath: string, full = false): {
   });
 
   // Index commits
-  const commitLog = git(repoPath, `log --format="%H|%an|%ae|%aI|%s" --shortstat ${sinceClause} -n ${commitLimit}`);
+  const commitLog = git(repoPath, [
+    "log",
+    "--format=%H|%an|%ae|%aI|%s",
+    "--shortstat",
+    ...sinceArgs,
+    "-n",
+    String(commitLimit),
+  ]);
   const commitEntries: Array<{
     sha: string; author_name: string; author_email: string;
     date: string; message: string; files_changed: number;
@@ -156,7 +163,11 @@ function indexRepo(repoPath: string, full = false): {
   );
 
   // Index branches
-  const branchOutput = git(repoPath, "branch -a --format='%(refname:short)|%(objectname:short)|%(committerdate:iso8601)'");
+  const branchOutput = git(repoPath, [
+    "branch",
+    "-a",
+    "--format=%(refname:short)|%(objectname:short)|%(committerdate:iso8601)",
+  ]);
   const branchEntries: Array<{
     name: string; is_remote: boolean; last_commit_sha: string | null;
     last_commit_date: string | null; ahead: number; behind: number;
@@ -176,7 +187,12 @@ function indexRepo(repoPath: string, full = false): {
           ? `origin/${defaultBranch}`
           : null;
         if (trackingBranch) {
-          const revlist = git(repoPath, `rev-list --left-right --count ${branchName}...${trackingBranch}`);
+          const revlist = git(repoPath, [
+            "rev-list",
+            "--left-right",
+            "--count",
+            `${branchName}...${trackingBranch}`,
+          ]);
           if (revlist) {
             const counts = revlist.split("\t");
             ahead = parseInt(counts[0] ?? "0", 10) || 0;
@@ -201,7 +217,11 @@ function indexRepo(repoPath: string, full = false): {
   );
 
   // Index tags
-  const tagOutput = git(repoPath, "tag -l --format='%(refname:short)|%(objectname:short)|%(creatordate:iso8601)|%(subject)'");
+  const tagOutput = git(repoPath, [
+    "tag",
+    "-l",
+    "--format=%(refname:short)|%(objectname:short)|%(creatordate:iso8601)|%(subject)",
+  ]);
   const tagEntries: Array<{ name: string; sha: string; date: string | null; message: string | null }> = [];
 
   if (tagOutput) {
@@ -222,7 +242,7 @@ function indexRepo(repoPath: string, full = false): {
   );
 
   // Index remotes
-  const remoteOutput = git(repoPath, "remote -v");
+  const remoteOutput = git(repoPath, ["remote", "-v"]);
   const remoteMap = new Map<string, { name: string; url: string; fetch_url: string | null }>();
 
   if (remoteOutput) {
