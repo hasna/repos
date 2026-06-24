@@ -21,6 +21,7 @@ import { getFilterAlias } from "../lib/config.js";
 import { getReposStatus } from "../lib/status.js";
 import { formatRepoNotFoundMessage } from "./messages.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
+import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getCrossOrgAuthors, getGraphStats } from "../lib/graph.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg, fuzzyFindRepo } from "../lib/utils.js";
@@ -65,6 +66,16 @@ function intFlag(value: string, flagName: string, min = 0) {
     console.error(chalk.red((error as Error).message));
     process.exit(1);
   }
+}
+
+function optionalIntFlag(value: string | undefined, flagName: string, min = 0) {
+  return value === undefined ? undefined : intFlag(value, flagName, min);
+}
+
+function csvFlag(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const parts = value.split(",").map((part) => part.trim()).filter(Boolean);
+  return parts.length > 0 ? parts : undefined;
 }
 
 async function bootstrapCliIfNeeded(argv: string[]) {
@@ -558,6 +569,83 @@ program
           console.log(chalk.yellow(`  ${result.errors.length} errors (repos without GitHub remote)`));
         }
       }
+    }
+  });
+
+program
+  .command("gh-catalog")
+  .description("Enumerate the GitHub repository catalog for OpenLoops")
+  .option("--sync", "Fetch GitHub repositories before listing")
+  .option("--cache-only", "Read cache only; fail if combined with --sync")
+  .option("--resume", "Resume from cached nextCursor when syncing")
+  .option("--cursor <page>", "GitHub API page cursor to start from")
+  .option("--max-pages <n>", "Maximum GitHub pages to sync this run")
+  .option("--page-size <n>", "GitHub page size, max 100", "100")
+  .option("--cache <path>", "Catalog cache path")
+  .option("--stale-minutes <n>", "Minutes until synced cache is stale", "60")
+  .option("--min-remaining <n>", "Minimum GitHub core rate-limit calls to preserve", "1")
+  .option("--org <org>", "Filter by GitHub org/account")
+  .option("--repo <repo>", "Filter by repo name or owner/name")
+  .option("--language <language>", "Filter by primary language")
+  .option("--package-scope <scope>", "Filter by package scope, for example @hasna")
+  .option("--local-path <path>", "Filter by matched local workspace path prefix")
+  .option("--tags <tags>", "Comma-separated topic or loop tag filters")
+  .option("--include-archived", "Include archived repositories")
+  .option("--include-disabled", "Include disabled repositories")
+  .option("-n, --limit <n>", "Max records to return", "100")
+  .option("-o, --offset <n>", "Skip first N matched records", "0")
+  .option("--json", "Output as JSON")
+  .action((opts) => {
+    if (opts.sync && opts.cacheOnly) {
+      console.error(chalk.red("Error: --sync and --cache-only cannot be combined"));
+      process.exit(1);
+    }
+
+    try {
+      const envelope = enumerateGithubRepoCatalog({
+        cachePath: opts.cache,
+        sync: Boolean(opts.sync),
+        resume: Boolean(opts.resume),
+        cursor: opts.cursor,
+        maxPages: optionalIntFlag(opts.maxPages, "--max-pages", 1),
+        pageSize: optionalIntFlag(opts.pageSize, "--page-size", 1),
+        staleMs: intFlag(opts.staleMinutes, "--stale-minutes", 1) * 60_000,
+        minRemaining: optionalIntFlag(opts.minRemaining, "--min-remaining", 0),
+        limit: intFlag(opts.limit, "--limit", 1),
+        offset: intFlag(opts.offset, "--offset", 0),
+        filter: {
+          org: opts.org,
+          repo: opts.repo,
+          language: opts.language,
+          packageScope: opts.packageScope,
+          localPath: opts.localPath,
+          tags: csvFlag(opts.tags),
+          includeArchived: Boolean(opts.includeArchived),
+          includeDisabled: Boolean(opts.includeDisabled),
+        },
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify(envelope, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold("GitHub Repository Catalog"));
+      console.log(`  Records: ${envelope.page.count}/${envelope.page.total}`);
+      console.log(`  Cache:   ${envelope.source.cachePath}`);
+      console.log(`  Synced:  ${envelope.source.cacheSyncedAt ?? "never"}`);
+      console.log(`  Stale:   ${envelope.source.stale ? "yes" : "no"} (${envelope.source.staleAt ?? "unknown"})`);
+      if (!envelope.source.completed && envelope.source.nextCursor) {
+        console.log(`  Cursor:  ${envelope.source.nextCursor}`);
+      }
+      for (const warning of envelope.warnings) console.log(chalk.yellow(`  Warning: ${warning}`));
+      for (const repo of envelope.repositories) {
+        const local = repo.local ? chalk.dim(` ${repo.local.path}`) : "";
+        console.log(`${chalk.bold(repo.full_name)} ${chalk.dim(`[${repo.visibility}]`)}${local}`);
+      }
+    } catch (err: any) {
+      console.error(chalk.red(`Error: ${err.message}`));
+      process.exit(1);
     }
   });
 
