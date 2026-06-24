@@ -33,7 +33,7 @@ repos-serve  # http://localhost:19450
 |---------|-------------|
 | `repos scan` | Discover and index all git repos |
 | `repos repos` | List repositories |
-| `repos repo <name>` | Get repo details |
+| `repos repo <name>` / `repos show <name>` / `repos inspect <name>` | Get repo details |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
 | `repos tags` | List tags |
@@ -47,7 +47,13 @@ repos-serve  # http://localhost:19450
 | `repos sync-github` | Sync PRs from GitHub |
 | `repos gh-info <name>` | Fetch GitHub metadata |
 
-All commands support `--json` for machine-readable output.
+CLI output is compact by default so it stays readable in agent terminals:
+
+- List/search/status-style commands show essential fields, truncate long text, and cap human rows by default.
+- Use `--verbose` for wider human rows and extra fields.
+- Use `--limit` plus `--cursor` or `--offset` on paginated list commands for more rows.
+- Use `repos show <name>` or `repos inspect <name>` for full repo detail.
+- Use `--json` for machine-readable records. JSON output keeps full fields where possible.
 
 ## MCP Server
 
@@ -67,6 +73,8 @@ repos-mcp
 - `get_stats`, `get_repo_stats`
 - `sync_github_prs`, `sync_all_github_prs`, `fetch_repo_metadata`
 - `register_agent`, `heartbeat`, `list_agents`
+
+MCP list/search/detail tools return compact JSON summaries by default to avoid dumping large records into agent context. Pass `verbose: true` to a tool call when you need the full records, and use `limit`/`offset` where available to page through large result sets.
 
 ## REST API
 
