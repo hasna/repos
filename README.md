@@ -46,6 +46,11 @@ repos-serve  # http://localhost:19450
 | `repos heatmap` | Commit activity heatmap |
 | `repos sync-github` | Sync PRs from GitHub |
 | `repos gh-info <name>` | Fetch GitHub metadata |
+| `repos storage status` | Show local/remote sync status |
+| `repos storage push` | Push local repo data to PostgreSQL |
+| `repos storage pull` | Pull PostgreSQL repo data locally |
+| `repos storage sync` | Push local changes, then pull remote changes |
+| `repos storage migrate` | Apply PostgreSQL migrations |
 
 All commands support `--json` for machine-readable output.
 
@@ -55,7 +60,7 @@ All commands support `--json` for machine-readable output.
 repos-mcp
 ```
 
-19 tools available for AI agents:
+23 tools available for AI agents:
 
 - `list_repos`, `get_repo`, `search_repos`
 - `list_commits`, `search_commits`
@@ -66,6 +71,7 @@ repos-mcp
 - `scan_repos`
 - `get_stats`, `get_repo_stats`
 - `sync_github_prs`, `sync_all_github_prs`, `fetch_repo_metadata`
+- `repos_storage_status`, `repos_storage_push`, `repos_storage_pull`, `repos_storage_sync`
 - `register_agent`, `heartbeat`, `list_agents`
 
 ## REST API
@@ -101,6 +107,8 @@ const results = searchAll("authentication");
 ## Data Storage
 
 SQLite database at `~/.hasna/repos/repos.db` with WAL mode and FTS5 full-text search.
+
+Storage sync is optional. By default the package stays local. Set `HASNA_REPOS_DATABASE_URL` or configure `~/.hasna/repos/storage/config.json` to run in hybrid/remote mode with PostgreSQL. `REPOS_DATABASE_URL` remains a shorthand fallback for local scripting.
 
 ## License
 

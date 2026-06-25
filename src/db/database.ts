@@ -1,6 +1,4 @@
 import { Database } from "bun:sqlite";
-// @ts-ignore — imported for future cloud adapter migration
-import { SqliteAdapter as _SqliteAdapter } from "@hasna/cloud";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 

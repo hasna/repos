@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "mode": "local",
+  "hosted": {
+    "api_url": "https://knowledge.hasna.xyz"
+  },
+  "storage": {
+    "type": "local",
+    "artifacts_root": "artifacts"
+  },
+  "sources": {
+    "preferred_ref": "open-files",
+    "allowed_schemes": [
+      "open-files",
+      "s3",
+      "file",
+      "https",
+      "http"
+    ]
+  },
+  "providers": {
+    "default_model": "openai:gpt-5.2",
+    "aliases": {
+      "fast": "openai:gpt-5-mini",
+      "reasoning": "anthropic:claude-opus-4-6",
+      "sonnet": "anthropic:claude-sonnet-4-6",
+      "deepseek": "deepseek:deepseek-chat",
+      "deepseek-reasoning": "deepseek:deepseek-reasoner"
+    },
+    "openai": {
+      "api_key_env": "OPENAI_API_KEY",
+      "default_model": "gpt-5.2"
+    },
+    "anthropic": {
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "default_model": "claude-sonnet-4-6"
+    },
+    "deepseek": {
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "default_model": "deepseek-chat"
+    }
+  },
+  "embeddings": {
+    "default_model": "openai:text-embedding-3-small",
+    "dimensions": 1536,
+    "batch_size": 64,
+    "max_parallel_calls": 4
+  },
+  "safety": {
+    "network": {
+      "web_search_enabled": false,
+      "s3_reads_enabled": false,
+      "allowed_s3_buckets": []
+    },
+    "redaction": {
+      "enabled": true
+    },
+    "approvals": {
+      "generated_writes_require_approval": true
+    }
+  }
+}

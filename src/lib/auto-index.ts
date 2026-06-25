@@ -1,7 +1,8 @@
 import { existsSync, watch } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { PgAdapterAsync, SqliteAdapter, getCloudConfig, getConnectionString, syncPull, syncPush } from "@hasna/cloud";
 import { getDb, getDbPath } from "../db/database.js";
+import { getStorageConfig } from "../db/storage-config.js";
+import { pullStorageChanges, pushStorageChanges } from "../db/storage-sync.js";
 import type { ScanResult } from "../types/index.js";
 import { getConfig, getHookQueuePath, getWorkspaceRoots } from "./config.js";
 import { drainHookQueue, installPostCommitHooks } from "./repo-hooks.js";
@@ -9,7 +10,7 @@ import { discoverRepos, scanRepoPaths } from "./scanner.js";
 
 const WORKSPACE_BOOTSTRAP_STATE_KEY = "workspace_bootstrap";
 
-export interface CloudSyncSummary {
+export interface StorageSyncSummary {
   direction: "pull" | "push";
   enabled: boolean;
   rowsSynced: number;
@@ -22,8 +23,8 @@ export interface WorkspaceBootstrapResult {
   roots: string[];
   hooks: ReturnType<typeof installPostCommitHooks>;
   scan?: ScanResult;
-  cloudPull?: CloudSyncSummary;
-  cloudPush?: CloudSyncSummary;
+  storagePull?: StorageSyncSummary;
+  storagePush?: StorageSyncSummary;
 }
 
 export interface AutoIndexWorker {
@@ -93,9 +94,9 @@ function resolveRepoPathFromWatchEvent(root: string, filename: string): string |
 export async function syncRepoCatalog(
   direction: "pull" | "push",
   onProgress?: (msg: string) => void,
-): Promise<CloudSyncSummary> {
-  const cloudConfig = getCloudConfig();
-  if (cloudConfig.mode === "local") {
+): Promise<StorageSyncSummary> {
+  const storageConfig = getStorageConfig();
+  if (storageConfig.mode === "local") {
     return {
       direction,
       enabled: false,
@@ -116,14 +117,11 @@ export async function syncRepoCatalog(
     };
   }
 
-  const local = new SqliteAdapter(sqlitePath);
-  const remote = new PgAdapterAsync(getConnectionString("repos"));
-
   try {
-    onProgress?.(`[cloud] ${direction} repo catalog`);
+    onProgress?.(`[storage] ${direction} repo catalog`);
     const results = direction === "push"
-      ? await syncPush(local, remote, { tables: getSyncTables(), conflictColumn: "updated_at" })
-      : await syncPull(remote, local, { tables: getSyncTables(), conflictColumn: "updated_at" });
+      ? await pushStorageChanges(getSyncTables())
+      : await pullStorageChanges(getSyncTables());
 
     return {
       direction,
@@ -138,9 +136,6 @@ export async function syncRepoCatalog(
       rowsSynced: 0,
       errors: [(error as Error).message],
     };
-  } finally {
-    local.close();
-    await remote.close().catch(() => {});
   }
 }
 
@@ -150,12 +145,12 @@ export async function ensureWorkspaceBootstrap(
     force?: boolean;
     full?: boolean;
     onProgress?: (msg: string) => void;
-    syncCloud?: boolean;
+    syncStorage?: boolean;
     workers?: number;
   } = {},
 ): Promise<WorkspaceBootstrapResult> {
   const roots = getWorkspaceRoots(rootDirs).map((root) => resolve(root));
-  const shouldSyncCloud = opts.syncCloud ?? true;
+  const shouldSyncStorage = opts.syncStorage ?? true;
   const state = getAutomationState<{ roots: string[] }>(WORKSPACE_BOOTSTRAP_STATE_KEY);
   const repoCount = getRepoCount();
   const expectedRoots = JSON.stringify(roots);
@@ -170,7 +165,7 @@ export async function ensureWorkspaceBootstrap(
     };
   }
 
-  const cloudPull = shouldSyncCloud ? await syncRepoCatalog("pull", opts.onProgress) : undefined;
+  const storagePull = shouldSyncStorage ? await syncRepoCatalog("pull", opts.onProgress) : undefined;
 
   const repoPaths = discoverRepos(roots);
   const hooks = installPostCommitHooks(repoPaths, getHookQueuePath());
@@ -188,15 +183,15 @@ export async function ensureWorkspaceBootstrap(
     bootstrappedAt: new Date().toISOString(),
   });
 
-  const cloudPush = shouldSyncCloud ? await syncRepoCatalog("push", opts.onProgress) : undefined;
+  const storagePush = shouldSyncStorage ? await syncRepoCatalog("push", opts.onProgress) : undefined;
 
   return {
     bootstrapped: true,
     roots,
     hooks,
     scan,
-    cloudPull,
-    cloudPush,
+    storagePull,
+    storagePush,
   };
 }
 
@@ -205,7 +200,7 @@ export async function startAutoIndexWorker(
   opts: {
     full?: boolean;
     onProgress?: (msg: string) => void;
-    syncCloud?: boolean;
+    syncStorage?: boolean;
     workers?: number;
   } = {},
 ): Promise<AutoIndexWorker> {
@@ -215,7 +210,7 @@ export async function startAutoIndexWorker(
   await ensureWorkspaceBootstrap(roots, {
     full: opts.full,
     onProgress: opts.onProgress,
-    syncCloud: opts.syncCloud,
+    syncStorage: opts.syncStorage,
     workers: opts.workers,
   });
 
@@ -239,10 +234,10 @@ export async function startAutoIndexWorker(
         opts.onProgress?.(
           `[${source}] ${basename(normalizedRepoPath)} indexed (${result.commits_indexed} commits, ${result.branches_indexed} branches, ${result.tags_indexed} tags)`,
         );
-        if (opts.syncCloud ?? true) {
+        if (opts.syncStorage ?? true) {
           const syncResult = await syncRepoCatalog("push", opts.onProgress);
           if (syncResult.errors.length > 0) {
-            opts.onProgress?.(`[cloud] push failed: ${syncResult.errors.join("; ")}`);
+            opts.onProgress?.(`[storage] push failed: ${syncResult.errors.join("; ")}`);
           }
         }
       })().catch((error) => {

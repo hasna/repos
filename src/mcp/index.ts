@@ -21,6 +21,7 @@ import { ensureWorkspaceBootstrap, startAutoIndexWorker } from "../lib/auto-inde
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getGraphStats } from "../lib/graph.js";
 import { getDb } from "../db/database.js";
+import { registerReposStorageTools } from "./storage-tools.js";
 
 const VERSION = "0.1.5";
 
@@ -52,6 +53,8 @@ const server = new McpServer({
   name: "repos",
   version: VERSION,
 });
+
+registerReposStorageTools(server);
 
 // ── Repos ──
 

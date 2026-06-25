@@ -45,7 +45,7 @@ describe("auto-index", () => {
   it("bootstraps a workspace and installs post-commit hooks", async () => {
     const repoPath = createTestRepo("bootstrap-repo", 2);
 
-    const result = await ensureWorkspaceBootstrap([TEST_DIR], { syncCloud: false });
+    const result = await ensureWorkspaceBootstrap([TEST_DIR], { syncStorage: false });
     const hookPath = join(repoPath, ".git", "hooks", "post-commit");
 
     expect(result.bootstrapped).toBe(true);
@@ -54,7 +54,7 @@ describe("auto-index", () => {
     expect(listRepos().length).toBe(1);
     expect(readFileSync(hookPath, "utf-8")).toContain(HOOK_MARKER_START);
 
-    const second = await ensureWorkspaceBootstrap([TEST_DIR], { syncCloud: false });
+    const second = await ensureWorkspaceBootstrap([TEST_DIR], { syncStorage: false });
     expect(second.bootstrapped).toBe(false);
     expect(second.hooks.unchanged).toBe(0);
   });

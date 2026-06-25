@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
 import { execSync } from "node:child_process";
 import { program } from "commander";
+import { registerEventsCommands } from "@hasna/events/commander";
 import { getCliVersion } from "./version.js";
 import { parseIntOption } from "./args.js";
 import chalk from "chalk";
+import { registerStorageCommands } from "./storage.js";
 import {
   listRepos,
   getRepo,
@@ -33,12 +35,14 @@ const ORG_ALIASES: Record<string, string> = {
   family: "hasnafamily",
 };
 
-const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set(["scan", "watch", "backup", "restore", "completions", "import"]);
+const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set(["scan", "watch", "backup", "restore", "completions", "import", "storage"]);
 
 program
   .name("repos")
   .description("Local repo intelligence — track all repos, search commits, PRs, branches")
   .version(getCliVersion());
+
+registerStorageCommands(program);
 
 function requireRepo(repoInput: string) {
   const repo = getRepo(repoInput);
@@ -81,7 +85,7 @@ async function bootstrapCliIfNeeded(argv: string[]) {
 
   const quiet = argv.includes("--json");
   await ensureWorkspaceBootstrap(undefined, {
-    syncCloud: false,
+    syncStorage: false,
     onProgress: quiet ? undefined : (msg) => console.log(chalk.dim(`[auto-index] ${msg}`)),
   });
 }
@@ -1032,4 +1036,6 @@ function collectCommands(cmd: any, prefix = ""): string[] {
 }
 
 await bootstrapCliIfNeeded(process.argv.slice(2));
+registerEventsCommands(program, { source: "repos" });
+
 await program.parseAsync(process.argv);

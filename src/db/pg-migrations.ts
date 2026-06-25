@@ -1,4 +1,4 @@
-// PostgreSQL migrations for @hasna/git cloud deployment
+// PostgreSQL migrations for @hasna/repos storage sync.
 // These mirror the SQLite schema but use PostgreSQL syntax
 
 export const PG_MIGRATIONS = [
@@ -192,6 +192,37 @@ export const PG_MIGRATIONS = [
       DROP TRIGGER IF EXISTS prs_search_trigger ON pull_requests;
       DROP FUNCTION IF EXISTS prs_search_update;
       ALTER TABLE pull_requests DROP COLUMN IF EXISTS search_vector;
+    `,
+  },
+  {
+    version: 3,
+    description: "Graph edges and automation state",
+    up: `
+      CREATE TABLE IF NOT EXISTS edges (
+        id SERIAL PRIMARY KEY,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        weight DOUBLE PRECISION DEFAULT 1.0,
+        metadata TEXT,
+        UNIQUE(source_type, source_id, relation, target_type, target_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_type, source_id);
+      CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_type, target_id);
+      CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
+
+      CREATE TABLE IF NOT EXISTS automation_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `,
+    down: `
+      DROP TABLE IF EXISTS automation_state CASCADE;
+      DROP TABLE IF EXISTS edges CASCADE;
     `,
   },
 ];
