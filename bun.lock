@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@hasna/git",
+      "name": "@hasna/repos",
       "dependencies": {
         "@hasna/cloud": "0.1.8",
         "@hasna/events": "^0.1.6",
