@@ -24,6 +24,7 @@ import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/githu
 import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getCrossOrgAuthors, getGraphStats } from "../lib/graph.js";
+import { buildPrQueue, inspectPackageHygiene, runGlobalCliSmoke } from "../lib/ops-producers.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg, fuzzyFindRepo } from "../lib/utils.js";
 
 const ORG_ALIASES: Record<string, string> = {
@@ -646,6 +647,86 @@ program
     } catch (err: any) {
       console.error(chalk.red(`Error: ${err.message}`));
       process.exit(1);
+    }
+  });
+
+const ops = program.command("ops").description("Loop-safe operational producers");
+
+ops
+  .command("pr-queue")
+  .description("Emit normalized open PR queue items and task seeds")
+  .option("--sync", "Sync GitHub PR metadata before reading the local queue")
+  .option("--org <org>", "Filter by GitHub org")
+  .option("--repo <repo>", "Filter by repo name or local path")
+  .option("--state <state>", "Filter PR state", "open")
+  .option("-n, --limit <n>", "Maximum PRs to emit", "100")
+  .option("--json", "Output JSON")
+  .action((opts: { sync?: boolean; org?: string; repo?: string; state?: string; limit: string; json?: boolean }) => {
+    const result = buildPrQueue({
+      sync: Boolean(opts.sync),
+      org: opts.org,
+      repo: opts.repo,
+      state: opts.state,
+      limit: intFlag(opts.limit, "--limit", 1),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(chalk.bold(`PR queue: ${result.summary.items} item(s), ${result.summary.task_seeds} task seed(s)`));
+    if (result.synced) {
+      console.log(chalk.dim(`synced repos=${result.synced.repos_synced} prs=${result.synced.total_synced} errors=${result.synced.errors.length}`));
+    }
+    for (const item of result.items.slice(0, 50)) {
+      console.log(`${chalk.green(item.repo.full_name)}#${item.pr.number} ${item.pr.title}`);
+      console.log(chalk.dim(`  ${item.repo.path}`));
+    }
+  });
+
+ops
+  .command("global-cli-smoke")
+  .description("Smoke-check globally installed CLIs used by agents")
+  .option("--commands <names>", "Comma-separated command names to check")
+  .option("--timeout-ms <n>", "Per-command timeout", "20000")
+  .option("--json", "Output JSON")
+  .action((opts: { commands?: string; timeoutMs: string; json?: boolean }) => {
+    const result = runGlobalCliSmoke({
+      commands: csvFlag(opts.commands),
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    const status = result.summary.failed === 0 && result.summary.missing === 0 ? chalk.green("ok") : chalk.red("issues");
+    console.log(`${status} checked=${result.summary.checked} ok=${result.summary.ok} failed=${result.summary.failed} missing=${result.summary.missing}`);
+    for (const row of result.commands.filter((command) => command.status !== "ok").slice(0, 30)) {
+      console.log(`${row.status === "missing" ? chalk.yellow("missing") : chalk.red("failed")} ${row.command} ${chalk.dim(row.stderr_preview)}`);
+    }
+    if (result.summary.failed > 0 || result.summary.missing > 0) process.exitCode = 1;
+  });
+
+ops
+  .command("package-hygiene")
+  .description("Inspect Hasna global package manager hygiene")
+  .option("--scope <scopes>", "Comma-separated package scopes", "@hasna,@hasnaxyz")
+  .option("--no-npm-global", "Skip npm global duplicate inspection")
+  .option("--timeout-ms <n>", "Per-command timeout", "20000")
+  .option("--json", "Output JSON")
+  .action((opts: { scope: string; npmGlobal?: boolean; timeoutMs: string; json?: boolean }) => {
+    const result = inspectPackageHygiene({
+      scopes: csvFlag(opts.scope),
+      includeNpmGlobal: opts.npmGlobal !== false,
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    const status = result.summary.scoped_npm_duplicates === 0 ? chalk.green("ok") : chalk.yellow("review");
+    console.log(`${status} bun=${result.summary.bun_packages_seen} npm=${result.summary.npm_packages_seen} duplicates=${result.summary.scoped_npm_duplicates} task_seeds=${result.summary.task_seeds}`);
+    for (const row of result.npm_global_duplicates.slice(0, 30)) {
+      console.log(`${chalk.yellow(row.name)}${row.version ? chalk.dim(`@${row.version}`) : ""}`);
     }
   });
 

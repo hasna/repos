@@ -40,3 +40,17 @@ export {
   getRepoStats,
   getGlobalStats,
 } from "./db/repos.js";
+export {
+  buildPrQueue,
+  inspectPackageHygiene,
+  runGlobalCliSmoke,
+} from "./lib/ops-producers.js";
+export type {
+  CliSmokeOptions,
+  CliSmokeResult,
+  PackageHygieneOptions,
+  PackageHygieneResult,
+  PrQueueOptions,
+  RepoPrQueueResult,
+  TaskSeed,
+} from "./lib/ops-producers.js";
