@@ -37,7 +37,7 @@ const ORG_ALIASES: Record<string, string> = {
   family: "hasnafamily",
 };
 
-const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set(["scan", "watch", "backup", "restore", "completions", "import"]);
+const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set(["scan", "watch", "backup", "restore", "completions", "import", "ops"]);
 
 program
   .name("repos")
