@@ -54,6 +54,7 @@ describe("ops producers", () => {
     expect(result.items[0]!.repo.full_name).toBe("hasna/loops");
     expect(result.items[0]!.task_seed.fingerprint).toBe("github-pr:hasna/loops#12");
     expect(result.items[0]!.task_seed.tags).toContain("auto:route");
+    expect(result.task_suggestions[0]!.fingerprint).toBe("github-pr:hasna/loops#12");
   });
 
   test("keeps large PR queue JSON stable with escaped task seed content", () => {
@@ -106,6 +107,7 @@ describe("ops producers", () => {
     expect(result.summary.ok).toBe(1);
     expect(result.summary.missing).toBe(1);
     expect(result.commands.find((row) => row.command === "missing")?.task_seed?.fingerprint).toBe("cli-smoke:missing");
+    expect(result.task_suggestions[0]!.fingerprint).toBe("cli-smoke:missing");
   });
 
   test("detects Hasna packages duplicated in npm global installs", () => {

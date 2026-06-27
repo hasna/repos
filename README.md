@@ -55,6 +55,9 @@ repos-serve  # http://localhost:19450
 | `repos triage prs [path]` | Summarize GitHub PR state through `gh` |
 | `repos docs drift [path]` | Check README coverage for package and agent ops commands |
 | `repos release health [path]` | Combine package, drift, docs, and branch release checks |
+| `repos ops pr-queue` | Emit PR merge task seeds, optional bounded GitHub sync, reports, and todos upserts |
+| `repos ops global-cli-smoke` | Check global CLIs, emit task seeds for failures, reports, and todos upserts |
+| `repos ops package-hygiene` | Check Bun/npm Hasna package hygiene |
 
 Legacy list/search/status commands support `--json` for machine-readable output.
 
@@ -62,6 +65,36 @@ Agent-loop ops commands emit compact JSON by default and bound returned lists wi
 `--limit`. Each supports `--pretty` for readable JSON, `--todo <id>` for a dry-run
 todos comment preview, and `--todo-apply` to write that compact result back to a
 task. Mutating todos integration is opt-in.
+
+Loop producer commands use a stricter contract for deterministic OpenLoops jobs:
+they emit `task_suggestions`, can write a private JSON report with `--report-dir`,
+and can upsert a bounded number of deduped todos tasks with `--upsert-tasks`.
+This lets loops follow the pattern: check expectation, write compact evidence,
+upsert one task per unmet expectation, then let task-created headless workflows
+claim the task. They should not dispatch prompts into tmux panes.
+
+Examples:
+
+```bash
+repos ops pr-queue \
+  --sync-orgs hasna,hasnaxyz,hasnatools,hasnastudio,hasnaai,hasnaeducation,hasnafamily \
+  --state open \
+  --limit 100 \
+  --report-dir ~/.hasna/loops/reports/repo-pr-sync-producer \
+  --upsert-tasks \
+  --todos-project ~/.hasna/loops \
+  --task-list repo-pr-merge-queue \
+  --max-task-actions 50 \
+  --json
+
+repos ops global-cli-smoke \
+  --report-dir ~/.hasna/loops/evidence/global-cli-smoke-native \
+  --upsert-tasks \
+  --todos-project ~/.hasna/loops \
+  --task-list global-cli-smoke \
+  --max-task-actions 20 \
+  --json
+```
 
 ## MCP Server
 

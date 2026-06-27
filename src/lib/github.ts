@@ -85,10 +85,10 @@ export function syncGithubPRs(
 }
 
 export function syncAllGithubPRs(
-  opts: { org?: string; limit?: number; onProgress?: (msg: string) => void } = {}
+  opts: { org?: string; limit?: number; state?: string; onProgress?: (msg: string) => void } = {}
 ): { total_synced: number; repos_synced: number; errors: string[] } {
   const db = getDb();
-  const { org, limit = 50, onProgress } = opts;
+  const { org, limit = 50, state = "all", onProgress } = opts;
 
   let repos;
   if (org) {
@@ -105,7 +105,7 @@ export function syncAllGithubPRs(
     const repo = repos[i]!;
     onProgress?.(`[${i + 1}/${repos.length}] Syncing PRs for ${repo.name}...`);
     try {
-      const result = syncGithubPRs(repo.id, { limit });
+      const result = syncGithubPRs(repo.id, { limit, state });
       total_synced += result.synced;
       repos_synced++;
     } catch (err) {

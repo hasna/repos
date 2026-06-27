@@ -24,7 +24,8 @@ import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/githu
 import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getCrossOrgAuthors, getGraphStats } from "../lib/graph.js";
-import { buildPrQueue, inspectPackageHygiene, runGlobalCliSmoke } from "../lib/ops-producers.js";
+import { buildPrQueue, inspectPackageHygiene, runGlobalCliSmoke, type TaskSeed } from "../lib/ops-producers.js";
+import { upsertTaskSeeds, writeLoopReport } from "../lib/ops-loop-tasks.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg, fuzzyFindRepo } from "../lib/utils.js";
 import {
   getDocsDrift,
@@ -116,6 +117,69 @@ function addOpsOptions(command: any) {
     .option("--todo-apply", "Actually write the todos comment; without this it is a dry run")
     .option("--todo-agent <name>", "todos agent name for --todo-apply")
     .option("--todo-project <path>", "todos project path for --todo-apply");
+}
+
+function addLoopProducerOptions(command: any, defaultMaxActions = 20) {
+  return command
+    .option("--report-dir <path>", "Write the full JSON envelope to this directory for loop evidence")
+    .option("--upsert-tasks", "Create deduped todos tasks from emitted task suggestions")
+    .option("--todos-project <path>", "todos project path for --upsert-tasks")
+    .option("--task-list <slug>", "Task list slug for --upsert-tasks")
+    .option("--max-task-actions <n>", "Maximum task suggestions to create/check per run", String(defaultMaxActions));
+}
+
+interface LoopProducerOpts {
+  reportDir?: string;
+  upsertTasks?: boolean;
+  todosProject?: string;
+  taskList?: string;
+  maxTaskActions: string;
+}
+
+type LoopTaskUpsert = ReturnType<typeof upsertTaskSeeds>;
+interface LoopArtifacts {
+  report_path?: string;
+  task_upsert?: LoopTaskUpsert;
+}
+
+type LoopProducerEnvelope<T extends object> = T & {
+  loop?: LoopArtifacts;
+};
+
+function applyLoopProducerArtifacts<T extends object>(
+  report: T,
+  seeds: TaskSeed[],
+  opts: LoopProducerOpts,
+  defaults: {
+    reportPrefix: string;
+    taskList: string;
+    taskListName: string;
+    taskListDescription: string;
+  },
+): LoopProducerEnvelope<T> {
+  const loop: LoopArtifacts = {};
+  if (opts.upsertTasks) {
+    loop.task_upsert = upsertTaskSeeds(seeds, {
+      project: opts.todosProject || defaultLoopsTodosProject(),
+      taskList: opts.taskList || defaults.taskList,
+      taskListName: defaults.taskListName,
+      taskListDescription: defaults.taskListDescription,
+      maxActions: intFlag(opts.maxTaskActions, "--max-task-actions", 1),
+    });
+  }
+  const envelope = Object.keys(loop).length > 0 ? { ...report, loop } : report;
+  if (opts.reportDir) {
+    loop.report_path = writeLoopReport(envelope, { reportDir: opts.reportDir, prefix: defaults.reportPrefix });
+  }
+  return Object.keys(loop).length > 0 ? { ...report, loop } : report;
+}
+
+function defaultLoopsTodosProject(): string {
+  return process.env["LOOPS_TODOS_PROJECT"] || `${process.env["HOME"] || "/home/hasna"}/.hasna/loops`;
+}
+
+function loopProducerHadErrors(report: { loop?: { task_upsert?: LoopTaskUpsert } }): boolean {
+  return Boolean(report.loop?.task_upsert && report.loop.task_upsert.summary.errors > 0);
 }
 
 function todosOpts(opts: any, cwd: string) {
@@ -701,25 +765,48 @@ program
 
 const ops = program.command("ops").description("Loop-safe operational producers");
 
-ops
-  .command("pr-queue")
-  .description("Emit normalized open PR queue items and task seeds")
-  .option("--sync", "Sync GitHub PR metadata before reading the local queue")
-  .option("--org <org>", "Filter by GitHub org")
-  .option("--repo <repo>", "Filter by repo name or local path")
-  .option("--state <state>", "Filter PR state", "open")
-  .option("-n, --limit <n>", "Maximum PRs to emit", "100")
-  .option("--json", "Output JSON")
-  .action((opts: { sync?: boolean; org?: string; repo?: string; state?: string; limit: string; json?: boolean }) => {
+addLoopProducerOptions(
+  ops
+    .command("pr-queue")
+    .description("Emit normalized open PR queue items and task seeds")
+    .option("--sync", "Sync GitHub PR metadata before reading the local queue")
+    .option("--sync-orgs <orgs>", "Bounded comma-separated orgs to sync before reading the queue")
+    .option("--fail-on-sync-errors", "Exit non-zero if GitHub sync reports errors")
+    .option("--org <org>", "Filter by GitHub org")
+    .option("--repo <repo>", "Filter by repo name or local path")
+    .option("--state <state>", "Filter PR state", "open")
+    .option("-n, --limit <n>", "Maximum PRs to emit", "100")
+    .option("--json", "Output JSON")
+    .addHelpText("after", "\nLoop use: add --sync-orgs hasna,hasnaxyz --report-dir <dir> --upsert-tasks --todos-project <path> --task-list repo-pr-merge-queue."),
+  50,
+)
+  .action((opts: LoopProducerOpts & {
+    sync?: boolean;
+    syncOrgs?: string;
+    failOnSyncErrors?: boolean;
+    org?: string;
+    repo?: string;
+    state?: string;
+    limit: string;
+    json?: boolean;
+  }) => {
     const result = buildPrQueue({
-      sync: Boolean(opts.sync),
+      sync: Boolean(opts.sync || opts.syncOrgs),
+      syncOrgs: csvFlag(opts.syncOrgs),
       org: opts.org,
       repo: opts.repo,
       state: opts.state,
       limit: intFlag(opts.limit, "--limit", 1),
     });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "repo-pr-queue",
+      taskList: "repo-pr-merge-queue",
+      taskListName: "Repo PR Merge Queue",
+      taskListDescription: "Open PR tasks created by deterministic OpenRepos producers and consumed by headless worker/verifier workflows.",
+    });
     if (opts.json) {
-      console.log(JSON.stringify(result, null, 2));
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope) || (opts.failOnSyncErrors && result.synced && result.synced.errors.length > 0)) process.exitCode = 1;
       return;
     }
     console.log(chalk.bold(`PR queue: ${result.summary.items} item(s), ${result.summary.task_seeds} task seed(s)`));
@@ -730,21 +817,37 @@ ops
       console.log(`${chalk.green(item.repo.full_name)}#${item.pr.number} ${item.pr.title}`);
       console.log(chalk.dim(`  ${item.repo.path}`));
     }
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope) || (opts.failOnSyncErrors && result.synced && result.synced.errors.length > 0)) process.exitCode = 1;
   });
 
-ops
-  .command("global-cli-smoke")
-  .description("Smoke-check globally installed CLIs used by agents")
-  .option("--commands <names>", "Comma-separated command names to check")
-  .option("--timeout-ms <n>", "Per-command timeout", "20000")
-  .option("--json", "Output JSON")
-  .action((opts: { commands?: string; timeoutMs: string; json?: boolean }) => {
+addLoopProducerOptions(
+  ops
+    .command("global-cli-smoke")
+    .description("Smoke-check globally installed CLIs used by agents")
+    .option("--commands <names>", "Comma-separated command names to check")
+    .option("--timeout-ms <n>", "Per-command timeout", "20000")
+    .option("--json", "Output JSON"),
+  20,
+)
+  .action((opts: LoopProducerOpts & { commands?: string; timeoutMs: string; json?: boolean }) => {
     const result = runGlobalCliSmoke({
       commands: csvFlag(opts.commands),
       timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
     });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "global-cli-smoke",
+      taskList: "global-cli-smoke",
+      taskListName: "Global CLI Smoke",
+      taskListDescription: "CLI availability failures created by deterministic OpenRepos smoke checks.",
+    });
     if (opts.json) {
-      console.log(JSON.stringify(result, null, 2));
+      console.log(JSON.stringify(envelope, null, 2));
+      if (result.summary.failed > 0 || result.summary.missing > 0 || loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
     const status = result.summary.failed === 0 && result.summary.missing === 0 ? chalk.green("ok") : chalk.red("issues");
@@ -752,7 +855,12 @@ ops
     for (const row of result.commands.filter((command) => command.status !== "ok").slice(0, 30)) {
       console.log(`${row.status === "missing" ? chalk.yellow("missing") : chalk.red("failed")} ${row.command} ${chalk.dim(row.stderr_preview)}`);
     }
-    if (result.summary.failed > 0 || result.summary.missing > 0) process.exitCode = 1;
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (result.summary.failed > 0 || result.summary.missing > 0 || loopProducerHadErrors(envelope)) process.exitCode = 1;
   });
 
 ops

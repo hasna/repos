@@ -54,11 +54,13 @@ export interface RepoPrQueueResult {
     items: number;
     task_seeds: number;
   };
+  task_suggestions: TaskSeed[];
   items: RepoPrQueueItem[];
 }
 
 export interface PrQueueOptions {
   sync?: boolean;
+  syncOrgs?: string[];
   org?: string;
   repo?: string;
   state?: string;
@@ -81,8 +83,16 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
     if (options.repo) {
       const result = syncGithubPRs(options.repo, { limit, state });
       synced = { repos_synced: 1, total_synced: result.synced, errors: [] };
+    } else if (options.syncOrgs?.length) {
+      synced = { repos_synced: 0, total_synced: 0, errors: [] };
+      for (const org of options.syncOrgs) {
+        const result = syncAllGithubPRs({ org, limit, state });
+        synced.repos_synced += result.repos_synced;
+        synced.total_synced += result.total_synced;
+        synced.errors.push(...result.errors.map((error) => `${org}: ${error}`));
+      }
     } else {
-      synced = syncAllGithubPRs({ org: options.org, limit });
+      synced = syncAllGithubPRs({ org: options.org, limit, state });
     }
   }
 
@@ -102,6 +112,7 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
       items: items.length,
       task_seeds: items.length,
     },
+    task_suggestions: items.map((item) => item.task_seed),
     items,
   };
 }
@@ -129,6 +140,7 @@ export interface CliSmokeResult {
     failed: number;
     missing: number;
   };
+  task_suggestions: TaskSeed[];
   commands: Array<{
     command: string;
     args: string[];
@@ -200,6 +212,9 @@ export function runGlobalCliSmoke(options: CliSmokeOptions = {}): CliSmokeResult
       failed: commands.filter((command) => command.status === "failed").length,
       missing: commands.filter((command) => command.status === "missing").length,
     },
+    task_suggestions: commands
+      .map((command) => command.task_seed)
+      .filter((seed): seed is TaskSeed => Boolean(seed)),
     commands,
   };
 }

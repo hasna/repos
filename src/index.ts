@@ -57,6 +57,10 @@ export {
   inspectPackageHygiene,
   runGlobalCliSmoke,
 } from "./lib/ops-producers.js";
+export {
+  upsertTaskSeeds,
+  writeLoopReport,
+} from "./lib/ops-loop-tasks.js";
 export type {
   CliSmokeOptions,
   CliSmokeResult,
@@ -66,3 +70,9 @@ export type {
   RepoPrQueueResult,
   TaskSeed,
 } from "./lib/ops-producers.js";
+export type {
+  TodosCommandResult,
+  TodosRunner,
+  UpsertTaskSeedsOptions,
+  UpsertTaskSeedsResult,
+} from "./lib/ops-loop-tasks.js";
