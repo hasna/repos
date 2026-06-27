@@ -18,6 +18,17 @@ import {
 import { ensureWorkspaceBootstrap, startAutoIndexWorker } from "../lib/auto-index.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getGraphStats } from "../lib/graph.js";
+import {
+  getDocsDrift,
+  getPackageDrift,
+  getPackageHealth,
+  getReleaseHealth,
+  resolvePackageBin,
+  scanPorts,
+  triageBranches,
+  triagePullRequests,
+  withTodos,
+} from "../lib/repo-ops.js";
 import { getDb } from "../db/database.js";
 
 export const MCP_NAME = "repos";
@@ -28,6 +39,26 @@ export function buildServer(): McpServer {
     name: MCP_NAME,
     version: VERSION,
   });
+
+function jsonText(value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
+function todosArgs(args: {
+  cwd?: string;
+  todo_task_id?: string;
+  todo_apply?: boolean;
+  todo_agent?: string;
+  todo_project?: string;
+}) {
+  return {
+    taskId: args.todo_task_id,
+    apply: Boolean(args.todo_apply),
+    agent: args.todo_agent,
+    project: args.todo_project,
+    cwd: args.cwd,
+  };
+}
 
 // ── Repos ──
 
@@ -176,6 +207,75 @@ server.tool("get_repo_stats", "Get detailed stats for a specific repo", {
   const stats = getRepoStats(repo_id);
   return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
 });
+
+// ── Agent Ops ──
+
+const todosShape = {
+  todo_task_id: z.string().optional().describe("todos task id to comment on"),
+  todo_apply: z.boolean().optional().describe("Actually write the todos comment; default is dry-run preview"),
+  todo_agent: z.string().optional().describe("todos agent name for todo_apply"),
+  todo_project: z.string().optional().describe("todos project path for todo_apply"),
+};
+
+server.tool("package_health", "Check package.json, scripts, bins, and lockfiles with compact JSON", {
+  cwd: z.string().optional().describe("Package root (default current process cwd)"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(getPackageHealth({ cwd: args.cwd, limit: args.limit }), todosArgs(args))));
+
+server.tool("package_drift", "Check package.json versus bun.lock drift with compact JSON", {
+  cwd: z.string().optional().describe("Package root (default current process cwd)"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(getPackageDrift({ cwd: args.cwd, limit: args.limit }), todosArgs(args))));
+
+server.tool("package_resolve_bin", "Resolve a package bin from package.json, node_modules/.bin, or PATH", {
+  cwd: z.string().optional().describe("Package root (default current process cwd)"),
+  name: z.string().optional().describe("Bin name to resolve; omit to list package-local bins"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(resolvePackageBin({ cwd: args.cwd, name: args.name, limit: args.limit }), todosArgs(args))));
+
+server.tool("ports_scan", "Scan listening TCP ports and annotate ports referenced by package scripts", {
+  cwd: z.string().optional().describe("Package root for script port hints"),
+  port: z.number().optional().describe("Only return one port"),
+  limit: z.number().optional().describe("Max returned listeners"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(scanPorts({ cwd: args.cwd, port: args.port, limit: args.limit }), todosArgs(args))));
+
+server.tool("triage_branches", "Triage current git branch, dirty state, stale branches, and merged branches", {
+  cwd: z.string().optional().describe("Git repo root"),
+  stale_days: z.number().optional().describe("Stale local branch threshold"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(triageBranches({ cwd: args.cwd, staleDays: args.stale_days, limit: args.limit }), todosArgs(args))));
+
+server.tool("triage_prs", "Triage GitHub pull requests via gh", {
+  cwd: z.string().optional().describe("Git repo root"),
+  state: z.string().optional().describe("PR state passed to gh"),
+  stale_days: z.number().optional().describe("Stale PR threshold"),
+  limit: z.number().optional().describe("Max returned PRs"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(triagePullRequests({ cwd: args.cwd, state: args.state, staleDays: args.stale_days, limit: args.limit }), todosArgs(args))));
+
+server.tool("docs_drift", "Check README coverage for package name, bins, and agent ops commands", {
+  cwd: z.string().optional().describe("Package root"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(getDocsDrift({ cwd: args.cwd, limit: args.limit }), todosArgs(args))));
+
+server.tool("release_health", "Combine package, drift, docs, and branch checks for release readiness", {
+  cwd: z.string().optional().describe("Package root"),
+  include_git: z.boolean().optional().describe("Include git branch checks; default true"),
+  stale_days: z.number().optional().describe("Stale local branch threshold"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(getReleaseHealth({
+  cwd: args.cwd,
+  includeGit: args.include_git,
+  staleDays: args.stale_days,
+  limit: args.limit,
+}), todosArgs(args))));
 
 // ── GitHub Sync ──
 

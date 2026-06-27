@@ -47,8 +47,21 @@ repos-serve  # http://localhost:19450
 | `repos sync-github` | Sync PRs from GitHub |
 | `repos gh-info <name>` | Fetch GitHub metadata |
 | `repos gh-catalog` | Enumerate/cache GitHub repository catalog JSON for OpenLoops |
+| `repos package health [path]` | Check package scripts, bins, lockfiles, and release metadata |
+| `repos package drift [path]` | Compare package.json against bun.lock |
+| `repos package resolve-bin [name]` | Resolve package bins from package.json, node_modules, or PATH |
+| `repos ports scan [path]` | Scan listening ports and match package script port hints |
+| `repos triage branches [path]` | Summarize branch, dirty, stale, merged, ahead/behind state |
+| `repos triage prs [path]` | Summarize GitHub PR state through `gh` |
+| `repos docs drift [path]` | Check README coverage for package and agent ops commands |
+| `repos release health [path]` | Combine package, drift, docs, and branch release checks |
 
-All commands support `--json` for machine-readable output.
+Legacy list/search/status commands support `--json` for machine-readable output.
+
+Agent-loop ops commands emit compact JSON by default and bound returned lists with
+`--limit`. Each supports `--pretty` for readable JSON, `--todo <id>` for a dry-run
+todos comment preview, and `--todo-apply` to write that compact result back to a
+task. Mutating todos integration is opt-in.
 
 ## MCP Server
 
@@ -56,7 +69,7 @@ All commands support `--json` for machine-readable output.
 repos-mcp
 ```
 
-19 tools available for AI agents:
+34 tools available for AI agents:
 
 - `list_repos`, `get_repo`, `search_repos`
 - `list_commits`, `search_commits`
@@ -67,6 +80,10 @@ repos-mcp
 - `scan_repos`
 - `get_stats`, `get_repo_stats`
 - `sync_github_prs`, `sync_all_github_prs`, `fetch_repo_metadata`
+- `graph_build`, `graph_query`, `graph_related`, `graph_path`, `graph_deps`, `graph_stats`
+- `package_health`, `package_drift`, `package_resolve_bin`
+- `ports_scan`, `triage_branches`, `triage_prs`
+- `docs_drift`, `release_health`
 - `register_agent`, `heartbeat`, `list_agents`
 
 ## REST API
