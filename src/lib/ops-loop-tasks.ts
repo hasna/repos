@@ -78,16 +78,6 @@ export function upsertTaskSeeds(seeds: TaskSeed[], options: UpsertTaskSeedsOptio
 
   const seen = new Set<string>();
   for (const seed of seeds) {
-    if (result.summary.attempted >= maxActions) {
-      result.summary.skipped += 1;
-      result.actions.push({
-        action: "skipped",
-        fingerprint: seed.fingerprint,
-        title: seed.title,
-        reason: `max-actions ${maxActions} reached`,
-      });
-      continue;
-    }
     if (seen.has(seed.fingerprint)) {
       result.summary.skipped += 1;
       result.actions.push({
@@ -113,13 +103,25 @@ export function upsertTaskSeeds(seeds: TaskSeed[], options: UpsertTaskSeedsOptio
       });
       continue;
     }
-    if (existing.task && !TERMINAL_STATUSES.has(String(existing.task.status ?? ""))) {
+    const activeTask = existing.tasks?.find((task) => !TERMINAL_STATUSES.has(String(task.status ?? "")));
+    if (activeTask) {
       result.summary.existing += 1;
       result.actions.push({
         action: "exists",
         fingerprint: seed.fingerprint,
         title: seed.title,
-        task_id: String(existing.task.id ?? ""),
+        task_id: String(activeTask.id ?? ""),
+      });
+      continue;
+    }
+
+    if (result.summary.created >= maxActions) {
+      result.summary.skipped += 1;
+      result.actions.push({
+        action: "skipped",
+        fingerprint: seed.fingerprint,
+        title: seed.title,
+        reason: `max task creations ${maxActions} reached`,
       });
       continue;
     }
@@ -149,13 +151,23 @@ export function upsertTaskSeeds(seeds: TaskSeed[], options: UpsertTaskSeedsOptio
   return result;
 }
 
-export function writeLoopReport(report: unknown, options: { reportDir?: string; prefix: string }): string | undefined {
+export function writeLoopReport(report: unknown, options: { reportDir?: string; prefix: string; annotatePath?: boolean }): string | undefined {
   if (!options.reportDir) return undefined;
   mkdirSync(options.reportDir, { recursive: true, mode: 0o700 });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const path = join(options.reportDir, `${options.prefix}-${stamp}.json`);
-  writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  const body = options.annotatePath ? reportWithPath(report, path) : report;
+  writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return path;
+}
+
+function reportWithPath(report: unknown, path: string): unknown {
+  if (!report || typeof report !== "object" || Array.isArray(report)) return report;
+  const record = report as Record<string, unknown>;
+  const loop = record["loop"] && typeof record["loop"] === "object" && !Array.isArray(record["loop"])
+    ? record["loop"] as Record<string, unknown>
+    : {};
+  return { ...record, loop: { ...loop, report_path: path } };
 }
 
 function ensureTaskList(
@@ -186,7 +198,7 @@ function findExistingTask(
   fingerprint: string,
   runner: TodosRunner,
   timeoutMs: number,
-): { task?: Record<string, unknown>; error?: string } {
+): { tasks?: Array<Record<string, unknown>>; error?: string } {
   const result = runner([
     "--project",
     options.project,
@@ -201,7 +213,7 @@ function findExistingTask(
   if (result.status !== 0) return { error: compactError(result, `failed to search task ${fingerprint}`) };
   try {
     const parsed = JSON.parse(result.stdout || "[]") as unknown;
-    if (Array.isArray(parsed)) return { task: parsed[0] as Record<string, unknown> | undefined };
+    if (Array.isArray(parsed)) return { tasks: parsed as Array<Record<string, unknown>> };
     return {};
   } catch (error) {
     return { error: `failed to parse todos search JSON for ${fingerprint}: ${(error as Error).message}` };

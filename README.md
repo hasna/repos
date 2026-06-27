@@ -78,6 +78,7 @@ Examples:
 ```bash
 repos ops pr-queue \
   --sync-orgs hasna,hasnaxyz,hasnatools,hasnastudio,hasnaai,hasnaeducation,hasnafamily \
+  --sync-max-repos 80 \
   --state open \
   --limit 100 \
   --report-dir ~/.hasna/loops/reports/repo-pr-sync-producer \

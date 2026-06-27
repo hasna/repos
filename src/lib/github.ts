@@ -1,18 +1,23 @@
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { getDb } from "../db/database.js";
 import { getRepo, bulkInsertPullRequests } from "../db/repos.js";
 import type { PullRequest } from "../types/index.js";
 
-function gh(args: string): string {
+function gh(args: string[]): string {
   try {
-    return execSync(`gh ${args}`, {
+    return execFileSync("gh", args, {
       encoding: "utf-8",
       timeout: 60_000,
       maxBuffer: 50 * 1024 * 1024,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
-  } catch {
-    return "";
+  } catch (error) {
+    const err = error as Error & { stderr?: Buffer | string; status?: number | null; signal?: NodeJS.Signals | null };
+    const stderr = Buffer.isBuffer(err.stderr) ? err.stderr.toString("utf8") : err.stderr;
+    const detail = (stderr || err.message || "unknown gh error").replace(/\s+/g, " ").trim();
+    const status = err.status == null ? "" : ` exit=${err.status}`;
+    const signal = err.signal ? ` signal=${err.signal}` : "";
+    throw new Error(`gh ${args.join(" ")} failed${status}${signal}: ${detail}`);
   }
 }
 
@@ -47,19 +52,26 @@ export function syncGithubPRs(
   const ghRepo = match[1]!.replace(/\.git$/, "");
 
   const { limit = 100, state = "all" } = opts;
-  const stateArg = state === "all" ? "--state all" : `--state ${state}`;
+  const output = gh([
+    "pr",
+    "list",
+    "-R",
+    ghRepo,
+    "--state",
+    state,
+    "--limit",
+    String(limit),
+    "--json",
+    "number,title,state,author,createdAt,updatedAt,mergedAt,closedAt,url,baseRefName,headRefName,additions,deletions,changedFiles",
+  ]);
 
-  const output = gh(
-    `pr list -R ${ghRepo} ${stateArg} --limit ${limit} --json number,title,state,author,createdAt,updatedAt,mergedAt,closedAt,url,baseRefName,headRefName,additions,deletions,changedFiles`
-  );
-
-  if (!output) return { synced: 0, repo_name: repo.name };
+  if (!output) throw new Error(`gh pr list returned empty output for ${ghRepo}`);
 
   let prs: GhPr[];
   try {
     prs = JSON.parse(output);
-  } catch {
-    return { synced: 0, repo_name: repo.name };
+  } catch (error) {
+    throw new Error(`gh pr list returned invalid JSON for ${ghRepo}: ${(error as Error).message}`);
   }
 
   const prRows: Array<Omit<PullRequest, "id">> = prs.map((pr) => ({
@@ -85,17 +97,20 @@ export function syncGithubPRs(
 }
 
 export function syncAllGithubPRs(
-  opts: { org?: string; limit?: number; state?: string; onProgress?: (msg: string) => void } = {}
-): { total_synced: number; repos_synced: number; errors: string[] } {
+  opts: { org?: string; limit?: number; state?: string; maxRepos?: number; onProgress?: (msg: string) => void } = {}
+): { total_synced: number; repos_seen: number; repos_checked: number; repos_synced: number; truncated: boolean; errors: string[] } {
   const db = getDb();
-  const { org, limit = 50, state = "all", onProgress } = opts;
+  const { org, limit = 50, state = "all", maxRepos, onProgress } = opts;
 
   let repos;
   if (org) {
-    repos = db.query("SELECT * FROM repos WHERE org = ? AND remote_url LIKE '%github.com%'").all(org) as any[];
+    repos = db.query("SELECT * FROM repos WHERE org = ? AND remote_url LIKE '%github.com%' ORDER BY name ASC").all(org) as any[];
   } else {
-    repos = db.query("SELECT * FROM repos WHERE remote_url LIKE '%github.com%'").all() as any[];
+    repos = db.query("SELECT * FROM repos WHERE remote_url LIKE '%github.com%' ORDER BY org ASC, name ASC").all() as any[];
   }
+  const repos_seen = repos.length;
+  const normalizedMaxRepos = normalizePositiveInteger(maxRepos);
+  if (normalizedMaxRepos && repos.length > normalizedMaxRepos) repos = repos.slice(0, normalizedMaxRepos);
 
   let total_synced = 0;
   let repos_synced = 0;
@@ -109,11 +124,11 @@ export function syncAllGithubPRs(
       total_synced += result.synced;
       repos_synced++;
     } catch (err) {
-      errors.push(`${repo.name}: ${err}`);
+      errors.push(`${repo.name}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  return { total_synced, repos_synced, errors };
+  return { total_synced, repos_seen, repos_checked: repos.length, repos_synced, truncated: repos.length < repos_seen, errors };
 }
 
 export function fetchRepoMetadata(repoIdOrName: string | number): {
@@ -130,10 +145,9 @@ export function fetchRepoMetadata(repoIdOrName: string | number): {
   if (!match) return null;
   const ghRepo = match[1]!.replace(/\.git$/, "");
 
-  const output = gh(`repo view ${ghRepo} --json description,repositoryTopics,stargazerCount,forkCount,primaryLanguage`);
-  if (!output) return null;
-
   try {
+    const output = gh(["repo", "view", ghRepo, "--json", "description,repositoryTopics,stargazerCount,forkCount,primaryLanguage"]);
+    if (!output) return null;
     const data = JSON.parse(output);
     const description = data.description || null;
     const topics = (data.repositoryTopics || []).map((t: any) => t.name);
@@ -152,4 +166,9 @@ export function fetchRepoMetadata(repoIdOrName: string | number): {
   } catch {
     return null;
   }
+}
+
+function normalizePositiveInteger(value: number | undefined): number | undefined {
+  if (value == null || !Number.isFinite(value) || value < 1) return undefined;
+  return Math.floor(value);
 }

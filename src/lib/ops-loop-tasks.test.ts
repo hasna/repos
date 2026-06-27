@@ -74,6 +74,72 @@ describe("loop task helpers", () => {
     expect(result.actions[0]).toMatchObject({ action: "exists", task_id: "task-existing" });
   });
 
+  test("does not starve new tasks behind existing active tasks", () => {
+    const added: string[] = [];
+    const runner: TodosRunner = (args) => {
+      if (args.includes("task-lists")) return { status: 0, stdout: "repo-pr-merge-queue", stderr: "" };
+      if (args.includes("search")) {
+        const fingerprint = args[args.indexOf("search") + 1]!;
+        if (fingerprint === "github-pr:hasna/repos#1") {
+          return { status: 0, stdout: JSON.stringify([{ id: "existing-1", status: "pending" }]), stderr: "" };
+        }
+        return { status: 0, stdout: "[]", stderr: "" };
+      }
+      if (args.includes("add")) {
+        const title = args[args.indexOf("add") + 1]!;
+        added.push(title);
+        return { status: 0, stdout: JSON.stringify({ id: "created-1", status: "pending" }), stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected" };
+    };
+
+    const result = upsertTaskSeeds([
+      makeSeed("github-pr:hasna/repos#1"),
+      makeSeed("github-pr:hasna/repos#2"),
+    ], {
+      project: "/home/hasna/.hasna/loops",
+      taskList: "repo-pr-merge-queue",
+      taskListName: "Repo PR Merge Queue",
+      taskListDescription: "PR work",
+      maxActions: 1,
+      runner,
+    });
+
+    expect(result.summary.existing).toBe(1);
+    expect(result.summary.created).toBe(1);
+    expect(added).toHaveLength(1);
+    expect(result.actions.map((action) => action.action)).toEqual(["exists", "created"]);
+  });
+
+  test("uses an active duplicate even when a terminal search hit appears first", () => {
+    const runner: TodosRunner = (args) => {
+      if (args.includes("task-lists")) return { status: 0, stdout: "global-cli-smoke", stderr: "" };
+      if (args.includes("search")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { id: "terminal", status: "done" },
+            { id: "active", status: "in_progress" },
+          ]),
+          stderr: "",
+        };
+      }
+      if (args.includes("add")) return { status: 0, stdout: JSON.stringify({ id: "should-not-add" }), stderr: "" };
+      return { status: 1, stdout: "", stderr: "unexpected" };
+    };
+
+    const result = upsertTaskSeeds([makeSeed("cli-smoke:opencode")], {
+      project: "/home/hasna/.hasna/loops",
+      taskList: "global-cli-smoke",
+      taskListName: "Global CLI Smoke",
+      taskListDescription: "CLI smoke",
+      runner,
+    });
+
+    expect(result.summary.existing).toBe(1);
+    expect(result.actions[0]).toMatchObject({ action: "exists", task_id: "active" });
+  });
+
   test("writes loop report JSON with private file permissions", () => {
     const dir = mkdtempSync(join(tmpdir(), "open-repos-loop-report-"));
     tempDirs.push(dir);
@@ -83,6 +149,16 @@ describe("loop task helpers", () => {
     expect(path).toBeTruthy();
     expect(JSON.parse(readFileSync(path!, "utf8"))).toEqual({ ok: true });
     expect(statSync(path!).mode & 0o777).toBe(0o600);
+  });
+
+  test("can annotate loop report JSON with its own report path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "open-repos-loop-report-"));
+    tempDirs.push(dir);
+
+    const path = writeLoopReport({ ok: true, loop: {} }, { reportDir: dir, prefix: "smoke", annotatePath: true });
+    const parsed = JSON.parse(readFileSync(path!, "utf8")) as { loop: { report_path: string } };
+
+    expect(parsed.loop.report_path).toBe(path);
   });
 });
 

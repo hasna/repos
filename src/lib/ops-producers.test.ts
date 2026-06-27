@@ -110,6 +110,26 @@ describe("ops producers", () => {
     expect(result.task_suggestions[0]!.fingerprint).toBe("cli-smoke:missing");
   });
 
+  test("global CLI smoke uses fallback probes and includes legacy commands", () => {
+    const seen: string[] = [];
+    const runner: CommandRunner = (command, args) => {
+      seen.push(`${command} ${args.join(" ")}`.trim());
+      if (command === "dispatch") return { status: 0, stdout: "dispatch help", stderr: "" };
+      if (command === "loops-daemon") return { status: 0, stdout: "0.3.26", stderr: "" };
+      if (command === "fallback-only" && args[0] === "version") return { status: 0, stdout: "1.0.0", stderr: "" };
+      return { status: 1, stdout: "", stderr: "bad flag" };
+    };
+
+    const defaultResult = runGlobalCliSmoke({ commands: ["loops-daemon", "dispatch"], runner });
+    const fallbackResult = runGlobalCliSmoke({ commands: ["fallback-only"], runner });
+
+    expect(defaultResult.summary.ok).toBe(2);
+    expect(fallbackResult.summary.ok).toBe(1);
+    expect(fallbackResult.commands[0]!.args).toEqual(["version"]);
+    expect(seen).toContain("fallback-only --help");
+    expect(seen).toContain("fallback-only version");
+  });
+
   test("detects Hasna packages duplicated in npm global installs", () => {
     const runner: CommandRunner = (command) => {
       if (command === "bun") {

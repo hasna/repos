@@ -40,8 +40,11 @@ export interface RepoPrQueueResult {
   schema: "open-repos.pr-queue.v1";
   generated_at: string;
   synced?: {
+    repos_seen: number;
+    repos_checked: number;
     repos_synced: number;
     total_synced: number;
+    truncated: boolean;
     errors: string[];
   };
   filters: {
@@ -61,6 +64,7 @@ export interface RepoPrQueueResult {
 export interface PrQueueOptions {
   sync?: boolean;
   syncOrgs?: string[];
+  syncMaxRepos?: number;
   org?: string;
   repo?: string;
   state?: string;
@@ -82,17 +86,31 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
   if (options.sync) {
     if (options.repo) {
       const result = syncGithubPRs(options.repo, { limit, state });
-      synced = { repos_synced: 1, total_synced: result.synced, errors: [] };
+      synced = { repos_seen: 1, repos_checked: 1, repos_synced: 1, total_synced: result.synced, truncated: false, errors: [] };
     } else if (options.syncOrgs?.length) {
-      synced = { repos_synced: 0, total_synced: 0, errors: [] };
+      synced = { repos_seen: 0, repos_checked: 0, repos_synced: 0, total_synced: 0, truncated: false, errors: [] };
+      let remainingRepos = normalizePositiveInteger(options.syncMaxRepos, 0);
       for (const org of options.syncOrgs) {
-        const result = syncAllGithubPRs({ org, limit, state });
+        if (options.syncMaxRepos && remainingRepos <= 0) {
+          synced.truncated = true;
+          break;
+        }
+        const result = syncAllGithubPRs({
+          org,
+          limit,
+          state,
+          ...(options.syncMaxRepos ? { maxRepos: remainingRepos } : {}),
+        });
+        synced.repos_seen += result.repos_seen;
+        synced.repos_checked += result.repos_checked;
         synced.repos_synced += result.repos_synced;
         synced.total_synced += result.total_synced;
+        synced.truncated = synced.truncated || result.truncated;
         synced.errors.push(...result.errors.map((error) => `${org}: ${error}`));
+        remainingRepos -= result.repos_checked;
       }
     } else {
-      synced = syncAllGithubPRs({ org: options.org, limit, state });
+      synced = syncAllGithubPRs({ org: options.org, limit, state, maxRepos: options.syncMaxRepos });
     }
   }
 
@@ -160,9 +178,10 @@ export type CommandRunner = (
 
 const DEFAULT_CLI_SMOKE_COMMANDS: CliSmokeCommandSpec[] = [
   { command: "loops", args: ["--version"] },
+  { command: "loops-daemon", args: ["--version"] },
   { command: "codewith", args: ["--version"] },
   { command: "claude", args: ["--version"] },
-  { command: "cursor", args: ["agent", "--help"] },
+  { command: "cursor", args: ["agent", "--version"] },
   { command: "opencode", args: ["--version"] },
   { command: "codex", args: ["--version"] },
   { command: "accounts", args: ["--help"] },
@@ -176,6 +195,7 @@ const DEFAULT_CLI_SMOKE_COMMANDS: CliSmokeCommandSpec[] = [
   { command: "calendar", args: ["--help"] },
   { command: "contacts", args: ["--help"] },
   { command: "economy", args: ["--version"] },
+  { command: "dispatch", args: ["--help"] },
   { command: "repos", args: ["--version"] },
   { command: "gh", args: ["--version"] },
   { command: "bun", args: ["--version"] },
@@ -186,13 +206,12 @@ export function runGlobalCliSmoke(options: CliSmokeOptions = {}): CliSmokeResult
   const runner = options.runner ?? spawnCommand;
   const commandSpecs = resolveCliSmokeCommands(options.commands);
   const commands = commandSpecs.map((spec) => {
-    const result = runner(spec.command, spec.args, { timeoutMs });
-    const missing = result.error?.code === "ENOENT";
+    const { command, args, result, missing } = runCliSmokeSpec(spec, runner, timeoutMs);
     const ok = !missing && result.status === 0;
     const status = ok ? "ok" : missing ? "missing" : "failed";
     const row: CliSmokeResult["commands"][number] = {
-      command: spec.command,
-      args: spec.args,
+      command: command === spec.command ? spec.command : `${spec.command} via ${command}`,
+      args,
       status,
       exit_code: result.status,
       stdout_preview: compactPreview(result.stdout),
@@ -357,6 +376,49 @@ function resolveCliSmokeCommands(commands?: string[]): CliSmokeCommandSpec[] {
   if (!commands?.length) return DEFAULT_CLI_SMOKE_COMMANDS;
   const defaults = new Map(DEFAULT_CLI_SMOKE_COMMANDS.map((spec) => [spec.command, spec]));
   return commands.map((command) => defaults.get(command) ?? { command, args: ["--help"] });
+}
+
+function runCliSmokeSpec(
+  spec: CliSmokeCommandSpec,
+  runner: CommandRunner,
+  timeoutMs: number,
+): { command: string; args: string[]; result: ReturnType<CommandRunner>; missing: boolean } {
+  const probes = cliSmokeProbes(spec);
+  let last = { command: spec.command, args: spec.args, result: runner(spec.command, spec.args, { timeoutMs }) };
+  if (!last.result.error || last.result.error.code !== "ENOENT") {
+    if (last.result.status === 0) return { ...last, missing: false };
+  }
+  let sawExecutable = !last.result.error || last.result.error.code !== "ENOENT";
+
+  for (const probe of probes.slice(1)) {
+    const result = runner(probe.command, probe.args, { timeoutMs });
+    last = { command: probe.command, args: probe.args, result };
+    if (!result.error || result.error.code !== "ENOENT") sawExecutable = true;
+    if (result.status === 0) return { ...last, missing: false };
+  }
+
+  return { ...last, missing: !sawExecutable };
+}
+
+function cliSmokeProbes(spec: CliSmokeCommandSpec): CliSmokeCommandSpec[] {
+  if (spec.command === "cursor" && spec.args[0] === "agent") {
+    return [
+      { command: "cursor", args: ["agent", "--version"] },
+      { command: "cursor", args: ["agent", "--help"] },
+      { command: "agent", args: ["--version"] },
+      { command: "agent", args: ["--help"] },
+    ];
+  }
+  const candidates = [spec.args, ["--version"], ["version"], ["help"], []];
+  const seen = new Set<string>();
+  return candidates
+    .filter((args) => {
+      const key = args.join("\0");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .map((args) => ({ command: spec.command, args }));
 }
 
 function spawnCommand(command: string, args: string[], opts: { timeoutMs: number }) {

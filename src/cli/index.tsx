@@ -125,7 +125,7 @@ function addLoopProducerOptions(command: any, defaultMaxActions = 20) {
     .option("--upsert-tasks", "Create deduped todos tasks from emitted task suggestions")
     .option("--todos-project <path>", "todos project path for --upsert-tasks")
     .option("--task-list <slug>", "Task list slug for --upsert-tasks")
-    .option("--max-task-actions <n>", "Maximum task suggestions to create/check per run", String(defaultMaxActions));
+    .option("--max-task-actions <n>", "Maximum new todos tasks to create per run; existing-task checks continue for dedupe", String(defaultMaxActions));
 }
 
 interface LoopProducerOpts {
@@ -169,7 +169,7 @@ function applyLoopProducerArtifacts<T extends object>(
   }
   const envelope = Object.keys(loop).length > 0 ? { ...report, loop } : report;
   if (opts.reportDir) {
-    loop.report_path = writeLoopReport(envelope, { reportDir: opts.reportDir, prefix: defaults.reportPrefix });
+    loop.report_path = writeLoopReport(envelope, { reportDir: opts.reportDir, prefix: defaults.reportPrefix, annotatePath: true });
   }
   return Object.keys(loop).length > 0 ? { ...report, loop } : report;
 }
@@ -771,18 +771,20 @@ addLoopProducerOptions(
     .description("Emit normalized open PR queue items and task seeds")
     .option("--sync", "Sync GitHub PR metadata before reading the local queue")
     .option("--sync-orgs <orgs>", "Bounded comma-separated orgs to sync before reading the queue")
+    .option("--sync-max-repos <n>", "Maximum GitHub repositories to sync before reading the queue")
     .option("--fail-on-sync-errors", "Exit non-zero if GitHub sync reports errors")
     .option("--org <org>", "Filter by GitHub org")
     .option("--repo <repo>", "Filter by repo name or local path")
     .option("--state <state>", "Filter PR state", "open")
     .option("-n, --limit <n>", "Maximum PRs to emit", "100")
     .option("--json", "Output JSON")
-    .addHelpText("after", "\nLoop use: add --sync-orgs hasna,hasnaxyz --report-dir <dir> --upsert-tasks --todos-project <path> --task-list repo-pr-merge-queue."),
+    .addHelpText("after", "\nLoop use: add --sync-orgs hasna,hasnaxyz --sync-max-repos 80 --report-dir <dir> --upsert-tasks --todos-project <path> --task-list repo-pr-merge-queue."),
   50,
 )
   .action((opts: LoopProducerOpts & {
     sync?: boolean;
     syncOrgs?: string;
+    syncMaxRepos?: string;
     failOnSyncErrors?: boolean;
     org?: string;
     repo?: string;
@@ -793,6 +795,7 @@ addLoopProducerOptions(
     const result = buildPrQueue({
       sync: Boolean(opts.sync || opts.syncOrgs),
       syncOrgs: csvFlag(opts.syncOrgs),
+      syncMaxRepos: optionalIntFlag(opts.syncMaxRepos, "--sync-max-repos", 1),
       org: opts.org,
       repo: opts.repo,
       state: opts.state,
@@ -811,7 +814,7 @@ addLoopProducerOptions(
     }
     console.log(chalk.bold(`PR queue: ${result.summary.items} item(s), ${result.summary.task_seeds} task seed(s)`));
     if (result.synced) {
-      console.log(chalk.dim(`synced repos=${result.synced.repos_synced} prs=${result.synced.total_synced} errors=${result.synced.errors.length}`));
+      console.log(chalk.dim(`synced repos=${result.synced.repos_synced}/${result.synced.repos_checked} prs=${result.synced.total_synced} truncated=${result.synced.truncated ? "yes" : "no"} errors=${result.synced.errors.length}`));
     }
     for (const item of result.items.slice(0, 50)) {
       console.log(`${chalk.green(item.repo.full_name)}#${item.pr.number} ${item.pr.title}`);
