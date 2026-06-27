@@ -3,6 +3,9 @@
   "version": "0.1.16",
   "description": "Local repo intelligence platform for AI agents — track all repos, search commits, PRs, branches across your machine. CLI + MCP + Web dashboard.",
   "type": "module",
+  "workspaces": [
+    "dashboard"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {

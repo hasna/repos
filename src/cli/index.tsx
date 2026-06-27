@@ -24,6 +24,17 @@ import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/githu
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getCrossOrgAuthors, getGraphStats } from "../lib/graph.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg, fuzzyFindRepo } from "../lib/utils.js";
+import {
+  getDocsDrift,
+  getPackageDrift,
+  getPackageHealth,
+  getReleaseHealth,
+  resolvePackageBin,
+  scanPorts,
+  triageBranches,
+  triagePullRequests,
+  withTodos,
+} from "../lib/repo-ops.js";
 
 const ORG_ALIASES: Record<string, string> = {
   oss: "hasna",
@@ -35,7 +46,20 @@ const ORG_ALIASES: Record<string, string> = {
   family: "hasnafamily",
 };
 
-const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set(["scan", "watch", "backup", "restore", "completions", "import"]);
+const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set([
+  "scan",
+  "watch",
+  "backup",
+  "restore",
+  "completions",
+  "import",
+  "package",
+  "ports",
+  "triage",
+  "docs",
+  "release",
+  "release-health",
+]);
 
 program
   .name("repos")
@@ -65,6 +89,30 @@ function intFlag(value: string, flagName: string, min = 0) {
     console.error(chalk.red((error as Error).message));
     process.exit(1);
   }
+}
+
+function printOpsJson(report: unknown, pretty?: boolean) {
+  console.log(JSON.stringify(report, null, pretty ? 2 : 0));
+}
+
+function addOpsOptions(command: any) {
+  return command
+    .option("-n, --limit <n>", "Max returned items", "20")
+    .option("--pretty", "Pretty-print JSON")
+    .option("--todo <id>", "Attach a compact comment preview for this todos task")
+    .option("--todo-apply", "Actually write the todos comment; without this it is a dry run")
+    .option("--todo-agent <name>", "todos agent name for --todo-apply")
+    .option("--todo-project <path>", "todos project path for --todo-apply");
+}
+
+function todosOpts(opts: any, cwd: string) {
+  return {
+    taskId: opts.todo,
+    apply: Boolean(opts.todoApply),
+    agent: opts.todoAgent,
+    project: opts.todoProject,
+    cwd,
+  };
 }
 
 async function bootstrapCliIfNeeded(argv: string[]) {
@@ -809,6 +857,154 @@ program
     if (opts.json) { console.log(JSON.stringify(result)); return; }
     console.log(chalk.green(`\n✓ Cloned ${result.cloned}, skipped ${result.skipped}`));
     if (result.errors.length > 0) console.log(chalk.yellow(`  ${result.errors.length} errors`));
+  });
+
+// ── Agent Ops ──
+const packageOps = program.command("package").description("Package health, drift, and bin resolution primitives");
+
+addOpsOptions(packageOps
+  .command("health [path]")
+  .description("Check package.json, scripts, bins, and lockfiles (compact JSON default)"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      getPackageHealth({ cwd, limit: intFlag(opts.limit, "--limit", 1) }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+addOpsOptions(packageOps
+  .command("drift [path]")
+  .description("Check package.json versus bun.lock drift (compact JSON default)"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      getPackageDrift({ cwd, limit: intFlag(opts.limit, "--limit", 1) }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+addOpsOptions(packageOps
+  .command("resolve-bin [name]")
+  .description("Resolve a package bin from package.json, node_modules/.bin, or PATH")
+  .option("--path <path>", "Package root", "."))
+  .action((name: string | undefined, opts: any) => {
+    const cwd = opts.path ?? process.cwd();
+    const report = withTodos(
+      resolvePackageBin({ cwd, name, limit: intFlag(opts.limit, "--limit", 1) }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+const portsOps = program.command("ports").description("Local port inspection primitives");
+
+addOpsOptions(portsOps
+  .command("scan [path]")
+  .description("Scan listening TCP ports and annotate ports referenced by package scripts")
+  .option("--port <n>", "Only return one port"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const port = opts.port === undefined ? undefined : intFlag(opts.port, "--port", 1);
+    const report = withTodos(
+      scanPorts({ cwd, port, limit: intFlag(opts.limit, "--limit", 1) }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+const triageOps = program.command("triage").description("Branch and pull request triage primitives");
+
+addOpsOptions(triageOps
+  .command("branches [path]")
+  .description("Triage current git branch, dirty state, stale branches, and merged branches")
+  .option("--stale-days <n>", "Stale local branch threshold", "30"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      triageBranches({
+        cwd,
+        staleDays: intFlag(opts.staleDays, "--stale-days", 1),
+        limit: intFlag(opts.limit, "--limit", 1),
+      }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+addOpsOptions(triageOps
+  .command("prs [path]")
+  .description("Triage GitHub pull requests via gh")
+  .option("--state <state>", "PR state passed to gh", "open")
+  .option("--stale-days <n>", "Stale PR threshold", "14"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      triagePullRequests({
+        cwd,
+        state: opts.state,
+        staleDays: intFlag(opts.staleDays, "--stale-days", 1),
+        limit: intFlag(opts.limit, "--limit", 1),
+      }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+const docsOps = program.command("docs").description("Documentation drift primitives");
+
+addOpsOptions(docsOps
+  .command("drift [path]")
+  .description("Check README coverage for package name, bins, and agent ops commands"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      getDocsDrift({ cwd, limit: intFlag(opts.limit, "--limit", 1) }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+const releaseOps = program.command("release").description("Release readiness primitives");
+
+addOpsOptions(releaseOps
+  .command("health [path]")
+  .description("Combine package, drift, docs, and branch checks for release readiness")
+  .option("--no-git", "Skip git branch checks")
+  .option("--stale-days <n>", "Stale local branch threshold", "30"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      getReleaseHealth({
+        cwd,
+        includeGit: opts.git,
+        staleDays: intFlag(opts.staleDays, "--stale-days", 1),
+        limit: intFlag(opts.limit, "--limit", 1),
+      }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+addOpsOptions(program
+  .command("release-health [path]")
+  .description("Alias for release health"))
+  .option("--no-git", "Skip git branch checks")
+  .option("--stale-days <n>", "Stale local branch threshold", "30")
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      getReleaseHealth({
+        cwd,
+        includeGit: opts.git,
+        staleDays: intFlag(opts.staleDays, "--stale-days", 1),
+        limit: intFlag(opts.limit, "--limit", 1),
+      }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
   });
 
 // ── Knowledge Graph ──

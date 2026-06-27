@@ -7,6 +7,18 @@ export { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "./lib/github
 export { getReposStatus } from "./lib/status.js";
 export type { ReposStatusContract } from "./lib/status.js";
 export {
+  getDocsDrift,
+  getPackageDrift,
+  getPackageHealth,
+  getReleaseHealth,
+  resolvePackageBin,
+  scanPorts,
+  triageBranches,
+  triagePullRequests,
+  withTodos,
+} from "./lib/repo-ops.js";
+export type { OpsIssue, OpsReport, TodosIntegrationOptions, TodosIntegrationResult } from "./lib/repo-ops.js";
+export {
   listRepos,
   getRepo,
   searchRepos,
