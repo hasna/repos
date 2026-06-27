@@ -46,6 +46,7 @@ repos-serve  # http://localhost:19450
 | `repos heatmap` | Commit activity heatmap |
 | `repos sync-github` | Sync PRs from GitHub |
 | `repos gh-info <name>` | Fetch GitHub metadata |
+| `repos gh-catalog` | Enumerate/cache GitHub repository catalog JSON for OpenLoops |
 | `repos package health [path]` | Check package scripts, bins, lockfiles, and release metadata |
 | `repos package drift [path]` | Compare package.json against bun.lock |
 | `repos package resolve-bin [name]` | Resolve package bins from package.json, node_modules, or PATH |
@@ -110,10 +111,50 @@ repos-serve  # Default port: 19450
 ```typescript
 import { scanRepos, searchAll, listRepos, getGlobalStats } from "@hasna/repos";
 
-const result = scanRepos(["/home/user/code"]);
+const result = await scanRepos(["/home/user/code"]);
 const repos = listRepos({ org: "myorg" });
 const results = searchAll("authentication");
 ```
+
+## OpenLoops GitHub Catalog
+
+OpenLoops should use the GitHub catalog contract instead of scraping CLI text:
+
+```bash
+# Refresh at most one GitHub API page, then return the first 100 matching records.
+repos gh-catalog --sync --max-pages 1 --json --limit 100
+
+# Continue a partial sync later without loading all repos in one run.
+repos gh-catalog --sync --resume --max-pages 1 --json
+
+# Enumerate cached records only, filtered for sequential multi-repo loop setup.
+repos gh-catalog --json --org hasna --language TypeScript --tags open-loops --limit 25 --offset 0
+```
+
+SDK entry points:
+
+```typescript
+import {
+  enumerateGithubRepoCatalog,
+  iterateGithubRepoCatalog,
+  syncGithubRepoCatalog,
+} from "@hasna/repos";
+
+const cache = syncGithubRepoCatalog({ maxPages: 1, resume: true });
+const page = enumerateGithubRepoCatalog({
+  limit: 25,
+  offset: 0,
+  filter: { org: "hasna", packageScope: "@hasna", tags: ["open-loops"] },
+});
+
+for (const repo of iterateGithubRepoCatalog({ filter: { language: "TypeScript" } })) {
+  // Run one repository loop at a time.
+}
+```
+
+The JSON envelope uses schema `open-repos.github-catalog.v1` and includes `source.cacheSyncedAt`, `source.staleAt`, `source.completed`, `source.nextCursor`, `page.nextOffset`, GitHub rate-limit metadata, discovered accounts/orgs, and repository records. Each record includes owner/account, org, repo name/full name, default branch, visibility, archived/disabled/fork flags, topics, description, safe HTTPS/SSH clone URLs, pushed/updated timestamps, primary language, package hints, local path and branch/dirty/ahead/behind status when matched, and loop tags.
+
+The catalog is cacheable and resumable. By default `repos gh-catalog` reads the cache and does not call GitHub; add `--sync` when OpenLoops intentionally wants to refresh data. The cache path defaults to `~/.hasna/repos/github-catalog.json` and can be overridden with `HASNA_REPOS_GITHUB_CACHE_PATH` or `--cache`.
 
 ## HTTP mode
 
