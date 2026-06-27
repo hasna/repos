@@ -56,6 +56,45 @@ describe("ops producers", () => {
     expect(result.items[0]!.task_seed.tags).toContain("auto:route");
   });
 
+  test("keeps large PR queue JSON stable with escaped task seed content", () => {
+    const repo = upsertRepo({
+      path: "/workspace/open-repos",
+      name: "open-repos",
+      org: "hasna",
+      remote_url: "https://github.com/hasna/repos.git",
+    });
+    const oddTitle = "Fix \"quoted\" PR queue\nwith tab\tand bell \u0007";
+    bulkInsertPullRequests(Array.from({ length: 505 }, (_, index) => ({
+      repo_id: repo.id,
+      number: index + 1,
+      title: `${oddTitle} #${index + 1}`,
+      state: "open" as const,
+      author: "andrei-hasna",
+      created_at: "2026-06-27T00:00:00Z",
+      updated_at: `2026-06-27T01:${String(index % 60).padStart(2, "0")}:00Z`,
+      merged_at: null,
+      closed_at: null,
+      url: `https://github.com/hasna/repos/pull/${index + 1}`,
+      base_branch: "main",
+      head_branch: `fix/pr-queue-${index + 1}`,
+      additions: index,
+      deletions: 1,
+      changed_files: 2,
+    })));
+
+    const result = buildPrQueue({ org: "hasna", limit: 500 });
+    const json = JSON.stringify(result, null, 2);
+    const parsed = JSON.parse(json) as typeof result;
+
+    expect(parsed.schema).toBe("open-repos.pr-queue.v1");
+    expect(parsed.summary.items).toBe(500);
+    expect(parsed.items).toHaveLength(500);
+    expect(parsed.items[0]!.pr.title).toContain('"quoted"');
+    expect(parsed.items[0]!.pr.title).toContain("\n");
+    expect(parsed.items[0]!.task_seed.title).toContain('"quoted"');
+    expect(parsed.items[0]!.task_seed.body).toContain("https://github.com/hasna/repos/pull/");
+  });
+
   test("smokes CLIs with an injectable bounded runner", () => {
     const runner: CommandRunner = (command) => command === "missing"
       ? { status: null, stdout: "", stderr: "", error: { code: "ENOENT", message: "not found" } }
