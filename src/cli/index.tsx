@@ -182,6 +182,10 @@ function loopProducerHadErrors(report: { loop?: { task_upsert?: LoopTaskUpsert }
   return Boolean(report.loop?.task_upsert && report.loop.task_upsert.summary.errors > 0);
 }
 
+function syncFailed(synced: { errors: string[] } | undefined, allowSyncErrors: boolean | undefined): boolean {
+  return !allowSyncErrors && Boolean(synced && synced.errors.length > 0);
+}
+
 function todosOpts(opts: any, cwd: string) {
   return {
     taskId: opts.todo,
@@ -771,8 +775,8 @@ addLoopProducerOptions(
     .description("Emit normalized open PR queue items and task seeds")
     .option("--sync", "Sync GitHub PR metadata before reading the local queue")
     .option("--sync-orgs <orgs>", "Bounded comma-separated orgs to sync before reading the queue")
-    .option("--sync-max-repos <n>", "Maximum GitHub repositories to sync before reading the queue")
-    .option("--fail-on-sync-errors", "Exit non-zero if GitHub sync reports errors")
+    .option("--sync-max-repos <n>", "Required maximum GitHub repositories to sync when using --sync-orgs")
+    .option("--allow-sync-errors", "Keep exit code zero even if GitHub sync reports errors")
     .option("--org <org>", "Filter by GitHub org")
     .option("--repo <repo>", "Filter by repo name or local path")
     .option("--state <state>", "Filter PR state", "open")
@@ -785,17 +789,23 @@ addLoopProducerOptions(
     sync?: boolean;
     syncOrgs?: string;
     syncMaxRepos?: string;
-    failOnSyncErrors?: boolean;
+    allowSyncErrors?: boolean;
     org?: string;
     repo?: string;
     state?: string;
     limit: string;
     json?: boolean;
   }) => {
+    const syncOrgs = csvFlag(opts.syncOrgs);
+    const syncMaxRepos = optionalIntFlag(opts.syncMaxRepos, "--sync-max-repos", 1);
+    if (syncOrgs?.length && !syncMaxRepos) {
+      console.error(chalk.red("Error: --sync-orgs requires --sync-max-repos to keep multi-repo sync bounded."));
+      process.exit(1);
+    }
     const result = buildPrQueue({
-      sync: Boolean(opts.sync || opts.syncOrgs),
-      syncOrgs: csvFlag(opts.syncOrgs),
-      syncMaxRepos: optionalIntFlag(opts.syncMaxRepos, "--sync-max-repos", 1),
+      sync: Boolean(opts.sync || syncOrgs),
+      syncOrgs,
+      syncMaxRepos,
       org: opts.org,
       repo: opts.repo,
       state: opts.state,
@@ -809,7 +819,7 @@ addLoopProducerOptions(
     });
     if (opts.json) {
       console.log(JSON.stringify(envelope, null, 2));
-      if (loopProducerHadErrors(envelope) || (opts.failOnSyncErrors && result.synced && result.synced.errors.length > 0)) process.exitCode = 1;
+      if (loopProducerHadErrors(envelope) || syncFailed(result.synced, opts.allowSyncErrors)) process.exitCode = 1;
       return;
     }
     console.log(chalk.bold(`PR queue: ${result.summary.items} item(s), ${result.summary.task_seeds} task seed(s)`));
@@ -825,7 +835,7 @@ addLoopProducerOptions(
       console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
     }
     if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
-    if (loopProducerHadErrors(envelope) || (opts.failOnSyncErrors && result.synced && result.synced.errors.length > 0)) process.exitCode = 1;
+    if (loopProducerHadErrors(envelope) || syncFailed(result.synced, opts.allowSyncErrors)) process.exitCode = 1;
   });
 
 addLoopProducerOptions(

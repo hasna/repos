@@ -97,6 +97,11 @@ repos ops global-cli-smoke \
   --json
 ```
 
+`--sync-orgs` requires `--sync-max-repos`; GitHub sync errors make the command
+exit non-zero by default so loop health cannot silently run on stale metadata.
+Use `--allow-sync-errors` only for exploratory reads where stale cached PR data
+is acceptable.
+
 ## MCP Server
 
 ```bash

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -49,6 +49,20 @@ function runCli(args: string[]) {
       ...process.env,
       HASNA_REPOS_AUTO_BOOTSTRAP: "0",
       NO_COLOR: "1",
+    },
+  });
+}
+
+function runCliWithEnv(args: string[], env: Record<string, string>) {
+  return Bun.spawnSync({
+    cmd: ["bun", "run", "src/cli/index.tsx", ...args],
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      HASNA_REPOS_AUTO_BOOTSTRAP: "0",
+      NO_COLOR: "1",
+      ...env,
     },
   });
 }
@@ -106,5 +120,46 @@ describe("repo ops CLI commands", () => {
     expect(stdout).toContain("ports");
     expect(stdout).toContain("triage");
     expect(stdout).toContain("release-health");
+  });
+
+  test("pr queue rejects multi-org sync without an explicit repo cap", () => {
+    const result = runCli(["ops", "pr-queue", "--sync-orgs", "hasna", "--json"]);
+    const stderr = new TextDecoder().decode(result.stderr);
+
+    expect(result.exitCode).toBe(1);
+    expect(stderr).toContain("--sync-orgs requires --sync-max-repos");
+  });
+
+  test("pr queue exits non-zero on sync errors by default", () => {
+    const binDir = join(tempDir, "bin");
+    const repoDir = join(tempDir, "open-test");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(repoDir, { recursive: true });
+    const ghPath = join(binDir, "gh");
+    writeFileSync(ghPath, "#!/usr/bin/env bash\necho 'gh unavailable' >&2\nexit 7\n");
+    chmodSync(ghPath, 0o755);
+    Bun.spawnSync({ cmd: ["git", "init"], cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+    Bun.spawnSync({ cmd: ["git", "remote", "add", "origin", "https://github.com/hasna/open-test.git"], cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+
+    const env = {
+      HASNA_REPOS_DB_PATH: join(tempDir, "repos.db"),
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    };
+    const scan = runCliWithEnv(["scan", "--root", tempDir, "--json"], env);
+    expect(scan.exitCode).toBe(0);
+
+    const result = runCliWithEnv([
+      "ops",
+      "pr-queue",
+      "--sync-orgs",
+      "hasna",
+      "--sync-max-repos",
+      "1",
+      "--json",
+    ], env);
+    const stdout = new TextDecoder().decode(result.stdout);
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(stdout).synced.errors[0]).toContain("gh pr list");
   });
 });
