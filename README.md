@@ -55,6 +55,7 @@ repos-serve  # http://localhost:19450
 | `repos triage prs [path]` | Summarize GitHub PR state through `gh` |
 | `repos docs drift [path]` | Check README coverage for package and agent ops commands |
 | `repos release health [path]` | Combine package, drift, docs, and branch release checks |
+| `repos no-cloud inventory [path]` | Scan repos for legacy cloud package references and route-safe remediation metadata |
 | `repos ops pr-queue` | Emit PR merge task seeds, optional bounded GitHub sync, reports, and todos upserts |
 | `repos ops global-cli-smoke` | Check global CLIs, emit task seeds for failures, reports, and todos upserts |
 | `repos ops package-hygiene` | Check Bun/npm Hasna package hygiene |

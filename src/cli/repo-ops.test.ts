@@ -122,6 +122,22 @@ describe("repo ops CLI commands", () => {
     expect(stdout).toContain("release-health");
   });
 
+  test("no-cloud inventory CLI emits route-safe schema", () => {
+    const result = runCli(["no-cloud", "inventory", tempDir, "--pretty"]);
+    const stderr = new TextDecoder().decode(result.stderr);
+    const stdout = new TextDecoder().decode(result.stdout);
+
+    expect(result.exitCode, stderr).toBe(0);
+    expect(JSON.parse(stdout)).toMatchObject({
+      kind: "no_cloud_inventory",
+      schema_version: "1.2",
+      summary: {
+        repos: 0,
+        routeable: 0,
+      },
+    });
+  });
+
   test("pr queue rejects multi-org sync without an explicit repo cap", () => {
     const result = runCli(["ops", "pr-queue", "--sync-orgs", "hasna", "--json"]);
     const stderr = new TextDecoder().decode(result.stderr);

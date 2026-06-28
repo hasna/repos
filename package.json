@@ -1,6 +1,6 @@
 {
   "name": "@hasna/repos",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Local repo intelligence platform for AI agents — track all repos, search commits, PRs, branches across your machine. CLI + MCP + Web dashboard.",
   "type": "module",
   "workspaces": [
@@ -26,7 +26,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "cd dashboard && bun run build && cd .. && bun build src/cli/index.tsx --outdir dist/cli --target bun --external ink --external react --external chalk --external @modelcontextprotocol/sdk && bun build src/mcp/index.ts --outdir dist/mcp --target bun --external @modelcontextprotocol/sdk && bun build src/server/index.ts --outdir dist/server --target bun && bun build src/index.ts --outdir dist --target bun && tsc --emitDeclarationOnly --outDir dist",
+    "clean": "rm -rf dist dashboard/dist",
+    "build": "bun run clean && cd dashboard && bun run build && cd .. && bun build src/cli/index.tsx --outdir dist/cli --target bun --external ink --external react --external chalk --external @modelcontextprotocol/sdk && bun build src/mcp/index.ts --outdir dist/mcp --target bun --external @modelcontextprotocol/sdk && bun build src/server/index.ts --outdir dist/server --target bun && bun build src/index.ts --outdir dist --target bun && tsc --emitDeclarationOnly --outDir dist",
     "build:dashboard": "cd dashboard && bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
@@ -58,7 +59,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/hasna/repos.git"
+    "url": "git+https://github.com/hasna/repos.git"
   },
   "homepage": "https://github.com/hasna/repos",
   "bugs": {

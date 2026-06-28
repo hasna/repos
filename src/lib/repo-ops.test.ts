@@ -152,7 +152,7 @@ describe("repo ops primitives", () => {
         "repos repos-mcp repos-serve",
         "repos package health repos package drift repos package resolve-bin",
         "repos ports scan repos triage branches repos triage prs",
-        "repos docs drift repos release health",
+        "repos docs drift repos release health repos no-cloud inventory",
       ].join("\n"),
     });
 

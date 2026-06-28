@@ -79,6 +79,7 @@ const OPS_COMMAND_MENTIONS = [
   "repos triage prs",
   "repos docs drift",
   "repos release health",
+  "repos no-cloud inventory",
 ];
 
 function capLimit(limit?: number, fallback = DEFAULT_LIMIT): number {
