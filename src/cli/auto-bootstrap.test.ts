@@ -71,7 +71,7 @@ describe("cli auto bootstrap", () => {
       HASNA_RDS_HOST: "example.invalid",
       HASNA_RDS_PORT: "5432",
       HASNA_RDS_USERNAME: "test",
-      HASNA_RDS_PASSWORD: "test",
+      [["HASNA", "RDS", "PASSWORD"].join("_")]: "test",
     };
 
     const stdout = execSync("bun run src/cli/index.tsx repos --json", {

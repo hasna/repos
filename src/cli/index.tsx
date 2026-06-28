@@ -38,6 +38,7 @@ import {
   triagePullRequests,
   withTodos,
 } from "../lib/repo-ops.js";
+import { getNoCloudInventory } from "../lib/no-cloud-inventory.js";
 
 const ORG_ALIASES: Record<string, string> = {
   oss: "hasna",
@@ -62,6 +63,7 @@ const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set([
   "triage",
   "docs",
   "release",
+  "no-cloud",
   "release-health",
 ]);
 
@@ -107,6 +109,11 @@ function csvFlag(value: string | undefined): string[] | undefined {
 
 function printOpsJson(report: unknown, pretty?: boolean) {
   console.log(JSON.stringify(report, null, pretty ? 2 : 0));
+}
+
+function collectValues(value: string, previous: string[] = []) {
+  previous.push(...value.split(",").map((entry) => entry.trim()).filter(Boolean));
+  return previous;
 }
 
 function addOpsOptions(command: any) {
@@ -1295,6 +1302,28 @@ addOpsOptions(program
       }),
       todosOpts(opts, cwd)
     );
+    printOpsJson(report, opts.pretty);
+  });
+
+const noCloudOps = program.command("no-cloud").description("No-cloud migration inventory primitives");
+
+noCloudOps
+  .command("inventory [path]")
+  .description("Scan git repos for legacy Hasna cloud references and optional npm latest metadata")
+  .option("-n, --limit <n>", "Max returned repos/npm packages", "200")
+  .option("--max-depth <n>", "Max directory depth when discovering git roots", "8")
+  .option("--include-npm", "Also query npm latest metadata for known @hasna packages")
+  .option("--npm-package <name>", "Package name for npm metadata checks; repeat or comma-separate for multiple", collectValues, [])
+  .option("--pretty", "Pretty-print JSON")
+  .action((path: string | undefined, opts: any) => {
+    const root = path ?? process.cwd();
+    const report = getNoCloudInventory({
+      root,
+      limit: intFlag(opts.limit, "--limit", 1),
+      maxDepth: intFlag(opts.maxDepth, "--max-depth", 1),
+      includeNpm: Boolean(opts.includeNpm) || Boolean(opts.npmPackage?.length),
+      npmPackages: opts.npmPackage,
+    });
     printOpsJson(report, opts.pretty);
   });
 
