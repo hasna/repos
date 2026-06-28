@@ -375,9 +375,10 @@ describe("no-cloud inventory", () => {
     });
   });
 
-  it("does not promote a clean nested duplicate over a heavily penalized top-level checkout", () => {
+  it("does not promote clean auxiliary or nested duplicates over a heavily penalized top-level checkout", () => {
     withTempWorkspace((root) => {
       const parent = join(root, "open-brains");
+      const auxiliary = join(root, "open-brains-compact-cli");
       const child = join(parent, "brains");
       gitRepo(parent);
       writeFileSync(join(parent, "README.md"), `${cloudPackage}\n`);
@@ -389,6 +390,10 @@ describe("no-cloud inventory", () => {
       execFileSync("git", ["update-ref", "refs/remotes/origin/main", remoteHead], { cwd: parent, stdio: "pipe" });
       execFileSync("git", ["reset", "--hard", "HEAD~1"], { cwd: parent, stdio: "pipe" });
       writeFileSync(join(parent, "README.md"), `${cloudPackage}\nlocal dirty change\n`);
+      gitRepo(auxiliary);
+      writeFileSync(join(auxiliary, "README.md"), `${cloudPackage}\n`);
+      commitAll(auxiliary, "add cloud evidence");
+      setTrackedGitHubRemote(auxiliary, "https://github.com/hasna/brains.git");
       gitRepo(child);
       writeFileSync(join(child, "README.md"), `${cloudPackage}\n`);
       commitAll(child, "add cloud evidence");
@@ -396,6 +401,7 @@ describe("no-cloud inventory", () => {
 
       const report = getNoCloudInventory({ root, limit: 10, maxDepth: 4 });
       const parentFinding = report.repos.find((entry) => entry.path === "open-brains");
+      const auxiliaryFinding = report.repos.find((entry) => entry.path === "open-brains-compact-cli");
       const childFinding = report.repos.find((entry) => entry.path === "open-brains/brains");
 
       expect(parentFinding).toMatchObject({
@@ -407,6 +413,14 @@ describe("no-cloud inventory", () => {
         behind: 1,
       });
       expect(parentFinding?.dirty).toBeGreaterThan(0);
+      expect(auxiliaryFinding).toMatchObject({
+        repo_key: "hasna/brains",
+        routing: "duplicate",
+        routeable: false,
+        route_blocked_reason: "duplicate-checkout",
+        canonical_path: "open-brains",
+        duplicate_of: "open-brains",
+      });
       expect(childFinding).toMatchObject({
         repo_key: "hasna/brains",
         routing: "duplicate",

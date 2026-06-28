@@ -386,11 +386,18 @@ function repoFinding(root: string, base: string, nestedParentPath: string | null
   };
 }
 
+function canonicalPathTier(repo: InternalRepoFinding, expectedOpenName: string, path: string): number {
+  if (expectedOpenName && (path === expectedOpenName || path.endsWith(`/opensource/${expectedOpenName}`))) return 0;
+  if (repo.nested_parent_path) return 3;
+  if (auxiliaryPathReason(repo)) return 2;
+  return 1;
+}
+
 function canonicalScore(repo: InternalRepoFinding): [number, number, number, string] {
   const path = repo.path.toLowerCase();
   const repoName = repo.repo_key?.split("/").pop() ?? "";
   const expectedOpenName = repoName ? `open-${repoName}` : "";
-  const nestedTier = repo.nested_parent_path ? 1 : 0;
+  const pathTier = canonicalPathTier(repo, expectedOpenName, path);
   let score = 0;
 
   if (expectedOpenName && (path === expectedOpenName || path.endsWith(`/opensource/${expectedOpenName}`))) score -= 100;
@@ -404,7 +411,7 @@ function canonicalScore(repo: InternalRepoFinding): [number, number, number, str
   if (path.includes("/.codewith")) score += 250;
   if (/(compact|improve|review|feature|worktree|codex|goal|pr-\d+)/.test(path)) score += 80;
 
-  return [nestedTier, score, path.length, path];
+  return [pathTier, score, path.length, path];
 }
 
 function isNoTouchRepoKey(repoKey: string | null): boolean {
