@@ -327,6 +327,65 @@ describe("no-cloud inventory", () => {
     });
   });
 
+  it("blocks nested git checkouts from remediation routing even when they are otherwise clean", () => {
+    withTempWorkspace((root) => {
+      const parent = join(root, "open-brains");
+      const child = join(parent, "brains");
+      gitRepo(parent);
+      gitRepo(child);
+      writeFileSync(join(child, "README.md"), `${cloudPackage}\n`);
+      commitAll(child, "add cloud evidence");
+      setTrackedGitHubRemote(child, "https://github.com/hasna/brains.git");
+
+      const report = getNoCloudInventory({ root, limit: 10, maxDepth: 4 });
+      const childFinding = report.repos.find((entry) => entry.path === "open-brains/brains");
+
+      expect(childFinding).toMatchObject({
+        repo_key: "hasna/brains",
+        routing: "canonical",
+        routeable: false,
+        route_blocked_reason: "nested-git-checkout",
+        canonical_path: "open-brains/brains",
+      });
+      expect(report.summary.routeable).toBe(0);
+    });
+  });
+
+  it("does not promote a clean nested duplicate over a top-level checkout", () => {
+    withTempWorkspace((root) => {
+      const parent = join(root, "open-brains");
+      const child = join(parent, "brains");
+      gitRepo(parent);
+      writeFileSync(join(parent, "README.md"), `${cloudPackage}\n`);
+      commitAll(parent, "add cloud evidence");
+      setTrackedGitHubRemote(parent, "https://github.com/hasna/brains.git");
+      gitRepo(child);
+      writeFileSync(join(child, "README.md"), `${cloudPackage}\n`);
+      commitAll(child, "add cloud evidence");
+      setTrackedGitHubRemote(child, "https://github.com/hasna/brains.git");
+
+      const report = getNoCloudInventory({ root, limit: 10, maxDepth: 4 });
+      const parentFinding = report.repos.find((entry) => entry.path === "open-brains");
+      const childFinding = report.repos.find((entry) => entry.path === "open-brains/brains");
+
+      expect(parentFinding).toMatchObject({
+        repo_key: "hasna/brains",
+        routing: "canonical",
+        routeable: false,
+        route_blocked_reason: "dirty-worktree",
+        canonical_path: "open-brains",
+      });
+      expect(childFinding).toMatchObject({
+        repo_key: "hasna/brains",
+        routing: "duplicate",
+        routeable: false,
+        route_blocked_reason: "duplicate-checkout",
+        canonical_path: "open-brains",
+        duplicate_of: "open-brains",
+      });
+    });
+  });
+
   it("does not skip large lockfiles that contain cloud references", () => {
     withTempWorkspace((root) => {
       const repo = join(root, "large-lock");

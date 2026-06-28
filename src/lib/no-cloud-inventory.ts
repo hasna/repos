@@ -7,6 +7,7 @@ type InventoryRouting = "canonical" | "duplicate" | "unkeyed";
 
 type InternalRepoFinding = NoCloudRepoFinding & {
   policy_path: string;
+  nested_parent_path: string | null;
 };
 
 export interface NoCloudInventoryOptions {
@@ -280,6 +281,16 @@ function collectGitRoots(root: string, maxDepth: number): { roots: string[]; exc
   return { roots: [...roots].sort(), excluded: [...excluded].sort() };
 }
 
+function nearestNestedParent(root: string, roots: string[]): string | null {
+  const normalizedRoot = root.replaceAll("\\", "/");
+  return roots
+    .filter((candidate) => {
+      const normalizedCandidate = candidate.replaceAll("\\", "/");
+      return normalizedCandidate !== normalizedRoot && normalizedRoot.startsWith(`${normalizedCandidate}/`);
+    })
+    .sort((a, b) => b.length - a.length)[0] ?? null;
+}
+
 function collectCloudFiles(root: string): string[] {
   const files: string[] = [];
 
@@ -326,7 +337,7 @@ function categoryCounts(root: string, files: string[]) {
   return { package: packageFiles, lock, source, docs, config };
 }
 
-function repoFinding(root: string, base: string): InternalRepoFinding {
+function repoFinding(root: string, base: string, nestedParentPath: string | null): InternalRepoFinding {
   const files = collectCloudFiles(root);
   const counts = categoryCounts(root, files);
   const dirty = (runGit(root, ["status", "--porcelain=v1"]) ?? "")
@@ -340,6 +351,7 @@ function repoFinding(root: string, base: string): InternalRepoFinding {
   return {
     path: redactPath(relative(base, root) || root),
     policy_path: root.replaceAll("\\", "/").toLowerCase(),
+    nested_parent_path: nestedParentPath,
     repo_key: remoteRepoKey(remote),
     routing: "unkeyed",
     routeable: false,
@@ -372,6 +384,7 @@ function canonicalScore(repo: InternalRepoFinding): [number, number, string] {
   if (expectedOpenName && (path === expectedOpenName || path.endsWith(`/opensource/${expectedOpenName}`))) score -= 100;
   if (repo.branch === "main") score -= 20;
   if (repo.dirty > 0) score += 250;
+  if (repo.nested_parent_path) score += 320;
   if (/(^|\/)opensourcedev(\/|$)/.test(path) || repo.policy_path.includes("/opensourcedev/")) score += 180;
   if ((repo.behind ?? 0) > 0) score += 220;
   if ((repo.ahead ?? 0) > 0) score += 180;
@@ -423,6 +436,7 @@ function routeBlockedReason(finding: InternalRepoFinding, isCanonical: boolean):
   if (finding.repo_key === "hasna/cloud") return "cloud-package-final-tombstone-gated";
   if (isNoTouchRepoKey(finding.repo_key)) return "no-touch-repo";
   if (!isManagedRepoKey(finding.repo_key)) return "outside-managed-org";
+  if (finding.nested_parent_path) return "nested-git-checkout";
   if (finding.dirty > 0) return "dirty-worktree";
   const pathReason = auxiliaryPathReason(finding);
   if (pathReason) return pathReason;
@@ -436,7 +450,7 @@ function routeBlockedReason(finding: InternalRepoFinding, isCanonical: boolean):
 }
 
 function publicFinding(finding: InternalRepoFinding): NoCloudRepoFinding {
-  const { policy_path: _policyPath, ...publicFields } = finding;
+  const { policy_path: _policyPath, nested_parent_path: _nestedParentPath, ...publicFields } = finding;
   return publicFields;
 }
 
@@ -525,7 +539,9 @@ export function getNoCloudInventory(options: NoCloudInventoryOptions = {}): NoCl
   const limit = cap(options.limit, DEFAULT_LIMIT, 10_000);
   const maxDepth = cap(options.maxDepth, DEFAULT_MAX_DEPTH, 32);
   const { roots, excluded } = collectGitRoots(root, maxDepth);
-  const repoFindings = classifyRouting(roots.map((repoRoot) => repoFinding(repoRoot, root)))
+  const repoFindings = classifyRouting(
+    roots.map((repoRoot) => repoFinding(repoRoot, root, nearestNestedParent(repoRoot, roots))),
+  )
     .sort((a, b) => {
       if (a.status !== b.status) return a.status === "needs-remediation" ? -1 : 1;
       if (a.routeable !== b.routeable) return a.routeable ? -1 : 1;
