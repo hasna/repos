@@ -393,10 +393,14 @@ function canonicalPathTier(repo: InternalRepoFinding, expectedOpenName: string, 
   return 1;
 }
 
+function expectedOpenCheckoutName(repoName: string): string {
+  return repoName.startsWith("open-") ? repoName : `open-${repoName}`;
+}
+
 function canonicalScore(repo: InternalRepoFinding): [number, number, number, string] {
   const path = repo.path.toLowerCase();
   const repoName = repo.repo_key?.split("/").pop() ?? "";
-  const expectedOpenName = repoName ? `open-${repoName}` : "";
+  const expectedOpenName = repoName ? expectedOpenCheckoutName(repoName) : "";
   const pathTier = canonicalPathTier(repo, expectedOpenName, path);
   let score = 0;
 

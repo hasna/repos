@@ -432,6 +432,42 @@ describe("no-cloud inventory", () => {
     });
   });
 
+  it("treats repo names that already start with open as expected top-level checkouts", () => {
+    withTempWorkspace((root) => {
+      const expected = join(root, "hasna", "opensource", "open-chrome");
+      const duplicate = join(root, "hasnaxyz", "project", "open-chrome");
+      gitRepo(expected);
+      writeFileSync(join(expected, "README.md"), `${cloudPackage}\n`);
+      commitAll(expected, "add cloud evidence");
+      setTrackedGitHubRemote(expected, "https://github.com/hasnaxyz/open-chrome.git");
+      writeFileSync(join(expected, "README.md"), `${cloudPackage}\nlocal dirty change\n`);
+      gitRepo(duplicate);
+      writeFileSync(join(duplicate, "README.md"), `${cloudPackage}\n`);
+      commitAll(duplicate, "add cloud evidence");
+      setTrackedGitHubRemote(duplicate, "https://github.com/hasnaxyz/open-chrome.git");
+
+      const report = getNoCloudInventory({ root, limit: 10, maxDepth: 4 });
+      const expectedFinding = report.repos.find((entry) => entry.path === "hasna/opensource/open-chrome");
+      const duplicateFinding = report.repos.find((entry) => entry.path === "hasnaxyz/project/open-chrome");
+
+      expect(expectedFinding).toMatchObject({
+        repo_key: "hasnaxyz/open-chrome",
+        routing: "canonical",
+        routeable: false,
+        route_blocked_reason: "dirty-worktree",
+        canonical_path: "hasna/opensource/open-chrome",
+      });
+      expect(duplicateFinding).toMatchObject({
+        repo_key: "hasnaxyz/open-chrome",
+        routing: "duplicate",
+        routeable: false,
+        route_blocked_reason: "duplicate-checkout",
+        canonical_path: "hasna/opensource/open-chrome",
+        duplicate_of: "hasna/opensource/open-chrome",
+      });
+    });
+  });
+
   it("does not skip large lockfiles that contain cloud references", () => {
     withTempWorkspace((root) => {
       const repo = join(root, "large-lock");
