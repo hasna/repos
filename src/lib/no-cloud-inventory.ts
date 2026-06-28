@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 
 type InventoryStatus = "verify-clean" | "needs-remediation";
 type InventoryRouting = "canonical" | "duplicate" | "unkeyed";
@@ -281,14 +281,25 @@ function collectGitRoots(root: string, maxDepth: number): { roots: string[]; exc
   return { roots: [...roots].sort(), excluded: [...excluded].sort() };
 }
 
+function nearestAncestorGitRoot(root: string): string | null {
+  let current = dirname(root);
+  while (current !== dirname(current)) {
+    if (existsSync(join(current, ".git"))) return current;
+    current = dirname(current);
+  }
+  return null;
+}
+
 function nearestNestedParent(root: string, roots: string[]): string | null {
   const normalizedRoot = root.replaceAll("\\", "/");
-  return roots
+  const discoveredParent = roots
     .filter((candidate) => {
       const normalizedCandidate = candidate.replaceAll("\\", "/");
       return normalizedCandidate !== normalizedRoot && normalizedRoot.startsWith(`${normalizedCandidate}/`);
     })
     .sort((a, b) => b.length - a.length)[0] ?? null;
+
+  return discoveredParent ?? nearestAncestorGitRoot(root);
 }
 
 function collectCloudFiles(root: string): string[] {
@@ -375,16 +386,16 @@ function repoFinding(root: string, base: string, nestedParentPath: string | null
   };
 }
 
-function canonicalScore(repo: InternalRepoFinding): [number, number, string] {
+function canonicalScore(repo: InternalRepoFinding): [number, number, number, string] {
   const path = repo.path.toLowerCase();
   const repoName = repo.repo_key?.split("/").pop() ?? "";
   const expectedOpenName = repoName ? `open-${repoName}` : "";
+  const nestedTier = repo.nested_parent_path ? 1 : 0;
   let score = 0;
 
   if (expectedOpenName && (path === expectedOpenName || path.endsWith(`/opensource/${expectedOpenName}`))) score -= 100;
   if (repo.branch === "main") score -= 20;
   if (repo.dirty > 0) score += 250;
-  if (repo.nested_parent_path) score += 320;
   if (/(^|\/)opensourcedev(\/|$)/.test(path) || repo.policy_path.includes("/opensourcedev/")) score += 180;
   if ((repo.behind ?? 0) > 0) score += 220;
   if ((repo.ahead ?? 0) > 0) score += 180;
@@ -393,7 +404,7 @@ function canonicalScore(repo: InternalRepoFinding): [number, number, string] {
   if (path.includes("/.codewith")) score += 250;
   if (/(compact|improve|review|feature|worktree|codex|goal|pr-\d+)/.test(path)) score += 80;
 
-  return [score, path.length, path];
+  return [nestedTier, score, path.length, path];
 }
 
 function isNoTouchRepoKey(repoKey: string | null): boolean {
@@ -477,7 +488,10 @@ function classifyRouting(findings: InternalRepoFinding[]): NoCloudRepoFinding[] 
     const canonical = [...group].sort((a, b) => {
       const aScore = canonicalScore(a);
       const bScore = canonicalScore(b);
-      return aScore[0] - bScore[0] || aScore[1] - bScore[1] || aScore[2].localeCompare(bScore[2]);
+      return aScore[0] - bScore[0]
+        || aScore[1] - bScore[1]
+        || aScore[2] - bScore[2]
+        || aScore[3].localeCompare(bScore[3]);
     })[0];
     if (!canonical) continue;
 

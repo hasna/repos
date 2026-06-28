@@ -351,7 +351,31 @@ describe("no-cloud inventory", () => {
     });
   });
 
-  it("does not promote a clean nested duplicate over a top-level checkout", () => {
+  it("blocks a nested git checkout even when the inventory root is the nested checkout itself", () => {
+    withTempWorkspace((root) => {
+      const parent = join(root, "open-brains");
+      const child = join(parent, "brains");
+      gitRepo(parent);
+      gitRepo(child);
+      writeFileSync(join(child, "README.md"), `${cloudPackage}\n`);
+      commitAll(child, "add cloud evidence");
+      setTrackedGitHubRemote(child, "https://github.com/hasna/brains.git");
+
+      const report = getNoCloudInventory({ root: child, limit: 10 });
+      const childFinding = report.repos.find((entry) => entry.path === child);
+
+      expect(childFinding).toMatchObject({
+        repo_key: "hasna/brains",
+        routing: "canonical",
+        routeable: false,
+        route_blocked_reason: "nested-git-checkout",
+        canonical_path: child,
+      });
+      expect(report.summary.routeable).toBe(0);
+    });
+  });
+
+  it("does not promote a clean nested duplicate over a heavily penalized top-level checkout", () => {
     withTempWorkspace((root) => {
       const parent = join(root, "open-brains");
       const child = join(parent, "brains");
@@ -359,6 +383,12 @@ describe("no-cloud inventory", () => {
       writeFileSync(join(parent, "README.md"), `${cloudPackage}\n`);
       commitAll(parent, "add cloud evidence");
       setTrackedGitHubRemote(parent, "https://github.com/hasna/brains.git");
+      writeFileSync(join(parent, "CHANGELOG.md"), "new remote-only commit\n");
+      commitAll(parent, "remote-only change");
+      const remoteHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: parent, encoding: "utf-8" }).trim();
+      execFileSync("git", ["update-ref", "refs/remotes/origin/main", remoteHead], { cwd: parent, stdio: "pipe" });
+      execFileSync("git", ["reset", "--hard", "HEAD~1"], { cwd: parent, stdio: "pipe" });
+      writeFileSync(join(parent, "README.md"), `${cloudPackage}\nlocal dirty change\n`);
       gitRepo(child);
       writeFileSync(join(child, "README.md"), `${cloudPackage}\n`);
       commitAll(child, "add cloud evidence");
@@ -374,7 +404,9 @@ describe("no-cloud inventory", () => {
         routeable: false,
         route_blocked_reason: "dirty-worktree",
         canonical_path: "open-brains",
+        behind: 1,
       });
+      expect(parentFinding?.dirty).toBeGreaterThan(0);
       expect(childFinding).toMatchObject({
         repo_key: "hasna/brains",
         routing: "duplicate",
