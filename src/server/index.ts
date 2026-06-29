@@ -18,8 +18,9 @@ import {
 import { ensureWorkspaceBootstrap, startAutoIndexWorker } from "../lib/auto-index.js";
 import { getHealthReport } from "../lib/utils.js";
 import { handleMcpHttpRoutes } from "../mcp/http.js";
+import { getCliVersion } from "../cli/version.js";
 
-const VERSION = "0.1.7";
+const VERSION = getCliVersion();
 
 function handleCliFlags(argv: string[]): boolean {
   if (argv.includes("--help") || argv.includes("-h")) {

@@ -30,9 +30,10 @@ import {
   withTodos,
 } from "../lib/repo-ops.js";
 import { getDb } from "../db/database.js";
+import { getCliVersion } from "../cli/version.js";
 
 export const MCP_NAME = "repos";
-export const VERSION = "0.1.7";
+export const VERSION = getCliVersion();
 
 export function buildServer(): McpServer {
   const server = new McpServer({

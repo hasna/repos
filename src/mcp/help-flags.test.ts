@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+
+const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf-8")).version;
 
 function runScript(script: string, ...args: string[]) {
   return Bun.spawnSync({
@@ -33,6 +36,7 @@ describe("entrypoint help/version flags", () => {
 
     expect(result.exitCode).toBe(0);
     expect(out).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(out).toBe(PACKAGE_VERSION);
   });
 
   test("server version returns semver", () => {
@@ -41,5 +45,6 @@ describe("entrypoint help/version flags", () => {
 
     expect(result.exitCode).toBe(0);
     expect(out).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(out).toBe(PACKAGE_VERSION);
   });
 });

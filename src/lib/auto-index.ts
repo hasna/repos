@@ -158,14 +158,9 @@ function getEnvFlag(primary: string, fallback: string, defaultValue: boolean): b
 
 function createRemoteSyncClient(databaseUrl: string): ReposRemoteSyncClient {
   const sslEnabled = getEnvFlag("HASNA_REPOS_DATABASE_SSL", "REPOS_DATABASE_SSL", true);
-  const rejectUnauthorized = getEnvFlag(
-    "HASNA_REPOS_DATABASE_SSL_REJECT_UNAUTHORIZED",
-    "REPOS_DATABASE_SSL_REJECT_UNAUTHORIZED",
-    true,
-  );
   return new Client({
     connectionString: databaseUrl,
-    ssl: sslEnabled ? { rejectUnauthorized } : false,
+    ssl: sslEnabled,
   });
 }
 
