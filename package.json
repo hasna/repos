@@ -1,6 +1,6 @@
 {
   "name": "@hasna/repos",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "Local repo intelligence platform for AI agents — track all repos, search commits, PRs, branches across your machine. CLI + MCP + Web dashboard.",
   "type": "module",
   "workspaces": [
@@ -34,7 +34,7 @@
     "dev:cli": "bun run src/cli/index.tsx",
     "dev:mcp": "bun run src/mcp/index.ts",
     "dev:serve": "bun run src/server/index.ts",
-    "prepublishOnly": "bun run build",
+    "prepublishOnly": "bun run typecheck && bun test && bun run build",
     "postinstall": "mkdir -p $HOME/.hasna/repos 2>/dev/null || true"
   },
   "keywords": [

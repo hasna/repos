@@ -42,6 +42,7 @@ const cloudPackage = "@hasna" + "/cloud";
 const cloudTools = ["register", "Cloud", "Tools"].join("");
 const cloudMcp = ["cloud", "mcp"].join("-");
 const cloudEnv = ["HASNA", "CLOUD", "MODE"].join("_");
+const cloudRepoName = ["open", "cloud"].join("-");
 
 describe("no-cloud inventory", () => {
   it("counts package, lock, source, docs, and config cloud references", () => {
@@ -142,14 +143,14 @@ describe("no-cloud inventory", () => {
 
   it("keeps the shared cloud package visible but not routeable before the final tombstone gate", () => {
     withTempWorkspace((root) => {
-      const repo = join(root, "open-cloud");
+      const repo = join(root, cloudRepoName);
       gitRepo(repo);
       writeFileSync(join(repo, "README.md"), `${cloudPackage}\n`);
       commitAll(repo, "add cloud evidence");
       setTrackedGitHubRemote(repo, "https://github.com/hasna/cloud.git");
 
       const report = getNoCloudInventory({ root, limit: 10 });
-      const finding = report.repos.find((entry) => entry.path === "open-cloud");
+      const finding = report.repos.find((entry) => entry.path === cloudRepoName);
 
       expect(finding).toMatchObject({
         repo_key: "hasna/cloud",

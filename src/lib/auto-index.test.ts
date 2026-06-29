@@ -8,6 +8,9 @@ import { ensureWorkspaceBootstrap, syncRepoCatalog, type ReposRemoteSyncClient }
 import { HOOK_MARKER_START } from "./repo-hooks";
 
 const TEST_DIR = join(import.meta.dir, "../../.test-auto-index");
+const legacyRdsEnvNames = ["HOST", "PORT", "USERNAME", "USER", "PASSWORD", "DATABASE", "DB"].map((name) =>
+  ["HASNA", "RDS", name].join("_"),
+);
 
 class FakeRemoteSyncClient implements ReposRemoteSyncClient {
   records = new Map<string, { table_name: string; record_id: string; payload: Record<string, unknown>; updated_at: string }>();
@@ -122,10 +125,7 @@ beforeEach(() => {
   process.env["HASNA_REPOS_HOOK_QUEUE_PATH"] = join(TEST_DIR, "hook-events.tsv");
   delete process.env["HASNA_REPOS_STORAGE_MODE"];
   delete process.env["HASNA_REPOS_DATABASE_URL"];
-  delete process.env[["HASNA", "RDS", "HOST"].join("_")];
-  delete process.env[["HASNA", "RDS", "PORT"].join("_")];
-  delete process.env[["HASNA", "RDS", "USERNAME"].join("_")];
-  delete process.env[["HASNA", "RDS", "PASSWORD"].join("_")];
+  for (const name of legacyRdsEnvNames) delete process.env[name];
   delete process.env["REPOS_STORAGE_MODE"];
   delete process.env["REPOS_DATABASE_URL"];
   getDb(":memory:");
@@ -140,10 +140,7 @@ afterAll(() => {
   delete process.env["HASNA_REPOS_HOOK_QUEUE_PATH"];
   delete process.env["HASNA_REPOS_STORAGE_MODE"];
   delete process.env["HASNA_REPOS_DATABASE_URL"];
-  delete process.env[["HASNA", "RDS", "HOST"].join("_")];
-  delete process.env[["HASNA", "RDS", "PORT"].join("_")];
-  delete process.env[["HASNA", "RDS", "USERNAME"].join("_")];
-  delete process.env[["HASNA", "RDS", "PASSWORD"].join("_")];
+  for (const name of legacyRdsEnvNames) delete process.env[name];
   delete process.env["REPOS_STORAGE_MODE"];
   delete process.env["REPOS_DATABASE_URL"];
 });
@@ -152,7 +149,7 @@ describe("auto-index", () => {
   it("bootstraps a workspace and installs post-commit hooks", async () => {
     const repoPath = createTestRepo("bootstrap-repo", 2);
 
-    const result = await ensureWorkspaceBootstrap([TEST_DIR], { syncCloud: false });
+    const result = await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
     const hookPath = join(repoPath, ".git", "hooks", "post-commit");
 
     expect(result.bootstrapped).toBe(true);
@@ -161,7 +158,7 @@ describe("auto-index", () => {
     expect(listRepos().length).toBe(1);
     expect(readFileSync(hookPath, "utf-8")).toContain(HOOK_MARKER_START);
 
-    const second = await ensureWorkspaceBootstrap([TEST_DIR], { syncCloud: false });
+    const second = await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
     expect(second.bootstrapped).toBe(false);
     expect(second.hooks.unchanged).toBe(0);
   });
@@ -170,8 +167,7 @@ describe("auto-index", () => {
     process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
     closeDb();
     const repoPath = createTestRepo("sync-push-repo", 1);
-    await ensureWorkspaceBootstrap([TEST_DIR], { syncCloud: false });
-    process.env["HASNA_REPOS_STORAGE_MODE"] = "hybrid";
+    await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
     process.env["HASNA_REPOS_DATABASE_URL"] = "postgres://repos@example.invalid/repos";
     const remote = new FakeRemoteSyncClient();
 
@@ -186,12 +182,32 @@ describe("auto-index", () => {
     });
   });
 
+  it("honors an explicit databaseUrl option without separate storage mode", async () => {
+    process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
+    closeDb();
+    const repoPath = createTestRepo("sync-option-url-repo", 1);
+    await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
+    const remote = new FakeRemoteSyncClient();
+
+    const result = await syncRepoCatalog("push", undefined, {
+      databaseUrl: "postgres://repos@example.invalid/repos",
+      remoteClient: remote,
+    });
+
+    expect(result.enabled).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.rowsSynced).toBeGreaterThanOrEqual(1);
+    expect(remote.repos.get(repoPath)).toMatchObject({
+      path: repoPath,
+      name: "sync-option-url-repo",
+    });
+  });
+
   it("pulls remote catalog records into the local database", async () => {
     process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
     closeDb();
     getDb();
     process.env["HASNA_REPOS_STORAGE_MODE"] = "remote";
-    process.env["HASNA_REPOS_DATABASE_URL"] = "postgres://repos@example.invalid/repos";
     const remote = new FakeRemoteSyncClient();
     const repoPath = join(TEST_DIR, "remote-repo");
     remote.seedRepo(repoPath, {
@@ -219,19 +235,20 @@ describe("auto-index", () => {
     });
   });
 
-  it("honors legacy RDS envs without the shared cloud package", async () => {
+  it("stays local for legacy shared RDS envs without repo-owned database config", async () => {
     process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
     closeDb();
     createTestRepo("legacy-rds-repo", 1);
-    await ensureWorkspaceBootstrap([TEST_DIR], { syncCloud: false });
-    process.env[["HASNA", "RDS", "HOST"].join("_")] = "rds.example.invalid";
-    process.env[["HASNA", "RDS", "PORT"].join("_")] = "5432";
-    process.env[["HASNA", "RDS", "USERNAME"].join("_")] = "repos_user";
-    process.env[["HASNA", "RDS", "PASSWORD"].join("_")] = "repos-password";
+    await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
+    process.env[legacyRdsEnvNames[0]!] = "rds.example.invalid";
+    process.env[legacyRdsEnvNames[1]!] = "5432";
+    process.env[legacyRdsEnvNames[2]!] = "repos_user";
+    process.env[legacyRdsEnvNames[4]!] = "repos-password";
 
     const result = await syncRepoCatalog("push", undefined, { remoteClient: new FakeRemoteSyncClient() });
 
-    expect(result.enabled).toBe(true);
+    expect(result.enabled).toBe(false);
+    expect(result.skippedReason).toBe("local_mode");
     expect(result.errors).toEqual([]);
   });
 });

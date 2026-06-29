@@ -10,7 +10,7 @@ import { discoverRepos, scanRepoPaths } from "./scanner.js";
 
 const WORKSPACE_BOOTSTRAP_STATE_KEY = "workspace_bootstrap";
 
-export interface CloudSyncSummary {
+export interface RemoteSyncSummary {
   direction: "pull" | "push";
   enabled: boolean;
   rowsSynced: number;
@@ -23,8 +23,8 @@ export interface WorkspaceBootstrapResult {
   roots: string[];
   hooks: ReturnType<typeof installPostCommitHooks>;
   scan?: ScanResult;
-  cloudPull?: CloudSyncSummary;
-  cloudPush?: CloudSyncSummary;
+  remotePull?: RemoteSyncSummary;
+  remotePush?: RemoteSyncSummary;
 }
 
 export interface AutoIndexWorker {
@@ -61,13 +61,6 @@ interface SyncTableSpec {
 }
 
 const SYNC_RECORD_TABLE = "repos_sync_records";
-const LEGACY_RDS_HOST_ENV = ["HASNA", "RDS", "HOST"].join("_");
-const LEGACY_RDS_PORT_ENV = ["HASNA", "RDS", "PORT"].join("_");
-const LEGACY_RDS_USER_ENV = ["HASNA", "RDS", "USERNAME"].join("_");
-const LEGACY_RDS_ALT_USER_ENV = ["HASNA", "RDS", "USER"].join("_");
-const LEGACY_RDS_PASSWORD_ENV = ["HASNA", "RDS", "PASSWORD"].join("_");
-const LEGACY_RDS_DATABASE_ENV = ["HASNA", "RDS", "DATABASE"].join("_");
-const LEGACY_RDS_ALT_DATABASE_ENV = ["HASNA", "RDS", "DB"].join("_");
 const SYNC_TABLES: SyncTableSpec[] = [
   {
     table: "repos",
@@ -145,12 +138,12 @@ function getRepoCount(): number {
 function getReposStorageMode(): "local" | "remote" | "hybrid" {
   const raw = (process.env["HASNA_REPOS_STORAGE_MODE"] || process.env["REPOS_STORAGE_MODE"] || "local").toLowerCase();
   if (raw === "remote" || raw === "hybrid") return raw;
-  if (hasLegacyRdsConfig() || process.env["HASNA_REPOS_DATABASE_URL"] || process.env["REPOS_DATABASE_URL"]) return "hybrid";
+  if (process.env["HASNA_REPOS_DATABASE_URL"] || process.env["REPOS_DATABASE_URL"]) return "hybrid";
   return "local";
 }
 
 function getReposDatabaseUrl(options: SyncRepoCatalogOptions): string | null {
-  return options.databaseUrl ?? process.env["HASNA_REPOS_DATABASE_URL"] ?? process.env["REPOS_DATABASE_URL"] ?? getLegacyRdsDatabaseUrl();
+  return options.databaseUrl ?? process.env["HASNA_REPOS_DATABASE_URL"] ?? process.env["REPOS_DATABASE_URL"] ?? null;
 }
 
 function getReposDatabaseSchema(options: SyncRepoCatalogOptions): string | null {
@@ -174,24 +167,6 @@ function createRemoteSyncClient(databaseUrl: string): ReposRemoteSyncClient {
     connectionString: databaseUrl,
     ssl: sslEnabled ? { rejectUnauthorized } : false,
   });
-}
-
-function hasLegacyRdsConfig(): boolean {
-  return Boolean(
-    process.env[LEGACY_RDS_HOST_ENV]
-      && (process.env[LEGACY_RDS_USER_ENV] || process.env[LEGACY_RDS_ALT_USER_ENV])
-      && process.env[LEGACY_RDS_PASSWORD_ENV],
-  );
-}
-
-function getLegacyRdsDatabaseUrl(): string | null {
-  if (!hasLegacyRdsConfig()) return null;
-  const host = process.env[LEGACY_RDS_HOST_ENV]!;
-  const port = process.env[LEGACY_RDS_PORT_ENV] || "5432";
-  const user = process.env[LEGACY_RDS_USER_ENV] || process.env[LEGACY_RDS_ALT_USER_ENV] || "";
-  const password = process.env[LEGACY_RDS_PASSWORD_ENV] || "";
-  const database = process.env[LEGACY_RDS_DATABASE_ENV] || process.env[LEGACY_RDS_ALT_DATABASE_ENV] || "repos";
-  return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}`;
 }
 
 function quotePgIdentifier(identifier: string): string {
@@ -437,8 +412,9 @@ export async function syncRepoCatalog(
   direction: "pull" | "push",
   onProgress?: (msg: string) => void,
   options: SyncRepoCatalogOptions = {},
-): Promise<CloudSyncSummary> {
-  const storageMode = options.storageMode ?? getReposStorageMode();
+): Promise<RemoteSyncSummary> {
+  const databaseUrl = getReposDatabaseUrl(options);
+  const storageMode = options.storageMode ?? (databaseUrl ? "hybrid" : getReposStorageMode());
   if (storageMode === "local") {
     return {
       direction,
@@ -460,7 +436,6 @@ export async function syncRepoCatalog(
     };
   }
 
-  const databaseUrl = getReposDatabaseUrl(options);
   if (!databaseUrl && !options.remoteClient) {
     return {
       direction,
@@ -505,12 +480,12 @@ export async function ensureWorkspaceBootstrap(
     force?: boolean;
     full?: boolean;
     onProgress?: (msg: string) => void;
-    syncCloud?: boolean;
+    syncRemote?: boolean;
     workers?: number;
   } = {},
 ): Promise<WorkspaceBootstrapResult> {
   const roots = getWorkspaceRoots(rootDirs).map((root) => resolve(root));
-  const shouldSyncCloud = opts.syncCloud ?? true;
+  const shouldSyncRemote = opts.syncRemote ?? true;
   const state = getAutomationState<{ roots: string[] }>(WORKSPACE_BOOTSTRAP_STATE_KEY);
   const repoCount = getRepoCount();
   const expectedRoots = JSON.stringify(roots);
@@ -525,7 +500,7 @@ export async function ensureWorkspaceBootstrap(
     };
   }
 
-  const cloudPull = shouldSyncCloud ? await syncRepoCatalog("pull", opts.onProgress) : undefined;
+  const remotePull = shouldSyncRemote ? await syncRepoCatalog("pull", opts.onProgress) : undefined;
 
   const repoPaths = discoverRepos(roots);
   const hooks = installPostCommitHooks(repoPaths, getHookQueuePath());
@@ -543,15 +518,15 @@ export async function ensureWorkspaceBootstrap(
     bootstrappedAt: new Date().toISOString(),
   });
 
-  const cloudPush = shouldSyncCloud ? await syncRepoCatalog("push", opts.onProgress) : undefined;
+  const remotePush = shouldSyncRemote ? await syncRepoCatalog("push", opts.onProgress) : undefined;
 
   return {
     bootstrapped: true,
     roots,
     hooks,
     scan,
-    cloudPull,
-    cloudPush,
+    remotePull,
+    remotePush,
   };
 }
 
@@ -560,7 +535,7 @@ export async function startAutoIndexWorker(
   opts: {
     full?: boolean;
     onProgress?: (msg: string) => void;
-    syncCloud?: boolean;
+    syncRemote?: boolean;
     workers?: number;
   } = {},
 ): Promise<AutoIndexWorker> {
@@ -570,7 +545,7 @@ export async function startAutoIndexWorker(
   await ensureWorkspaceBootstrap(roots, {
     full: opts.full,
     onProgress: opts.onProgress,
-    syncCloud: opts.syncCloud,
+    syncRemote: opts.syncRemote,
     workers: opts.workers,
   });
 
@@ -594,10 +569,10 @@ export async function startAutoIndexWorker(
         opts.onProgress?.(
           `[${source}] ${basename(normalizedRepoPath)} indexed (${result.commits_indexed} commits, ${result.branches_indexed} branches, ${result.tags_indexed} tags)`,
         );
-        if (opts.syncCloud ?? true) {
+        if (opts.syncRemote ?? true) {
           const syncResult = await syncRepoCatalog("push", opts.onProgress);
           if (syncResult.errors.length > 0) {
-            opts.onProgress?.(`[cloud] push failed: ${syncResult.errors.join("; ")}`);
+            opts.onProgress?.(`[remote] push failed: ${syncResult.errors.join("; ")}`);
           }
         }
       })().catch((error) => {

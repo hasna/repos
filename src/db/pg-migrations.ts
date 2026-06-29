@@ -1,4 +1,4 @@
-// PostgreSQL migrations for @hasna/git cloud deployment
+// PostgreSQL migrations for @hasna/repos app-owned remote storage
 // These mirror the SQLite schema but use PostgreSQL syntax
 
 export const PG_MIGRATIONS = [

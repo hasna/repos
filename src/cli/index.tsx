@@ -219,7 +219,7 @@ async function bootstrapCliIfNeeded(argv: string[]) {
 
   const quiet = argv.includes("--json");
   await ensureWorkspaceBootstrap(undefined, {
-    syncCloud: false,
+    syncRemote: false,
     onProgress: quiet ? undefined : (msg) => console.log(chalk.dim(`[auto-index] ${msg}`)),
   });
 }
