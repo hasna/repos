@@ -53,8 +53,13 @@ export {
   getGlobalStats,
 } from "./db/repos.js";
 export {
+  buildDependencyRefresh,
+  buildDocsRulesDrift,
   buildPrQueue,
+  buildProtectedRelease,
   buildReleaseCandidates,
+  buildTaskRouteHealth,
+  buildWorkspaceWorktreeHygiene,
   inspectPackageHygiene,
   runGlobalCliSmoke,
 } from "./lib/ops-producers.js";
@@ -65,13 +70,23 @@ export {
 export type {
   CliSmokeOptions,
   CliSmokeResult,
+  DependencyRefreshOptions,
+  DependencyRefreshResult,
+  DocsRulesDriftOptions,
+  DocsRulesDriftResult,
   PackageHygieneOptions,
   PackageHygieneResult,
   PrQueueOptions,
+  ProtectedReleaseOptions,
+  ProtectedReleaseResult,
   RepoPrQueueResult,
   ReleaseCandidateOptions,
   ReleaseCandidateResult,
+  TaskRouteHealthOptions,
+  TaskRouteHealthResult,
   TaskSeed,
+  WorkspaceWorktreeHygieneOptions,
+  WorkspaceWorktreeHygieneResult,
 } from "./lib/ops-producers.js";
 export type {
   TodosCommandResult,

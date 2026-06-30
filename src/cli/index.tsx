@@ -24,7 +24,18 @@ import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/githu
 import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getCrossOrgAuthors, getGraphStats } from "../lib/graph.js";
-import { buildPrQueue, buildReleaseCandidates, inspectPackageHygiene, runGlobalCliSmoke, type TaskSeed } from "../lib/ops-producers.js";
+import {
+  buildDependencyRefresh,
+  buildDocsRulesDrift,
+  buildPrQueue,
+  buildProtectedRelease,
+  buildReleaseCandidates,
+  buildTaskRouteHealth,
+  buildWorkspaceWorktreeHygiene,
+  inspectPackageHygiene,
+  runGlobalCliSmoke,
+  type TaskSeed,
+} from "../lib/ops-producers.js";
 import { upsertTaskSeeds, writeLoopReport } from "../lib/ops-loop-tasks.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg, fuzzyFindRepo } from "../lib/utils.js";
 import {
@@ -974,6 +985,272 @@ addLoopProducerOptions(
       const label = gate.status === "block" ? chalk.yellow("block") : gate.status === "warn" ? chalk.magenta("warn") : chalk.green("pass");
       console.log(`${label} ${gate.id}: ${gate.message}`);
     }
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+  });
+
+addLoopProducerOptions(
+  ops
+    .command("docs-rules-drift")
+    .description("Detect source changes that need docs, changelog, prompt, skill, or agent-rule updates")
+    .requiredOption("--repo <path-or-name>", "Local repo path or repos registry name")
+    .option("--github-repo <owner/name>", "GitHub owner/name; inferred from origin remote by default")
+    .option("--branch <branch>", "Release branch", "main")
+    .option("--docs-paths <paths>", "Comma-separated docs/rules paths to watch")
+    .option("--source-paths <paths>", "Comma-separated source paths to compare")
+    .option("--timeout-ms <n>", "Per-command timeout", "20000")
+    .option("--no-fetch", "Skip git fetch before inspection")
+    .option("--json", "Output JSON")
+    .addHelpText("after", "\nLoop use: add --repo <repo> --report-dir <dir> --upsert-tasks --todos-project <repo-project> --task-list codewith-product-backlog."),
+  1,
+)
+  .action((opts: LoopProducerOpts & {
+    repo: string;
+    githubRepo?: string;
+    branch: string;
+    docsPaths?: string;
+    sourcePaths?: string;
+    timeoutMs: string;
+    fetch?: boolean;
+    json?: boolean;
+  }) => {
+    const result = buildDocsRulesDrift({
+      repo: opts.repo,
+      githubRepo: opts.githubRepo,
+      branch: opts.branch,
+      docsPaths: csvFlag(opts.docsPaths),
+      sourcePaths: csvFlag(opts.sourcePaths),
+      fetch: opts.fetch !== false,
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "repo-docs-rules-drift",
+      taskList: "repo-docs-rules-drift",
+      taskListName: "Repo Docs and Rules Drift",
+      taskListDescription: "Docs, changelog, skills, and agent rule drift tasks created by deterministic OpenRepos producers.",
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+      return;
+    }
+    const status = result.summary.status === "ok" ? chalk.green("ok") : result.summary.status === "blocked" ? chalk.red("blocked") : chalk.yellow("drift");
+    console.log(`${status} ${result.repo.github_repo} seeds=${result.summary.task_seeds}`);
+    for (const issue of result.issues) console.log(`${issue.severity === "high" ? chalk.red("high") : chalk.yellow("medium")} ${issue.id}: ${issue.message}`);
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+  });
+
+addLoopProducerOptions(
+  ops
+    .command("dependency-refresh")
+    .description("Detect repo dependency refresh needs and emit lifecycle-routed task seeds")
+    .requiredOption("--repo <path-or-name>", "Local repo path or repos registry name")
+    .option("--github-repo <owner/name>", "GitHub owner/name; inferred from origin remote by default")
+    .option("--max-lock-age-days <n>", "Create a refresh task when lockfiles are older than this", "7")
+    .option("--timeout-ms <n>", "Per-command timeout", "30000")
+    .option("--json", "Output JSON"),
+  1,
+)
+  .action((opts: LoopProducerOpts & {
+    repo: string;
+    githubRepo?: string;
+    maxLockAgeDays: string;
+    timeoutMs: string;
+    json?: boolean;
+  }) => {
+    const result = buildDependencyRefresh({
+      repo: opts.repo,
+      githubRepo: opts.githubRepo,
+      maxLockAgeDays: intFlag(opts.maxLockAgeDays, "--max-lock-age-days", 1),
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "repo-dependency-refresh",
+      taskList: "repo-dependency-refresh",
+      taskListName: "Repo Dependency Refresh",
+      taskListDescription: "Dependency refresh tasks created by deterministic OpenRepos producers.",
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+      return;
+    }
+    const status = result.summary.status === "ok" ? chalk.green("ok") : chalk.yellow("needs-refresh");
+    console.log(`${status} ${result.repo.github_repo} seeds=${result.summary.task_seeds}`);
+    for (const check of result.checks.filter((check) => check.status !== "ok")) console.log(`${check.status} ${check.id}: ${check.message}`);
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+  });
+
+addLoopProducerOptions(
+  ops
+    .command("workspace-worktree-hygiene")
+    .description("Inspect workspace repos for stale, dirty, detached, or missing OpenLoops worktrees")
+    .option("--root <path>", "Workspace root to scan; repeatable or comma-separated", collectValues, [])
+    .option("--worktree-root <path>", "Only report worktrees under this root")
+    .option("--stale-days <n>", "Age threshold for stale worktrees", "7")
+    .option("-n, --limit <n>", "Maximum repos to inspect", "200")
+    .option("--timeout-ms <n>", "Per-command timeout", "20000")
+    .option("--json", "Output JSON"),
+  5,
+)
+  .action((opts: LoopProducerOpts & {
+    root: string[];
+    worktreeRoot?: string;
+    staleDays: string;
+    limit: string;
+    timeoutMs: string;
+    json?: boolean;
+  }) => {
+    const result = buildWorkspaceWorktreeHygiene({
+      roots: opts.root.length ? opts.root : undefined,
+      worktreeRoot: opts.worktreeRoot,
+      staleDays: intFlag(opts.staleDays, "--stale-days", 1),
+      limit: intFlag(opts.limit, "--limit", 1),
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "workspace-worktree-hygiene",
+      taskList: "workspace-worktree-hygiene",
+      taskListName: "Workspace Worktree Hygiene",
+      taskListDescription: "Stale, dirty, detached, and missing worktree tasks created by deterministic OpenRepos producers.",
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+      return;
+    }
+    const status = result.summary.issue_worktrees === 0 ? chalk.green("ok") : chalk.yellow("issues");
+    console.log(`${status} repos=${result.summary.repos_checked} issue_worktrees=${result.summary.issue_worktrees} seeds=${result.summary.task_seeds}`);
+    for (const row of result.worktrees.slice(0, 30)) console.log(`${chalk.yellow(row.path)} ${chalk.dim(row.issues.join(","))}`);
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+  });
+
+addLoopProducerOptions(
+  ops
+    .command("task-route-health")
+    .description("Check that a task-created lifecycle router loop is active and recently succeeding")
+    .requiredOption("--router-loop <id-or-name>", "OpenLoops router loop id or name")
+    .option("--project <path>", "Project path the router serves")
+    .option("--max-age-minutes <n>", "Maximum latest-run age", "15")
+    .option("--timeout-ms <n>", "Per-command timeout", "20000")
+    .option("--json", "Output JSON"),
+  1,
+)
+  .action((opts: LoopProducerOpts & {
+    routerLoop: string;
+    project?: string;
+    maxAgeMinutes: string;
+    timeoutMs: string;
+    json?: boolean;
+  }) => {
+    const result = buildTaskRouteHealth({
+      routerLoop: opts.routerLoop,
+      project: opts.project,
+      maxAgeMinutes: intFlag(opts.maxAgeMinutes, "--max-age-minutes", 1),
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "task-route-health",
+      taskList: "task-route-health",
+      taskListName: "Task Route Health",
+      taskListDescription: "Task lifecycle route health tasks created by deterministic OpenRepos producers.",
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+      return;
+    }
+    const status = result.summary.status === "ok" ? chalk.green("ok") : chalk.yellow("issue");
+    console.log(`${status} ${result.router_loop} latest=${result.state.latest_run_status ?? "unknown"} age=${result.state.latest_run_age_minutes ?? "unknown"} seeds=${result.summary.task_seeds}`);
+    for (const issue of result.issues) console.log(`${issue.severity === "high" ? chalk.red("high") : chalk.yellow("medium")} ${issue.id}: ${issue.message}`);
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+  });
+
+addLoopProducerOptions(
+  ops
+    .command("protected-release")
+    .description("Emit a protected release task only when release-candidate gates are green")
+    .requiredOption("--repo <path-or-name>", "Local repo path or repos registry name")
+    .option("--github-repo <owner/name>", "GitHub owner/name; inferred from origin remote by default")
+    .option("--package <name>", "Published package name; inferred from package.json by default")
+    .option("--branch <branch>", "Release branch", "main")
+    .option("--tag-prefix <prefix>", "Release tag prefix", "v")
+    .option("--version-file <path>", "Version file inside the repo; inferred from package.json/Cargo.toml by default")
+    .option("--quiet-minutes <n>", "Block release if branch changed more recently than this", "60")
+    .option("--approval-label <text>", "Protected release approval/check name")
+    .option("--timeout-ms <n>", "Per-command timeout", "20000")
+    .option("--no-fetch", "Skip git fetch before inspection")
+    .option("--no-require-green-ci", "Do not require GitHub Actions to be green")
+    .option("--no-open-pr-blocker", "Do not block on open PRs")
+    .option("--json", "Output JSON"),
+  1,
+)
+  .action((opts: LoopProducerOpts & {
+    repo: string;
+    githubRepo?: string;
+    package?: string;
+    branch: string;
+    tagPrefix: string;
+    versionFile?: string;
+    quietMinutes: string;
+    approvalLabel?: string;
+    timeoutMs: string;
+    fetch?: boolean;
+    requireGreenCi?: boolean;
+    openPrBlocker?: boolean;
+    json?: boolean;
+  }) => {
+    const result = buildProtectedRelease({
+      repo: opts.repo,
+      githubRepo: opts.githubRepo,
+      packageName: opts.package,
+      branch: opts.branch,
+      tagPrefix: opts.tagPrefix,
+      versionFile: opts.versionFile,
+      quietMinutes: intFlag(opts.quietMinutes, "--quiet-minutes", 0),
+      approvalLabel: opts.approvalLabel,
+      requireGreenCi: opts.requireGreenCi !== false,
+      includeOpenPrBlocker: opts.openPrBlocker !== false,
+      fetch: opts.fetch !== false,
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "protected-release",
+      taskList: "protected-release",
+      taskListName: "Protected Release",
+      taskListDescription: "Protected release tasks created only after deterministic release gates are green.",
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+      return;
+    }
+    const status = result.summary.status === "ready" ? chalk.green("ready") : result.summary.status === "blocked" ? chalk.yellow("blocked") : chalk.dim("noop");
+    console.log(`${status} ${result.release.repo.github_repo} ${result.release.state.intended_tag ?? "unknown-tag"} seeds=${result.summary.task_seeds}`);
     if (envelope.loop?.task_upsert) {
       const upsert = envelope.loop.task_upsert.summary;
       console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));

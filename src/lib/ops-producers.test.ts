@@ -5,8 +5,13 @@ import { join } from "node:path";
 import { closeDb, getDb } from "../db/database.js";
 import { bulkInsertPullRequests, upsertRepo } from "../db/repos.js";
 import {
+  buildDependencyRefresh,
+  buildDocsRulesDrift,
   buildPrQueue,
+  buildProtectedRelease,
   buildReleaseCandidates,
+  buildTaskRouteHealth,
+  buildWorkspaceWorktreeHygiene,
   inspectPackageHygiene,
   runGlobalCliSmoke,
   type CommandRunner,
@@ -303,6 +308,122 @@ describe("ops producers", () => {
     expect(result.repo.version_file).toBe("package.json");
     expect(result.state.intended_tag).toBe("v0.2.0");
     expect(result.summary.status).toBe("candidate");
+  });
+
+  test("detects docs and agent-rule drift after source changes", () => {
+    const repoPath = writePackageJsonVersion("@hasna/codewith", "0.2.0");
+    mkdirSync(join(repoPath, "src"), { recursive: true });
+    writeFileSync(join(repoPath, "README.md"), "# docs\n");
+    writeFileSync(join(repoPath, "CODEWITH.md"), "rules\n");
+    writeFileSync(join(repoPath, "src", "index.ts"), "export {}\n");
+    const runner: CommandRunner = (command, args) => {
+      if (command === "git" && args.includes("config")) return { status: 0, stdout: "https://github.com/hasna/codewith.git\n", stderr: "" };
+      if (command === "git" && args.includes("rev-parse")) return { status: 0, stdout: "abcdef1234567890\n", stderr: "" };
+      if (command === "git" && args.includes("log")) return { status: 0, stdout: "1111111111111111\n", stderr: "" };
+      if (command === "git" && args.includes("rev-list")) return { status: 0, stdout: "2\n", stderr: "" };
+      if (command === "git" && args.includes("diff")) return { status: 0, stdout: "src/index.ts\n", stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+
+    const result = buildDocsRulesDrift({ repo: repoPath, fetch: false, runner });
+
+    expect(result.schema).toBe("open-repos.docs-rules-drift.v1");
+    expect(result.summary.status).toBe("drift");
+    expect(result.task_suggestions[0]!.tags).toContain("docs-rules-drift");
+    expect(result.task_suggestions[0]!.body).toContain("CHANGELOG/README/docs");
+  });
+
+  test("detects dependency refresh needs with Bun outdated output", () => {
+    const repoPath = writePackageJsonVersion("@hasna/codewith", "0.2.0");
+    const runner: CommandRunner = (command) => {
+      if (command === "git") return { status: 0, stdout: "https://github.com/hasna/codewith.git\n", stderr: "" };
+      if (command === "bun") return { status: 1, stdout: JSON.stringify({ react: { current: "18.0.0", latest: "19.0.0" } }), stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+
+    const result = buildDependencyRefresh({ repo: repoPath, runner });
+
+    expect(result.schema).toBe("open-repos.dependency-refresh.v1");
+    expect(result.summary.status).toBe("needs-refresh");
+    expect(result.checks.find((check) => check.id === "bun-outdated")?.count).toBe(1);
+    expect(result.task_suggestions[0]!.tags).toContain("dependency-refresh");
+  });
+
+  test("detects stale dirty workspace worktrees under the configured root", () => {
+    const root = mkdtempSync(join(tmpdir(), "open-repos-worktree-root-"));
+    tempDirs.push(root);
+    const repoPath = join(root, "open-codewith");
+    const worktreeRoot = join(root, "worktrees");
+    const worktreePath = join(worktreeRoot, "open-codewith", "task-123");
+    mkdirSync(join(repoPath, ".git"), { recursive: true });
+    mkdirSync(worktreePath, { recursive: true });
+    const runner: CommandRunner = (command, args) => {
+      if (command === "git" && args.includes("worktree")) {
+        return {
+          status: 0,
+          stdout: [
+            `worktree ${repoPath}`,
+            "HEAD mainhead",
+            "branch refs/heads/main",
+            "",
+            `worktree ${worktreePath}`,
+            "HEAD taskhead",
+            "branch refs/heads/openloops/task-123",
+            "",
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      if (command === "git" && args.includes("status")) return { status: 0, stdout: " M src/main.rs\n", stderr: "" };
+      if (command === "git" && args.includes("show")) return { status: 0, stdout: "2026-01-01T00:00:00Z\n", stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+
+    const result = buildWorkspaceWorktreeHygiene({ roots: [root], worktreeRoot, staleDays: 1, runner });
+
+    expect(result.schema).toBe("open-repos.workspace-worktree-hygiene.v1");
+    expect(result.summary.repos_checked).toBe(1);
+    expect(result.summary.issue_worktrees).toBe(1);
+    expect(result.worktrees[0]!.issues).toContain("dirty-worktree");
+    expect(result.worktrees[0]!.task_seed?.tags).toContain("worktree-hygiene");
+  });
+
+  test("emits route health task when router latest run is stale or failed", () => {
+    const runner: CommandRunner = (command, args) => {
+      if (command === "loops" && args.includes("show")) return { status: 0, stdout: JSON.stringify({ status: "active" }), stderr: "" };
+      if (command === "loops" && args.includes("runs")) return { status: 0, stdout: JSON.stringify([{ status: "failed", startedAt: "2026-01-01T00:00:00Z" }]), stderr: "" };
+      return { status: 1, stdout: "", stderr: "bad" };
+    };
+
+    const result = buildTaskRouteHealth({ routerLoop: "machine-repo-open-codewith-task-lifecycle-router", project: "/repo", runner });
+
+    expect(result.schema).toBe("open-repos.task-route-health.v1");
+    expect(result.summary.status).toBe("issue");
+    expect(result.task_suggestions[0]!.fingerprint).toContain("task-route-health");
+  });
+
+  test("emits protected release task only when release gates are candidate-ready", () => {
+    const repoPath = writePackageJsonVersion("@hasna/repos", "0.2.0");
+    const headSha = "abcdef1234567890abcdef1234567890abcdef12";
+    const runner = releaseRunner({
+      headSha,
+      headCommittedAt: "2026-06-26T00:00:00Z",
+      latestReachableTag: "v0.1.0",
+      commitsSinceTag: "2",
+      latestGithubRelease: "v0.1.0",
+      latestNpmVersion: "0.1.0",
+      openPrCount: 0,
+      latestReleaseAncestor: true,
+      intendedTagExists: false,
+      ciRuns: [{ status: "completed", conclusion: "success", workflowName: "ci" }],
+    });
+
+    const result = buildProtectedRelease({ repo: repoPath, githubRepo: "hasna/repos", fetch: false, runner });
+
+    expect(result.schema).toBe("open-repos.protected-release.v1");
+    expect(result.summary.status).toBe("ready");
+    expect(result.task_suggestions[0]!.tags).toContain("protected-release");
+    expect(result.task_suggestions[0]!.priority).toBe("critical");
   });
 });
 

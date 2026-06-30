@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, join } from "node:path";
 import { getDb } from "../db/database.js";
 import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
 import type { PullRequest } from "../types/index.js";
@@ -174,7 +175,7 @@ export interface CliSmokeResult {
 export type CommandRunner = (
   command: string,
   args: string[],
-  opts: { timeoutMs: number },
+  opts: { timeoutMs: number; cwd?: string },
 ) => { status: number | null; stdout: string; stderr: string; error?: { code?: string; message: string } };
 
 const DEFAULT_CLI_SMOKE_COMMANDS: CliSmokeCommandSpec[] = [
@@ -326,6 +327,157 @@ export interface ReleaseCandidateResult {
     status: "noop" | "candidate" | "blocked";
     candidates: number;
     blockers: number;
+    task_seeds: number;
+  };
+  task_suggestions: TaskSeed[];
+}
+
+export interface DocsRulesDriftOptions {
+  repo: string;
+  githubRepo?: string;
+  branch?: string;
+  fetch?: boolean;
+  timeoutMs?: number;
+  docsPaths?: string[];
+  sourcePaths?: string[];
+  runner?: CommandRunner;
+}
+
+export interface DocsRulesDriftResult {
+  schema: "open-repos.docs-rules-drift.v1";
+  generated_at: string;
+  repo: {
+    input: string;
+    path: string;
+    github_repo: string;
+    branch: string;
+  };
+  config: {
+    docs_paths: string[];
+    source_paths: string[];
+  };
+  state: {
+    head_sha: string | null;
+    latest_docs_commit: string | null;
+    source_commits_since_docs: number | null;
+    changed_source_files: string[];
+  };
+  summary: {
+    status: "ok" | "drift" | "blocked";
+    task_seeds: number;
+  };
+  issues: Array<{ id: string; severity: "medium" | "high"; message: string }>;
+  task_suggestions: TaskSeed[];
+}
+
+export interface DependencyRefreshOptions {
+  repo: string;
+  githubRepo?: string;
+  maxLockAgeDays?: number;
+  timeoutMs?: number;
+  runner?: CommandRunner;
+}
+
+export interface DependencyRefreshResult {
+  schema: "open-repos.dependency-refresh.v1";
+  generated_at: string;
+  repo: {
+    input: string;
+    path: string;
+    github_repo: string;
+    package_name: string | null;
+  };
+  limits: {
+    max_lock_age_days: number;
+  };
+  checks: Array<{
+    id: string;
+    status: "ok" | "issue" | "skipped";
+    message: string;
+    count?: number;
+  }>;
+  summary: {
+    status: "ok" | "needs-refresh";
+    task_seeds: number;
+  };
+  task_suggestions: TaskSeed[];
+}
+
+export interface WorkspaceWorktreeHygieneOptions {
+  roots?: string[];
+  worktreeRoot?: string;
+  staleDays?: number;
+  limit?: number;
+  timeoutMs?: number;
+  runner?: CommandRunner;
+}
+
+export interface WorkspaceWorktreeHygieneResult {
+  schema: "open-repos.workspace-worktree-hygiene.v1";
+  generated_at: string;
+  roots: string[];
+  worktree_root: string | null;
+  limits: {
+    stale_days: number;
+    limit: number;
+  };
+  summary: {
+    repos_checked: number;
+    worktrees_checked: number;
+    issue_worktrees: number;
+    task_seeds: number;
+  };
+  worktrees: Array<{
+    repo_path: string;
+    path: string;
+    branch: string | null;
+    head: string | null;
+    age_days: number | null;
+    dirty: boolean;
+    exists: boolean;
+    issues: string[];
+    task_seed?: TaskSeed;
+  }>;
+  task_suggestions: TaskSeed[];
+}
+
+export interface TaskRouteHealthOptions {
+  routerLoop: string;
+  project?: string;
+  maxAgeMinutes?: number;
+  timeoutMs?: number;
+  runner?: CommandRunner;
+}
+
+export interface TaskRouteHealthResult {
+  schema: "open-repos.task-route-health.v1";
+  generated_at: string;
+  router_loop: string;
+  project: string | null;
+  state: {
+    loop_status: string | null;
+    latest_run_status: string | null;
+    latest_run_started_at: string | null;
+    latest_run_age_minutes: number | null;
+  };
+  summary: {
+    status: "ok" | "issue";
+    task_seeds: number;
+  };
+  issues: Array<{ id: string; severity: "high" | "medium"; message: string }>;
+  task_suggestions: TaskSeed[];
+}
+
+export interface ProtectedReleaseOptions extends ReleaseCandidateOptions {
+  approvalLabel?: string;
+}
+
+export interface ProtectedReleaseResult {
+  schema: "open-repos.protected-release.v1";
+  generated_at: string;
+  release: ReleaseCandidateResult;
+  summary: {
+    status: "blocked" | "noop" | "ready";
     task_seeds: number;
   };
   task_suggestions: TaskSeed[];
@@ -541,6 +693,295 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
   };
 }
 
+const DEFAULT_DOCS_PATHS = [
+  "README.md",
+  "CHANGELOG.md",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "CODEWITH.md",
+  "docs",
+  ".codewith/skills",
+  ".agents/skills",
+];
+
+const DEFAULT_SOURCE_PATHS = [
+  "src",
+  "codex-rs",
+  "codex-cli",
+  "app",
+  "packages",
+  "crates",
+  "package.json",
+  "Cargo.toml",
+  "bun.lock",
+  "Cargo.lock",
+  ".github/workflows",
+];
+
+export function buildDocsRulesDrift(options: DocsRulesDriftOptions): DocsRulesDriftResult {
+  const repoPath = resolveRepoPath(options.repo);
+  const runner = options.runner ?? spawnCommand;
+  const timeoutMs = normalizePositiveInteger(options.timeoutMs, 20_000);
+  const branch = options.branch ?? "main";
+  const githubRepo = options.githubRepo ?? inferGithubRepo(repoPath, runner, timeoutMs) ?? "unknown/unknown";
+  const docsPaths = existingRelativePaths(repoPath, options.docsPaths?.length ? options.docsPaths : DEFAULT_DOCS_PATHS);
+  const sourcePaths = existingRelativePaths(repoPath, options.sourcePaths?.length ? options.sourcePaths : DEFAULT_SOURCE_PATHS);
+  const ref = `origin/${branch}`;
+  const issues: DocsRulesDriftResult["issues"] = [];
+
+  if (options.fetch !== false) {
+    const fetched = runner("git", ["-C", repoPath, "fetch", "origin", branch], { timeoutMs });
+    if (fetched.status !== 0) {
+      issues.push({ id: "fetch", severity: "high", message: `git fetch failed: ${compactPreview(fetched.stderr || fetched.stdout)}` });
+    }
+  }
+
+  const headSha = gitOutput(repoPath, runner, timeoutMs, ["rev-parse", ref]);
+  const latestDocsCommit = docsPaths.length > 0
+    ? gitOutput(repoPath, runner, timeoutMs, ["log", "-1", "--format=%H", ref, "--", ...docsPaths])
+    : null;
+  const sourceCommitsSinceDocs = latestDocsCommit && sourcePaths.length > 0
+    ? Number(gitOutput(repoPath, runner, timeoutMs, ["rev-list", "--count", `${latestDocsCommit}..${ref}`, "--", ...sourcePaths]) ?? "0")
+    : null;
+  const changedSourceFiles = latestDocsCommit && sourcePaths.length > 0
+    ? gitOutput(repoPath, runner, timeoutMs, ["diff", "--name-only", `${latestDocsCommit}..${ref}`, "--", ...sourcePaths])
+      ?.split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 50) ?? []
+    : [];
+
+  if (!headSha) issues.push({ id: "head", severity: "high", message: `could not resolve ${ref}` });
+  if (docsPaths.length === 0) issues.push({ id: "docs-paths", severity: "medium", message: "no docs/rules paths exist in this repo" });
+  if (sourcePaths.length === 0) issues.push({ id: "source-paths", severity: "medium", message: "no source paths exist in this repo" });
+  if (sourcePaths.length > 0 && !latestDocsCommit) {
+    issues.push({ id: "docs-baseline", severity: "high", message: "no docs/rules baseline commit found for tracked docs paths" });
+  }
+  if ((sourceCommitsSinceDocs ?? 0) > 0) {
+    issues.push({
+      id: "source-after-docs",
+      severity: "medium",
+      message: `${sourceCommitsSinceDocs} source commit(s) landed after the latest docs/rules update`,
+    });
+  }
+
+  const blocking = issues.filter((issue) => issue.severity === "high");
+  const drift = issues.length > 0;
+  const taskSeeds = drift
+    ? [docsRulesDriftTaskSeed({
+      repoPath,
+      githubRepo,
+      branch,
+      headSha,
+      latestDocsCommit,
+      sourceCommitsSinceDocs,
+      changedSourceFiles,
+      issues,
+    })]
+    : [];
+
+  return {
+    schema: "open-repos.docs-rules-drift.v1",
+    generated_at: new Date().toISOString(),
+    repo: { input: options.repo, path: repoPath, github_repo: githubRepo, branch },
+    config: { docs_paths: docsPaths, source_paths: sourcePaths },
+    state: {
+      head_sha: headSha,
+      latest_docs_commit: latestDocsCommit,
+      source_commits_since_docs: Number.isFinite(sourceCommitsSinceDocs) ? sourceCommitsSinceDocs : null,
+      changed_source_files: changedSourceFiles,
+    },
+    summary: {
+      status: blocking.length > 0 ? "blocked" : drift ? "drift" : "ok",
+      task_seeds: taskSeeds.length,
+    },
+    issues,
+    task_suggestions: taskSeeds,
+  };
+}
+
+export function buildDependencyRefresh(options: DependencyRefreshOptions): DependencyRefreshResult {
+  const repoPath = resolveRepoPath(options.repo);
+  const runner = options.runner ?? spawnCommand;
+  const timeoutMs = normalizePositiveInteger(options.timeoutMs, 30_000);
+  const maxLockAgeDays = normalizePositiveInteger(options.maxLockAgeDays, 7);
+  const githubRepo = options.githubRepo ?? inferGithubRepo(repoPath, runner, timeoutMs) ?? "unknown/unknown";
+  const packageName = inferPackageName(repoPath);
+  const checks: DependencyRefreshResult["checks"] = [];
+
+  if (existsSync(join(repoPath, "package.json"))) {
+    const outdated = runner("bun", ["outdated", "--json"], { timeoutMs, cwd: repoPath });
+    const count = parseOutdatedCount(outdated.stdout);
+    if (outdated.status === 0 && count === 0) {
+      checks.push({ id: "bun-outdated", status: "ok", message: "bun outdated reported no package updates", count: 0 });
+    } else if (count > 0) {
+      checks.push({ id: "bun-outdated", status: "issue", message: `${count} Bun/npm package update(s) available`, count });
+    } else {
+      checks.push({
+        id: "bun-outdated",
+        status: "issue",
+        message: `could not determine Bun/npm outdated state: ${compactPreview(outdated.stderr || outdated.stdout || outdated.error?.message || "")}`,
+      });
+    }
+  } else {
+    checks.push({ id: "bun-outdated", status: "skipped", message: "package.json not present" });
+  }
+
+  for (const lockFile of ["bun.lock", "bun.lockb", "Cargo.lock"]) {
+    const lockPath = join(repoPath, lockFile);
+    if (!existsSync(lockPath)) continue;
+    const ageDays = daysSinceMtime(lockPath);
+    if (ageDays != null && ageDays > maxLockAgeDays) {
+      checks.push({ id: `stale-${lockFile}`, status: "issue", message: `${lockFile} is ${ageDays} day(s) old; refresh review is due`, count: ageDays });
+    } else {
+      checks.push({ id: `fresh-${lockFile}`, status: "ok", message: `${lockFile} age is within ${maxLockAgeDays} day(s)`, ...(ageDays == null ? {} : { count: ageDays }) });
+    }
+  }
+
+  if (existsSync(join(repoPath, "Cargo.toml")) || existsSync(join(repoPath, "codex-rs", "Cargo.toml"))) {
+    const cargo = runner("cargo", ["--version"], { timeoutMs, cwd: repoPath });
+    checks.push(cargo.status === 0
+      ? { id: "cargo-available", status: "ok", message: "cargo is available for Rust dependency refresh checks" }
+      : { id: "cargo-available", status: "issue", message: `cargo unavailable: ${compactPreview(cargo.stderr || cargo.error?.message || "")}` });
+  }
+
+  const issues = checks.filter((check) => check.status === "issue");
+  const taskSeeds = issues.length > 0 ? [dependencyRefreshTaskSeed({ repoPath, githubRepo, packageName, maxLockAgeDays, issues })] : [];
+  return {
+    schema: "open-repos.dependency-refresh.v1",
+    generated_at: new Date().toISOString(),
+    repo: { input: options.repo, path: repoPath, github_repo: githubRepo, package_name: packageName },
+    limits: { max_lock_age_days: maxLockAgeDays },
+    checks,
+    summary: { status: issues.length > 0 ? "needs-refresh" : "ok", task_seeds: taskSeeds.length },
+    task_suggestions: taskSeeds,
+  };
+}
+
+export function buildWorkspaceWorktreeHygiene(options: WorkspaceWorktreeHygieneOptions = {}): WorkspaceWorktreeHygieneResult {
+  const roots = options.roots?.length ? options.roots : [`${process.env["HOME"] || "/home/hasna"}/workspace/hasna/opensource`];
+  const worktreeRoot = options.worktreeRoot ?? `${process.env["HOME"] || "/home/hasna"}/.hasna/loops/worktrees`;
+  const runner = options.runner ?? spawnCommand;
+  const timeoutMs = normalizePositiveInteger(options.timeoutMs, 20_000);
+  const staleDays = normalizePositiveInteger(options.staleDays, 7);
+  const limit = normalizePositiveInteger(options.limit, 200);
+  const repos = discoverGitRepos(roots).slice(0, limit);
+  const worktrees: WorkspaceWorktreeHygieneResult["worktrees"] = [];
+  let worktreesChecked = 0;
+
+  for (const repoPath of repos) {
+    const listed = runner("git", ["-C", repoPath, "worktree", "list", "--porcelain"], { timeoutMs });
+    if (listed.status !== 0) continue;
+    const primaryPath = statSafe(repoPath)?.realpath ?? repoPath;
+    for (const entry of parseWorktreeList(listed.stdout)) {
+      const normalizedPath = statSafe(entry.path)?.realpath ?? entry.path;
+      if (normalizedPath === primaryPath) continue;
+      if (worktreeRoot && !normalizedPath.startsWith(worktreeRoot)) continue;
+      worktreesChecked += 1;
+      const exists = existsSync(entry.path);
+      const dirty = exists ? Boolean(runner("git", ["-C", entry.path, "status", "--porcelain"], { timeoutMs }).stdout.trim()) : false;
+      const committedAt = exists ? gitOutput(entry.path, runner, timeoutMs, ["show", "-s", "--format=%cI", "HEAD"]) : null;
+      const ageDays = committedAt ? daysSince(committedAt) : null;
+      const issues: string[] = [];
+      if (!exists) issues.push("missing-worktree-path");
+      if (!entry.branch) issues.push("detached-or-unknown-branch");
+      if (dirty) issues.push("dirty-worktree");
+      if (ageDays != null && ageDays > staleDays) issues.push("stale-worktree");
+      if (issues.length === 0) continue;
+      const row = {
+        repo_path: repoPath,
+        path: entry.path,
+        branch: entry.branch,
+        head: entry.head,
+        age_days: ageDays,
+        dirty,
+        exists,
+        issues,
+      };
+      worktrees.push({ ...row, task_seed: worktreeHygieneTaskSeed(row) });
+    }
+  }
+
+  return {
+    schema: "open-repos.workspace-worktree-hygiene.v1",
+    generated_at: new Date().toISOString(),
+    roots,
+    worktree_root: worktreeRoot,
+    limits: { stale_days: staleDays, limit },
+    summary: {
+      repos_checked: repos.length,
+      worktrees_checked: worktreesChecked,
+      issue_worktrees: worktrees.length,
+      task_seeds: worktrees.length,
+    },
+    worktrees,
+    task_suggestions: worktrees.map((worktree) => worktree.task_seed).filter((seed): seed is TaskSeed => Boolean(seed)),
+  };
+}
+
+export function buildTaskRouteHealth(options: TaskRouteHealthOptions): TaskRouteHealthResult {
+  const runner = options.runner ?? spawnCommand;
+  const timeoutMs = normalizePositiveInteger(options.timeoutMs, 20_000);
+  const maxAgeMinutes = normalizePositiveInteger(options.maxAgeMinutes, 15);
+  const issues: TaskRouteHealthResult["issues"] = [];
+  const show = runner("loops", ["show", options.routerLoop, "--json"], { timeoutMs });
+  const loop = parseJsonObject<{ status?: unknown }>(show.stdout);
+  const runs = runner("loops", ["runs", options.routerLoop, "--limit", "1", "--json"], { timeoutMs });
+  const latest = parseJsonArray<{ status?: unknown; startedAt?: unknown }>(runs.stdout)[0];
+  const latestStartedAt = typeof latest?.startedAt === "string" ? latest.startedAt : null;
+  const latestRunAgeMinutes = latestStartedAt ? minutesSince(latestStartedAt) : null;
+  const loopStatus = typeof loop?.status === "string" ? loop.status : null;
+  const latestRunStatus = typeof latest?.status === "string" ? latest.status : null;
+
+  if (show.status !== 0 || !loopStatus) {
+    issues.push({ id: "router-loop-missing", severity: "high", message: `could not read router loop ${options.routerLoop}` });
+  } else if (loopStatus !== "active") {
+    issues.push({ id: "router-loop-inactive", severity: "high", message: `router loop ${options.routerLoop} is ${loopStatus}` });
+  }
+  if (runs.status !== 0 || !latestRunStatus) {
+    issues.push({ id: "router-run-missing", severity: "high", message: `could not read latest run for router loop ${options.routerLoop}` });
+  } else if (latestRunStatus !== "succeeded") {
+    issues.push({ id: "router-run-not-succeeded", severity: "high", message: `latest router run status is ${latestRunStatus}` });
+  }
+  if (latestRunAgeMinutes != null && latestRunAgeMinutes > maxAgeMinutes) {
+    issues.push({ id: "router-run-stale", severity: "medium", message: `latest router run is ${latestRunAgeMinutes} minute(s) old; max is ${maxAgeMinutes}` });
+  }
+
+  const taskSeeds = issues.length > 0 ? [taskRouteHealthTaskSeed({ routerLoop: options.routerLoop, project: options.project, issues })] : [];
+  return {
+    schema: "open-repos.task-route-health.v1",
+    generated_at: new Date().toISOString(),
+    router_loop: options.routerLoop,
+    project: options.project ?? null,
+    state: {
+      loop_status: loopStatus,
+      latest_run_status: latestRunStatus,
+      latest_run_started_at: latestStartedAt,
+      latest_run_age_minutes: latestRunAgeMinutes,
+    },
+    summary: { status: issues.length > 0 ? "issue" : "ok", task_seeds: taskSeeds.length },
+    issues,
+    task_suggestions: taskSeeds,
+  };
+}
+
+export function buildProtectedRelease(options: ProtectedReleaseOptions): ProtectedReleaseResult {
+  const release = buildReleaseCandidates(options);
+  const taskSeeds = release.summary.status === "candidate" && release.state.head_sha && release.state.intended_tag
+    ? [protectedReleaseTaskSeed(release, options.approvalLabel)]
+    : [];
+  return {
+    schema: "open-repos.protected-release.v1",
+    generated_at: new Date().toISOString(),
+    release,
+    summary: {
+      status: release.summary.status === "blocked" ? "blocked" : taskSeeds.length > 0 ? "ready" : "noop",
+      task_seeds: taskSeeds.length,
+    },
+    task_suggestions: taskSeeds,
+  };
+}
+
 function listPrRows(opts: { org?: string; repo?: string; state: string; limit: number }): PrRow[] {
   const db = getDb();
   const params: Array<string | number> = [];
@@ -668,10 +1109,11 @@ function cliSmokeProbes(spec: CliSmokeCommandSpec): CliSmokeCommandSpec[] {
     .map((args) => ({ command: spec.command, args }));
 }
 
-function spawnCommand(command: string, args: string[], opts: { timeoutMs: number }) {
+function spawnCommand(command: string, args: string[], opts: { timeoutMs: number; cwd?: string }) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     timeout: opts.timeoutMs,
+    cwd: opts.cwd,
     maxBuffer: 512 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1002,6 +1444,331 @@ function releaseCandidateTaskSeed(opts: {
       publish_path: "separate-approved-protected-release-step",
     },
   };
+}
+
+function docsRulesDriftTaskSeed(opts: {
+  repoPath: string;
+  githubRepo: string;
+  branch: string;
+  headSha: string | null;
+  latestDocsCommit: string | null;
+  sourceCommitsSinceDocs: number | null;
+  changedSourceFiles: string[];
+  issues: DocsRulesDriftResult["issues"];
+}): TaskSeed {
+  const shortHead = opts.headSha?.slice(0, 12) ?? "unknown";
+  return {
+    fingerprint: `docs-rules-drift:${opts.githubRepo}:${opts.branch}:${shortHead}:${opts.latestDocsCommit?.slice(0, 12) ?? "no-docs"}`,
+    title: `Update docs, changelog, and agent rules for ${opts.githubRepo}`,
+    body: [
+      `Repository: ${opts.repoPath}`,
+      `GitHub repo: ${opts.githubRepo}`,
+      `Branch: ${opts.branch}`,
+      `Head SHA: ${opts.headSha ?? "unknown"}`,
+      `Latest docs/rules commit: ${opts.latestDocsCommit ?? "unknown"}`,
+      `Source commits since docs/rules update: ${opts.sourceCommitsSinceDocs ?? "unknown"}`,
+      "",
+      "Issues:",
+      ...opts.issues.map((issue) => `- ${issue.id}: ${issue.message}`),
+      "",
+      "Changed source files sample:",
+      ...(opts.changedSourceFiles.length ? opts.changedSourceFiles.map((file) => `- ${file}`) : ["- none captured"]),
+      "",
+      "Routing metadata:",
+      "  route_enabled: true",
+      "  automation.allowed: true",
+      "  automation.mode: auto",
+      `  repo: ${repoSlug(opts.githubRepo)}`,
+      "  project_group: oss",
+      "  workflow: task-lifecycle",
+      "  worktree_mode: required",
+      "",
+      "Start a durable goal in an isolated worktree. Review recent code changes, update CHANGELOG/README/docs and repo-local AGENTS.md, CLAUDE.md, CODEWITH.md, skills, and rules where applicable. Preserve unrelated changes, validate docs references, use an adversarial reviewer for non-trivial changes, commit logically, and open/update a PR.",
+    ].join("\n"),
+    priority: "medium",
+    tags: ["auto:route", "area:repoops", "task-lifecycle", "docs-rules-drift", `repo:${repoSlug(opts.githubRepo)}`],
+    metadata: {
+      source: "open-repos.docs-rules-drift.v1",
+      repo_path: opts.repoPath,
+      repo_full_name: opts.githubRepo,
+      branch: opts.branch,
+      head_sha: opts.headSha,
+      latest_docs_commit: opts.latestDocsCommit,
+      source_commits_since_docs: opts.sourceCommitsSinceDocs,
+      automation_mode: "auto:route",
+      workflow: "task-lifecycle",
+      worktree: "required",
+    },
+  };
+}
+
+function dependencyRefreshTaskSeed(opts: {
+  repoPath: string;
+  githubRepo: string;
+  packageName: string | null;
+  maxLockAgeDays: number;
+  issues: DependencyRefreshResult["checks"];
+}): TaskSeed {
+  return {
+    fingerprint: `dependency-refresh:${opts.githubRepo}:${opts.packageName ?? "no-package"}:${opts.issues.map((issue) => issue.id).join("+")}`,
+    title: `Refresh dependencies for ${opts.githubRepo}`,
+    body: [
+      `Repository: ${opts.repoPath}`,
+      `GitHub repo: ${opts.githubRepo}`,
+      `Package: ${opts.packageName ?? "unknown"}`,
+      `Max lock age policy: ${opts.maxLockAgeDays} day(s)`,
+      "",
+      "Issues:",
+      ...opts.issues.map((issue) => `- ${issue.id}: ${issue.message}`),
+      "",
+      "Routing metadata:",
+      "  route_enabled: true",
+      "  automation.allowed: true",
+      "  automation.mode: auto",
+      `  repo: ${repoSlug(opts.githubRepo)}`,
+      "  project_group: oss",
+      "  workflow: task-lifecycle",
+      "  worktree_mode: required",
+      "",
+      "Start a durable goal in an isolated worktree. Inspect package manager state first, update dependencies conservatively, run tests/builds, check changelog/security notes for dependency changes, use an adversarial reviewer for risky updates, commit logically, and open/update a PR. Do not bypass supply-chain policy for third-party packages.",
+    ].join("\n"),
+    priority: "medium",
+    tags: ["auto:route", "area:repoops", "task-lifecycle", "dependency-refresh", `repo:${repoSlug(opts.githubRepo)}`],
+    metadata: {
+      source: "open-repos.dependency-refresh.v1",
+      repo_path: opts.repoPath,
+      repo_full_name: opts.githubRepo,
+      package_name: opts.packageName,
+      issue_ids: opts.issues.map((issue) => issue.id),
+      automation_mode: "auto:route",
+      workflow: "task-lifecycle",
+      worktree: "required",
+    },
+  };
+}
+
+function worktreeHygieneTaskSeed(opts: {
+  repo_path: string;
+  path: string;
+  branch: string | null;
+  head: string | null;
+  age_days: number | null;
+  dirty: boolean;
+  exists: boolean;
+  issues: string[];
+}): TaskSeed {
+  const repoName = basename(opts.repo_path);
+  return {
+    fingerprint: `worktree-hygiene:${repoName}:${opts.path}:${opts.issues.join("+")}`,
+    title: `Triage stale or unsafe worktree for ${repoName}`,
+    body: [
+      `Repository: ${opts.repo_path}`,
+      `Worktree: ${opts.path}`,
+      `Branch: ${opts.branch ?? "unknown"}`,
+      `Head: ${opts.head ?? "unknown"}`,
+      `Age days: ${opts.age_days ?? "unknown"}`,
+      `Dirty: ${opts.dirty ? "yes" : "no"}`,
+      `Path exists: ${opts.exists ? "yes" : "no"}`,
+      "",
+      "Issues:",
+      ...opts.issues.map((issue) => `- ${issue}`),
+      "",
+      "Routing metadata:",
+      "  route_enabled: true",
+      "  automation.allowed: true",
+      "  automation.mode: auto",
+      `  repo: ${repoName}`,
+      "  project_group: oss",
+      "  workflow: task-lifecycle",
+      "  worktree_mode: required",
+      "",
+      "Start a durable goal. Inspect before deleting or pruning anything. Preserve user work and active workflow state. If cleanup is safe, commit or archive evidence first where appropriate; otherwise update this task with exact blockers and leave the worktree untouched.",
+    ].join("\n"),
+    priority: opts.dirty ? "high" : "medium",
+    tags: ["auto:route", "area:repoops", "task-lifecycle", "worktree-hygiene", `repo:${repoName}`],
+    metadata: {
+      source: "open-repos.workspace-worktree-hygiene.v1",
+      repo_path: opts.repo_path,
+      worktree_path: opts.path,
+      branch: opts.branch,
+      head: opts.head,
+      issue_ids: opts.issues,
+      automation_mode: "auto:route",
+      workflow: "task-lifecycle",
+      worktree: "required",
+    },
+  };
+}
+
+function taskRouteHealthTaskSeed(opts: {
+  routerLoop: string;
+  project?: string;
+  issues: TaskRouteHealthResult["issues"];
+}): TaskSeed {
+  return {
+    fingerprint: `task-route-health:${opts.routerLoop}:${opts.issues.map((issue) => issue.id).join("+")}`,
+    title: `Fix task lifecycle route health for ${opts.routerLoop}`,
+    body: [
+      `Router loop: ${opts.routerLoop}`,
+      `Project: ${opts.project ?? "unknown"}`,
+      "",
+      "Issues:",
+      ...opts.issues.map((issue) => `- ${issue.id}: ${issue.message}`),
+      "",
+      "Routing metadata:",
+      "  route_enabled: true",
+      "  automation.allowed: true",
+      "  automation.mode: auto",
+      "  project_group: ops",
+      "  workflow: task-lifecycle",
+      "",
+      "Investigate OpenLoops route health first. Preserve loop history and databases. Fix the narrow route, template, account/profile, or daemon issue; validate with a fresh route run and report evidence.",
+    ].join("\n"),
+    priority: opts.issues.some((issue) => issue.severity === "high") ? "high" : "medium",
+    tags: ["auto:route", "area:repoops", "task-route-health"],
+    metadata: {
+      source: "open-repos.task-route-health.v1",
+      router_loop: opts.routerLoop,
+      project: opts.project,
+      issue_ids: opts.issues.map((issue) => issue.id),
+      automation_mode: "auto:route",
+      workflow: "task-lifecycle",
+    },
+  };
+}
+
+function protectedReleaseTaskSeed(release: ReleaseCandidateResult, approvalLabel?: string): TaskSeed {
+  const head = release.state.head_sha!;
+  const tag = release.state.intended_tag!;
+  return {
+    fingerprint: `protected-release:${release.repo.github_repo}:${tag}:${head.slice(0, 12)}`,
+    title: `Protected release publish for ${release.repo.github_repo} ${tag}`,
+    body: [
+      `Repository: ${release.repo.path}`,
+      `GitHub repo: ${release.repo.github_repo}`,
+      `Package: ${release.repo.package_name}`,
+      `Branch: ${release.repo.branch}`,
+      `Head SHA: ${head}`,
+      `Release tag: ${tag}`,
+      `Latest reachable tag: ${release.state.latest_reachable_tag ?? "none"}`,
+      `Latest GitHub release: ${release.state.latest_github_release ?? "unknown"}`,
+      `Latest npm version: ${release.repo.package_name}@${release.state.latest_npm_version ?? "unknown"}`,
+      `Approval label/check: ${approvalLabel ?? "repo policy and protected release workflow"}`,
+      "",
+      "Routing metadata:",
+      "  route_enabled: true",
+      "  automation.allowed: true",
+      "  automation.mode: protected",
+      `  repo: ${repoSlug(release.repo.github_repo)}`,
+      "  project_group: oss",
+      "  workflow: task-lifecycle",
+      "  worktree_mode: required",
+      "",
+      "Start a durable goal in an isolated worktree. Re-check CI, tag existence, npm registry state, changelog, and release notes. Use an adversarial reviewer. Publish only if the protected release policy explicitly allows it in this environment; otherwise prepare the final release PR/handoff and leave exact blockers.",
+    ].join("\n"),
+    priority: "critical",
+    tags: ["auto:route", "area:repoops", "task-lifecycle", "protected-release", `repo:${repoSlug(release.repo.github_repo)}`],
+    metadata: {
+      source: "open-repos.protected-release.v1",
+      repo_path: release.repo.path,
+      repo_full_name: release.repo.github_repo,
+      package_name: release.repo.package_name,
+      branch: release.repo.branch,
+      head_sha: head,
+      intended_tag: tag,
+      automation_mode: "protected",
+      workflow: "task-lifecycle",
+      worktree: "required",
+    },
+  };
+}
+
+function existingRelativePaths(repoPath: string, candidates: string[]): string[] {
+  return candidates.filter((candidate) => existsSync(join(repoPath, candidate)));
+}
+
+function daysSinceMtime(path: string): number | null {
+  try {
+    const mtime = statSync(path).mtimeMs;
+    return Math.max(0, Math.floor((Date.now() - mtime) / 86_400_000));
+  } catch {
+    return null;
+  }
+}
+
+function daysSince(iso: string): number | null {
+  const time = Date.parse(iso);
+  if (!Number.isFinite(time)) return null;
+  return Math.max(0, Math.floor((Date.now() - time) / 86_400_000));
+}
+
+function parseOutdatedCount(stdout: string): number {
+  if (!stdout.trim()) return 0;
+  try {
+    const parsed = JSON.parse(stdout) as unknown;
+    if (Array.isArray(parsed)) return parsed.length;
+    if (parsed && typeof parsed === "object") {
+      if (Array.isArray((parsed as { outdated?: unknown }).outdated)) return ((parsed as { outdated: unknown[] }).outdated).length;
+      return Object.keys(parsed).length;
+    }
+  } catch {
+    return 0;
+  }
+  return 0;
+}
+
+function discoverGitRepos(roots: string[]): string[] {
+  const repos: string[] = [];
+  for (const root of roots) {
+    if (!existsSync(root)) continue;
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const path = join(root, entry.name);
+      if (existsSync(join(path, ".git"))) repos.push(path);
+    }
+  }
+  return repos.sort();
+}
+
+function statSafe(path: string): { realpath: string } | null {
+  try {
+    return { realpath: realpathSync(path) };
+  } catch {
+    return null;
+  }
+}
+
+function parseWorktreeList(stdout: string): Array<{ path: string; head: string | null; branch: string | null }> {
+  const records: Array<{ path: string; head: string | null; branch: string | null }> = [];
+  let current: { path?: string; head?: string | null; branch?: string | null } = {};
+  const flush = () => {
+    if (current.path) records.push({ path: current.path, head: current.head ?? null, branch: current.branch ?? null });
+    current = {};
+  };
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      flush();
+      continue;
+    }
+    const [key, ...rest] = line.split(" ");
+    const value = rest.join(" ");
+    if (key === "worktree") current.path = value;
+    if (key === "HEAD") current.head = value;
+    if (key === "branch") current.branch = value.replace(/^refs\/heads\//, "");
+    if (key === "detached") current.branch = null;
+  }
+  flush();
+  return records;
+}
+
+function parseJsonObject<T extends object>(value: string): T | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as T : null;
+  } catch {
+    return null;
+  }
 }
 
 function repoSlug(githubRepo: string): string {
