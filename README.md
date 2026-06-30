@@ -59,6 +59,7 @@ repos-serve  # http://localhost:19450
 | `repos ops pr-queue` | Emit PR merge task seeds, optional bounded GitHub sync, reports, and todos upserts |
 | `repos ops global-cli-smoke` | Check global CLIs, emit task seeds for failures, reports, and todos upserts |
 | `repos ops package-hygiene` | Check Bun/npm Hasna package hygiene |
+| `repos ops release-candidates` | Detect releasable repo changes or release blockers and emit task seeds |
 
 Legacy list/search/status commands support `--json` for machine-readable output.
 
@@ -96,12 +97,34 @@ repos ops global-cli-smoke \
   --task-list global-cli-smoke \
   --max-task-actions 20 \
   --json
+
+repos ops release-candidates \
+  --repo ~/workspace/hasna/opensource/open-codewith \
+  --github-repo hasna/codewith \
+  --package @hasna/codewith \
+  --branch main \
+  --tag-prefix rust-v \
+  --version-file codex-rs/Cargo.toml \
+  --report-dir ~/.hasna/loops/reports/open-codewith-release-candidates \
+  --upsert-tasks \
+  --todos-project ~/.hasna/loops \
+  --task-list repo-release-candidates \
+  --max-task-actions 1 \
+  --json
 ```
 
 `--sync-orgs` requires `--sync-max-repos`; GitHub sync errors make the command
 exit non-zero by default so loop health cannot silently run on stale metadata.
 Use `--allow-sync-errors` only for exploratory reads where stale cached PR data
 is acceptable.
+
+Release-candidate producers intentionally exit zero when they find release
+blockers after writing the report/task. The loop's job is to turn releasability
+state into deduped tasks; only report/task write failures should make the
+producer loop fail. Auto-routed release tasks are prepare-only: workers may
+update changelogs, release notes, PRs, and evidence, but must not create or push
+release tags, run `npm publish`/`bun publish`, or dispatch release workflows.
+Actual publishing belongs in a separate approved/protected release step.
 
 ## MCP Server
 

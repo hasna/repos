@@ -24,7 +24,7 @@ import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/githu
 import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getCrossOrgAuthors, getGraphStats } from "../lib/graph.js";
-import { buildPrQueue, inspectPackageHygiene, runGlobalCliSmoke, type TaskSeed } from "../lib/ops-producers.js";
+import { buildPrQueue, buildReleaseCandidates, inspectPackageHygiene, runGlobalCliSmoke, type TaskSeed } from "../lib/ops-producers.js";
 import { upsertTaskSeeds, writeLoopReport } from "../lib/ops-loop-tasks.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg, fuzzyFindRepo } from "../lib/utils.js";
 import {
@@ -905,6 +905,81 @@ ops
     for (const row of result.npm_global_duplicates.slice(0, 30)) {
       console.log(`${chalk.yellow(row.name)}${row.version ? chalk.dim(`@${row.version}`) : ""}`);
     }
+  });
+
+addLoopProducerOptions(
+  ops
+    .command("release-candidates")
+    .description("Detect releasable repo changes or release blockers and emit task seeds")
+    .requiredOption("--repo <path-or-name>", "Local repo path or repos registry name")
+    .option("--github-repo <owner/name>", "GitHub owner/name; inferred from origin remote by default")
+    .option("--package <name>", "Published package name; inferred from package.json by default")
+    .option("--branch <branch>", "Release branch", "main")
+    .option("--tag-prefix <prefix>", "Release tag prefix", "v")
+    .option("--version-file <path>", "Version file inside the repo; inferred from package.json/Cargo.toml by default")
+    .option("--quiet-minutes <n>", "Block release if branch changed more recently than this", "60")
+    .option("--timeout-ms <n>", "Per-command timeout", "20000")
+    .option("--no-fetch", "Skip git fetch before inspection")
+    .option("--no-require-green-ci", "Do not require GitHub Actions to be green")
+    .option("--no-open-pr-blocker", "Do not block on open PRs")
+    .option("--json", "Output JSON")
+    .addHelpText("after", "\nLoop use: add --report-dir <dir> --upsert-tasks --todos-project <path> --task-list repo-release-candidates. Blocked release state still exits 0 after report/task creation."),
+  5,
+)
+  .action((opts: LoopProducerOpts & {
+    repo: string;
+    githubRepo?: string;
+    package?: string;
+    branch: string;
+    tagPrefix: string;
+    versionFile?: string;
+    quietMinutes: string;
+    timeoutMs: string;
+    fetch?: boolean;
+    requireGreenCi?: boolean;
+    openPrBlocker?: boolean;
+    json?: boolean;
+  }) => {
+    const result = buildReleaseCandidates({
+      repo: opts.repo,
+      githubRepo: opts.githubRepo,
+      packageName: opts.package,
+      branch: opts.branch,
+      tagPrefix: opts.tagPrefix,
+      versionFile: opts.versionFile,
+      quietMinutes: intFlag(opts.quietMinutes, "--quiet-minutes", 0),
+      requireGreenCi: opts.requireGreenCi !== false,
+      includeOpenPrBlocker: opts.openPrBlocker !== false,
+      fetch: opts.fetch !== false,
+      timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
+    });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "repo-release-candidates",
+      taskList: "repo-release-candidates",
+      taskListName: "Repo Release Candidates",
+      taskListDescription: "Release candidate and release-blocker tasks created by deterministic OpenRepos producers.",
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+      return;
+    }
+    const status = result.summary.status === "candidate"
+      ? chalk.green("candidate")
+      : result.summary.status === "blocked"
+        ? chalk.yellow("blocked")
+        : chalk.dim("noop");
+    console.log(`${status} ${result.repo.github_repo} ${result.state.intended_tag ?? "unknown-tag"} seeds=${result.summary.task_seeds}`);
+    for (const gate of result.gates) {
+      const label = gate.status === "block" ? chalk.yellow("block") : gate.status === "warn" ? chalk.magenta("warn") : chalk.green("pass");
+      console.log(`${label} ${gate.id}: ${gate.message}`);
+    }
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope)) process.exitCode = 1;
   });
 
 // ── GitHub Metadata ──

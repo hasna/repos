@@ -1,12 +1,18 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { closeDb, getDb } from "../db/database.js";
 import { bulkInsertPullRequests, upsertRepo } from "../db/repos.js";
 import {
   buildPrQueue,
+  buildReleaseCandidates,
   inspectPackageHygiene,
   runGlobalCliSmoke,
   type CommandRunner,
 } from "./ops-producers.js";
+
+const tempDirs: string[] = [];
 
 beforeEach(() => {
   closeDb();
@@ -17,6 +23,7 @@ beforeEach(() => {
 afterAll(() => {
   closeDb();
   delete process.env["HASNA_REPOS_DB_PATH"];
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 describe("ops producers", () => {
@@ -153,4 +160,220 @@ describe("ops producers", () => {
     expect(result.summary.scoped_npm_duplicates).toBe(1);
     expect(result.task_seeds[0]!.fingerprint).toBe("package-hygiene:npm-global-duplicate:@hasna/loops");
   });
+
+  test("emits a release candidate task for a quiet green branch with unreleased commits", () => {
+    const repoPath = writeCargoVersion("0.2.0");
+    const headSha = "abcdef1234567890abcdef1234567890abcdef12";
+    const runner = releaseRunner({
+      headSha,
+      headCommittedAt: "2026-06-26T00:00:00Z",
+      latestReachableTag: "rust-v0.1.0",
+      commitsSinceTag: "3",
+      latestGithubRelease: "rust-v0.1.0",
+      latestNpmVersion: "0.1.0",
+      openPrCount: 0,
+      latestReleaseAncestor: true,
+      intendedTagExists: false,
+      ciRuns: [{ status: "completed", conclusion: "success", workflowName: "ci" }],
+    });
+
+    const result = buildReleaseCandidates({
+      repo: repoPath,
+      githubRepo: "hasna/codewith",
+      packageName: "@hasna/codewith",
+      tagPrefix: "rust-v",
+      versionFile: "codex-rs/Cargo.toml",
+      fetch: false,
+      runner,
+    });
+
+    expect(result.schema).toBe("open-repos.release-candidates.v1");
+    expect(result.summary.status).toBe("candidate");
+    expect(result.state.intended_tag).toBe("rust-v0.2.0");
+    expect(result.summary.task_seeds).toBe(1);
+    expect(result.task_suggestions[0]!.fingerprint).toBe(`release-candidate:hasna/codewith:rust-v0.2.0:${headSha.slice(0, 12)}`);
+    expect(result.task_suggestions[0]!.tags).toContain("auto:route");
+    expect(result.task_suggestions[0]!.tags).toContain("task-lifecycle");
+    expect(result.task_suggestions[0]!.metadata["publish_path"]).toBe("separate-approved-protected-release-step");
+    expect(result.task_suggestions[0]!.body).toContain("Do not create or push release tags");
+  });
+
+  test("emits a release blocker task when published release state is ahead of branch state", () => {
+    const repoPath = writeCargoVersion("0.1.48");
+    const runner = releaseRunner({
+      headSha: "7984aa35cf6f54048c36da286f7250576c27789a",
+      headCommittedAt: "2026-06-26T00:00:00Z",
+      latestReachableTag: "rust-v0.1.45",
+      commitsSinceTag: "95",
+      latestGithubRelease: "rust-v0.1.51",
+      latestNpmVersion: "0.1.51",
+      openPrCount: 2,
+      latestReleaseAncestor: false,
+      intendedTagExists: false,
+      ciRuns: [{ status: "completed", conclusion: "success", workflowName: "ci" }],
+    });
+
+    const result = buildReleaseCandidates({
+      repo: repoPath,
+      githubRepo: "hasna/codewith",
+      packageName: "@hasna/codewith",
+      tagPrefix: "rust-v",
+      versionFile: "codex-rs/Cargo.toml",
+      fetch: false,
+      runner,
+    });
+
+    expect(result.summary.status).toBe("blocked");
+    expect(result.gates.map((gate) => gate.id)).toEqual(expect.arrayContaining([
+      "version-regression",
+      "tag-regression",
+      "latest-release-not-ancestor",
+      "open-prs",
+    ]));
+    expect(result.task_suggestions[0]!.fingerprint).toBe("release-blocker:hasna/codewith:main:7984aa35cf6f:rust-v0.1.48");
+    expect(result.task_suggestions[0]!.tags).toContain("release-blocker");
+    expect(result.task_suggestions[0]!.tags).toContain("task-lifecycle");
+    expect(result.task_suggestions[0]!.body).toContain("latest GitHub release rust-v0.1.51 is not an ancestor");
+  });
+
+  test("fails closed when external release state cannot be verified", () => {
+    const repoPath = writeCargoVersion("0.2.0");
+    const runner = releaseRunner({
+      headSha: "abcdef1234567890abcdef1234567890abcdef12",
+      headCommittedAt: "2026-06-26T00:00:00Z",
+      latestReachableTag: "rust-v0.1.0",
+      commitsSinceTag: "3",
+      latestGithubRelease: "rust-v0.1.0",
+      latestNpmVersion: "0.1.0",
+      openPrCount: 0,
+      latestReleaseAncestor: true,
+      intendedTagExists: false,
+      ciRuns: [{ status: "completed", conclusion: "success", workflowName: "ci" }],
+      failGithubRelease: true,
+      failNpm: true,
+      failOpenPrs: true,
+    });
+
+    const result = buildReleaseCandidates({
+      repo: repoPath,
+      githubRepo: "hasna/codewith",
+      packageName: "@hasna/codewith",
+      tagPrefix: "rust-v",
+      versionFile: "codex-rs/Cargo.toml",
+      fetch: false,
+      runner,
+    });
+
+    expect(result.summary.status).toBe("blocked");
+    expect(result.gates.map((gate) => gate.id)).toEqual(expect.arrayContaining([
+      "github-release-check",
+      "npm-registry-check",
+      "open-pr-check",
+    ]));
+    expect(result.state.checks.github_release.ok).toBe(false);
+    expect(result.state.checks.npm_package.ok).toBe(false);
+    expect(result.state.checks.open_prs.ok).toBe(false);
+    expect(result.task_suggestions[0]!.body).toContain("Routing metadata:");
+  });
+
+  test("infers package.json release config for standard packages", () => {
+    const repoPath = writePackageJsonVersion("@hasna/repos", "0.2.0");
+    const runner = releaseRunner({
+      headSha: "abcdef1234567890abcdef1234567890abcdef12",
+      headCommittedAt: "2026-06-26T00:00:00Z",
+      latestReachableTag: "v0.1.0",
+      commitsSinceTag: "4",
+      latestGithubRelease: "v0.1.0",
+      latestNpmVersion: "0.1.0",
+      openPrCount: 0,
+      latestReleaseAncestor: true,
+      intendedTagExists: false,
+      ciRuns: [{ status: "completed", conclusion: "success", workflowName: "ci" }],
+    });
+
+    const result = buildReleaseCandidates({
+      repo: repoPath,
+      githubRepo: "hasna/repos",
+      fetch: false,
+      runner,
+    });
+
+    expect(result.repo.package_name).toBe("@hasna/repos");
+    expect(result.repo.tag_prefix).toBe("v");
+    expect(result.repo.version_file).toBe("package.json");
+    expect(result.state.intended_tag).toBe("v0.2.0");
+    expect(result.summary.status).toBe("candidate");
+  });
 });
+
+function writeCargoVersion(version: string): string {
+  const repoPath = mkdtempSync(join(tmpdir(), "open-repos-release-test-"));
+  tempDirs.push(repoPath);
+  mkdirSync(join(repoPath, "codex-rs"), { recursive: true });
+  writeFileSync(join(repoPath, "codex-rs", "Cargo.toml"), `[package]\nname = "codewith"\nversion = "${version}"\n`);
+  return repoPath;
+}
+
+function writePackageJsonVersion(name: string, version: string): string {
+  const repoPath = mkdtempSync(join(tmpdir(), "open-repos-release-test-"));
+  tempDirs.push(repoPath);
+  writeFileSync(join(repoPath, "package.json"), JSON.stringify({ name, version }, null, 2));
+  return repoPath;
+}
+
+function releaseRunner(opts: {
+  headSha: string;
+  headCommittedAt: string;
+  latestReachableTag: string;
+  commitsSinceTag: string;
+  latestGithubRelease: string;
+  latestNpmVersion: string;
+  openPrCount: number;
+  latestReleaseAncestor: boolean;
+  intendedTagExists: boolean;
+  ciRuns: Array<{ status: string; conclusion: string; workflowName: string }>;
+  failGithubRelease?: boolean;
+  failNpm?: boolean;
+  failOpenPrs?: boolean;
+}): CommandRunner {
+  return (command, args) => {
+    const text = `${command} ${args.join(" ")}`;
+    if (command === "git" && args.includes("config") && args.includes("remote.origin.url")) {
+      return { status: 0, stdout: "https://github.com/hasna/codewith.git\n", stderr: "" };
+    }
+    if (command === "git" && args.includes("rev-parse") && args.includes("origin/main")) {
+      return { status: 0, stdout: `${opts.headSha}\n`, stderr: "" };
+    }
+    if (command === "git" && args.includes("show") && args.includes("--format=%cI")) {
+      return { status: 0, stdout: `${opts.headCommittedAt}\n`, stderr: "" };
+    }
+    if (command === "git" && args.includes("describe")) {
+      return { status: 0, stdout: `${opts.latestReachableTag}\n`, stderr: "" };
+    }
+    if (command === "git" && args.includes("rev-list")) {
+      return { status: 0, stdout: `${opts.commitsSinceTag}\n`, stderr: "" };
+    }
+    if (command === "git" && args.includes("merge-base")) {
+      return { status: opts.latestReleaseAncestor ? 0 : 1, stdout: "", stderr: opts.latestReleaseAncestor ? "" : "not ancestor" };
+    }
+    if (command === "git" && args.includes("--verify")) {
+      return { status: opts.intendedTagExists ? 0 : 1, stdout: "", stderr: "" };
+    }
+    if (command === "gh" && args.includes("release")) {
+      if (opts.failGithubRelease) return { status: 1, stdout: "", stderr: "gh auth failed" };
+      return { status: 0, stdout: JSON.stringify([{ tagName: opts.latestGithubRelease }]), stderr: "" };
+    }
+    if (command === "gh" && args.includes("pr")) {
+      if (opts.failOpenPrs) return { status: 1, stdout: "", stderr: "gh pr failed" };
+      return { status: 0, stdout: JSON.stringify(Array.from({ length: opts.openPrCount }, (_, index) => ({ number: index + 1 }))), stderr: "" };
+    }
+    if (command === "gh" && args.includes("run")) {
+      return { status: 0, stdout: JSON.stringify(opts.ciRuns), stderr: "" };
+    }
+    if (command === "curl") {
+      if (opts.failNpm) return { status: 22, stdout: "", stderr: "404" };
+      return { status: 0, stdout: JSON.stringify({ "dist-tags": { latest: opts.latestNpmVersion } }), stderr: "" };
+    }
+    return { status: 1, stdout: "", stderr: `unexpected command: ${text}` };
+  };
+}
