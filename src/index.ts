@@ -54,6 +54,7 @@ export {
 } from "./db/repos.js";
 export {
   buildPrQueue,
+  buildReleaseCandidates,
   inspectPackageHygiene,
   runGlobalCliSmoke,
 } from "./lib/ops-producers.js";
@@ -68,6 +69,8 @@ export type {
   PackageHygieneResult,
   PrQueueOptions,
   RepoPrQueueResult,
+  ReleaseCandidateOptions,
+  ReleaseCandidateResult,
   TaskSeed,
 } from "./lib/ops-producers.js";
 export type {
