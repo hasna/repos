@@ -60,6 +60,11 @@ repos-serve  # http://localhost:19450
 | `repos ops global-cli-smoke` | Check global CLIs, emit task seeds for failures, reports, and todos upserts |
 | `repos ops package-hygiene` | Check Bun/npm Hasna package hygiene |
 | `repos ops release-candidates` | Detect releasable repo changes or release blockers and emit task seeds |
+| `repos ops docs-rules-drift` | Detect code changes that need docs, changelog, prompt, skill, or agent-rule updates |
+| `repos ops dependency-refresh` | Detect dependency refresh needs and emit lifecycle-routed task seeds |
+| `repos ops workspace-worktree-hygiene` | Scan workspace repos for stale, dirty, detached, or missing loop worktrees |
+| `repos ops task-route-health` | Check that task-created lifecycle router loops are active and recently succeeding |
+| `repos ops protected-release` | Emit a protected release task only when release-candidate gates are green |
 
 Legacy list/search/status commands support `--json` for machine-readable output.
 
@@ -110,6 +115,27 @@ repos ops release-candidates \
   --todos-project ~/.hasna/loops \
   --task-list repo-release-candidates \
   --max-task-actions 1 \
+  --json
+
+repos ops docs-rules-drift \
+  --repo ~/workspace/hasna/opensource/open-codewith \
+  --github-repo hasna/codewith \
+  --report-dir ~/.hasna/loops/reports/open-codewith-docs-rules-drift \
+  --upsert-tasks \
+  --todos-project ~/workspace/hasna/opensource/open-codewith \
+  --task-list codewith-product-backlog \
+  --max-task-actions 1 \
+  --json
+
+repos ops workspace-worktree-hygiene \
+  --root ~/workspace/hasna/opensource \
+  --worktree-root ~/.hasna/loops/worktrees \
+  --stale-days 7 \
+  --report-dir ~/.hasna/loops/reports/opensource-worktree-hygiene \
+  --upsert-tasks \
+  --todos-project ~/.hasna/loops \
+  --task-list workspace-worktree-hygiene \
+  --max-task-actions 5 \
   --json
 ```
 
