@@ -1036,6 +1036,7 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
       body: [
         `Repository: ${row.repo_path}`,
         `PR: ${prUrl}`,
+        `GitHub author is ${row.author}`,
         `Base: ${row.base_branch ?? "unknown"}`,
         `Head: ${row.head_branch ?? "unknown"}`,
         "",
@@ -1048,6 +1049,7 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
         repo_full_name: fullName,
         pr_number: row.number,
         pr_url: prUrl,
+        github_author: row.author,
         source: "open-repos.pr-queue.v1",
       },
     },

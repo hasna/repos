@@ -27,11 +27,11 @@ describe("loop task helpers", () => {
           stderr: "",
         };
       }
-      if (args.includes("add")) {
-        const description = args[args.indexOf("-d") + 1]!;
+      if (args.includes("task") && args.includes("upsert")) {
+        const description = args[args.indexOf("--description") + 1]!;
         const task = { id: `task-${tasks.length + 1}`, status: "pending", description };
         tasks.push(task);
-        return { status: 0, stdout: JSON.stringify(task), stderr: "" };
+        return { status: 0, stdout: JSON.stringify({ task, created: true }), stderr: "" };
       }
       return { status: 1, stdout: "", stderr: `unexpected ${args.join(" ")}` };
     };
@@ -50,15 +50,27 @@ describe("loop task helpers", () => {
     expect(result.summary.skipped).toBe(1);
     expect(result.summary.errors).toBe(0);
     expect(tasks[0]!.description).toContain("Fingerprint: github-pr:hasna/repos#1");
+    const upsertCall = calls.find((args) => args.includes("task") && args.includes("upsert"));
+    expect(upsertCall).toContain("--fingerprint");
+    expect(upsertCall).toContain("github-pr:hasna/repos#1");
+    expect(upsertCall).toContain("--metadata-json");
+    expect(JSON.parse(upsertCall![upsertCall!.indexOf("--metadata-json") + 1]!)).toEqual({
+      source: "test",
+      fingerprint: "github-pr:hasna/repos#1",
+    });
+    expect(upsertCall).toContain("--working-dir");
+    expect(upsertCall![upsertCall!.indexOf("--working-dir") + 1]).toBe("/home/hasna/.hasna/loops");
     expect(calls.some((args) => args.includes("task-lists") && args.includes("--add"))).toBe(true);
   });
 
   test("does not recreate non-terminal existing tasks", () => {
+    const calls: string[][] = [];
     const existing = { id: "task-existing", status: "in_progress" };
     const runner: TodosRunner = (args) => {
+      calls.push(args);
       if (args.includes("task-lists")) return { status: 0, stdout: "global-cli-smoke", stderr: "" };
       if (args.includes("search")) return { status: 0, stdout: JSON.stringify([existing]), stderr: "" };
-      if (args.includes("add")) return { status: 0, stdout: JSON.stringify({ id: "should-not-add" }), stderr: "" };
+      if (args.includes("task") && args.includes("upsert")) return { status: 0, stdout: JSON.stringify({ task: { id: "should-not-upsert" }, created: true }), stderr: "" };
       return { status: 1, stdout: "", stderr: "unexpected" };
     };
 
@@ -72,6 +84,7 @@ describe("loop task helpers", () => {
 
     expect(result.summary.existing).toBe(1);
     expect(result.actions[0]).toMatchObject({ action: "exists", task_id: "task-existing" });
+    expect(calls.some((args) => args.includes("task") && args.includes("upsert"))).toBe(false);
   });
 
   test("does not starve new tasks behind existing active tasks", () => {
@@ -85,10 +98,10 @@ describe("loop task helpers", () => {
         }
         return { status: 0, stdout: "[]", stderr: "" };
       }
-      if (args.includes("add")) {
-        const title = args[args.indexOf("add") + 1]!;
+      if (args.includes("task") && args.includes("upsert")) {
+        const title = args[args.indexOf("--title") + 1]!;
         added.push(title);
-        return { status: 0, stdout: JSON.stringify({ id: "created-1", status: "pending" }), stderr: "" };
+        return { status: 0, stdout: JSON.stringify({ task: { id: "created-1", status: "pending" }, created: true }), stderr: "" };
       }
       return { status: 1, stdout: "", stderr: "unexpected" };
     };
@@ -124,7 +137,7 @@ describe("loop task helpers", () => {
           stderr: "",
         };
       }
-      if (args.includes("add")) return { status: 0, stdout: JSON.stringify({ id: "should-not-add" }), stderr: "" };
+      if (args.includes("task") && args.includes("upsert")) return { status: 0, stdout: JSON.stringify({ task: { id: "should-not-upsert" }, created: true }), stderr: "" };
       return { status: 1, stdout: "", stderr: "unexpected" };
     };
 
@@ -138,6 +151,37 @@ describe("loop task helpers", () => {
 
     expect(result.summary.existing).toBe(1);
     expect(result.actions[0]).toMatchObject({ action: "exists", task_id: "active" });
+  });
+
+  test("reports task upsert reuse when the todos metadata fingerprint already exists", () => {
+    const runner: TodosRunner = (args) => {
+      if (args.includes("task-lists")) return { status: 0, stdout: "repo-pr-merge-queue", stderr: "" };
+      if (args.includes("search")) return { status: 0, stdout: "[]", stderr: "" };
+      if (args.includes("task") && args.includes("upsert")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify({ task: { id: "existing-metadata", status: "done" }, created: false }),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected" };
+    };
+
+    const result = upsertTaskSeeds([makeSeed("github-pr:hasna/repos#1")], {
+      project: "/home/hasna/.hasna/loops",
+      taskList: "repo-pr-merge-queue",
+      taskListName: "Repo PR Merge Queue",
+      taskListDescription: "PR work",
+      runner,
+    });
+
+    expect(result.summary.created).toBe(0);
+    expect(result.summary.existing).toBe(1);
+    expect(result.actions[0]).toMatchObject({
+      action: "exists",
+      task_id: "existing-metadata",
+      reason: "upsert reused existing metadata fingerprint",
+    });
   });
 
   test("writes loop report JSON with private file permissions", () => {

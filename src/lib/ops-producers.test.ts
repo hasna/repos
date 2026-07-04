@@ -66,7 +66,10 @@ describe("ops producers", () => {
     expect(result.items[0]!.repo.full_name).toBe("hasna/loops");
     expect(result.items[0]!.task_seed.fingerprint).toBe("github-pr:hasna/loops#12");
     expect(result.items[0]!.task_seed.tags).toContain("auto:route");
+    expect(result.items[0]!.task_seed.body).toContain("GitHub author is andrei-hasna");
+    expect(result.items[0]!.task_seed.metadata["github_author"]).toBe("andrei-hasna");
     expect(result.task_suggestions[0]!.fingerprint).toBe("github-pr:hasna/loops#12");
+    expect(result.task_suggestions[0]!.metadata["github_author"]).toBe("andrei-hasna");
   });
 
   test("keeps large PR queue JSON stable with escaped task seed content", () => {
