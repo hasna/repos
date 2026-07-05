@@ -31,11 +31,15 @@ jobs:
         run: bun run test
 
       - name: Publish to npm
-        # bun publish does not read NODE_AUTH_TOKEN (npm/setup-node convention);
-        # it authenticates via .npmrc (or NPM_CONFIG_TOKEN). Every tag publish
-        # before this fix failed with "missing authentication".
-        run: |
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
-          bun publish --access public
+        # Auth mechanism (documented per task d8f3d2ed): bun publish reads the
+        # NPM_CONFIG_TOKEN environment variable directly for the default
+        # registry. It does NOT read NODE_AUTH_TOKEN (an npm/setup-node
+        # convention), and writing ~/.npmrc at publish time was proven dead on
+        # tag v0.1.33 (run 28740654644): bun 1.3.x still failed with "missing
+        # authentication" even with the token expanded into ~/.npmrc. Single
+        # mechanism on purpose so the next tag cleanly attributes success.
+        # NODE_AUTH_TOKEN is the repo secret holding the live npm publish
+        # token (set 2026-07-05; same token that published v0.1.33 locally).
+        run: bun publish --access public
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
