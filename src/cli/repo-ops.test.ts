@@ -138,12 +138,54 @@ describe("repo ops CLI commands", () => {
     });
   });
 
-  test("pr queue rejects multi-org sync without an explicit repo cap", () => {
-    const result = runCli(["ops", "pr-queue", "--sync-orgs", "hasna", "--json"]);
+  test("pr queue allows multi-org sync without a repo cap (paginates all)", () => {
+    // --sync-max-repos is now optional: omitting it paginates every repo instead of
+    // rejecting the run. Isolated empty DB => zero repos to sync => clean exit.
+    const result = runCliWithEnv(["ops", "pr-queue", "--sync-orgs", "hasna", "--json"], {
+      HASNA_REPOS_DB_PATH: join(tempDir, "repos.db"),
+    });
     const stderr = new TextDecoder().decode(result.stderr);
+    const stdout = new TextDecoder().decode(result.stdout);
 
-    expect(result.exitCode).toBe(1);
-    expect(stderr).toContain("--sync-orgs requires --sync-max-repos");
+    expect(result.exitCode, stderr).toBe(0);
+    expect(stderr).not.toContain("--sync-orgs requires --sync-max-repos");
+    const synced = JSON.parse(stdout).synced;
+    expect(synced.repos_seen).toBe(0);
+    expect(synced.truncated).toBe(false);
+    expect(synced.skipped).toEqual([]);
+  });
+
+  test("pr queue skips stale/missing repo refs instead of failing", () => {
+    const binDir = join(tempDir, "bin");
+    const repoDir = join(tempDir, "open-gone");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(repoDir, { recursive: true });
+    const ghPath = join(binDir, "gh");
+    // Fake `gh` reproduces the 404 a renamed/deleted remote returns.
+    writeFileSync(
+      ghPath,
+      "#!/usr/bin/env bash\necho \"GraphQL: Could not resolve to a Repository with the name 'hasna/open-gone'. (repository)\" >&2\nexit 1\n",
+    );
+    chmodSync(ghPath, 0o755);
+    Bun.spawnSync({ cmd: ["git", "init"], cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+    Bun.spawnSync({ cmd: ["git", "remote", "add", "origin", "https://github.com/hasna/open-gone.git"], cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+
+    const env = {
+      HASNA_REPOS_DB_PATH: join(tempDir, "repos.db"),
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    };
+    const scan = runCliWithEnv(["scan", "--root", tempDir, "--json"], env);
+    expect(scan.exitCode).toBe(0);
+
+    // No --allow-sync-errors: a 404 must still be a clean, skipped result.
+    const result = runCliWithEnv(["ops", "pr-queue", "--sync-orgs", "hasna", "--sync-max-repos", "1", "--json"], env);
+    const stdout = new TextDecoder().decode(result.stdout);
+    const synced = JSON.parse(stdout).synced;
+
+    expect(result.exitCode, stdout).toBe(0);
+    expect(synced.errors).toEqual([]);
+    expect(synced.skipped.length).toBe(1);
+    expect(synced.skipped[0]).toContain("Could not resolve to a Repository");
   });
 
   test("pr queue exits non-zero on sync errors by default", () => {
