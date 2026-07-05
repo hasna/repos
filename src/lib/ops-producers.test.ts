@@ -66,6 +66,10 @@ describe("ops producers", () => {
     expect(result.items[0]!.repo.full_name).toBe("hasna/loops");
     expect(result.items[0]!.task_seed.fingerprint).toBe("github-pr:hasna/loops#12");
     expect(result.items[0]!.task_seed.tags).toContain("auto:route");
+    // pr_author + pr_state must be seeded into metadata so the open-loops
+    // freshness gate / bot-login fast path avoids a per-task live `gh pr view`.
+    expect(result.items[0]!.task_seed.metadata["pr_author"]).toBe("andrei-hasna");
+    expect(result.items[0]!.task_seed.metadata["pr_state"]).toBe("open");
     expect(result.task_suggestions[0]!.fingerprint).toBe("github-pr:hasna/loops#12");
   });
 
