@@ -1053,6 +1053,12 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
         repo_full_name: fullName,
         pr_number: row.number,
         pr_url: prUrl,
+        // pr_author + pr_state feed the open-loops (@hasna/loops >=0.4.10) PR
+        // freshness gate + bot-login normalization fast path, letting it skip a
+        // per-task live `gh pr view` fallback. Values are already fetched into
+        // the row (see pr block above); previously they were dropped here.
+        pr_author: row.author,
+        pr_state: row.state,
         source: "open-repos.pr-queue.v1",
       },
     },
