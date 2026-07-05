@@ -793,14 +793,14 @@ addLoopProducerOptions(
     .description("Emit normalized open PR queue items and task seeds")
     .option("--sync", "Sync GitHub PR metadata before reading the local queue")
     .option("--sync-orgs <orgs>", "Bounded comma-separated orgs to sync before reading the queue")
-    .option("--sync-max-repos <n>", "Required maximum GitHub repositories to sync when using --sync-orgs")
+    .option("--sync-max-repos <n>", "Optional cap on GitHub repositories to sync when using --sync-orgs; omit to paginate ALL repos")
     .option("--allow-sync-errors", "Keep exit code zero even if GitHub sync reports errors")
     .option("--org <org>", "Filter by GitHub org")
     .option("--repo <repo>", "Filter by repo name or local path")
     .option("--state <state>", "Filter PR state", "open")
     .option("-n, --limit <n>", "Maximum PRs to emit", "100")
     .option("--json", "Output JSON")
-    .addHelpText("after", "\nLoop use: add --sync-orgs hasna,hasnaxyz --sync-max-repos 80 --report-dir <dir> --upsert-tasks --todos-project <path> --task-list repo-pr-merge-queue."),
+    .addHelpText("after", "\nLoop use: add --sync-orgs hasna,hasnaxyz --report-dir <dir> --upsert-tasks --todos-project <path> --task-list repo-pr-merge-queue. Omit --sync-max-repos to sync every repo across the orgs; pass it only to bound a run."),
   50,
 )
   .action((opts: LoopProducerOpts & {
@@ -815,11 +815,9 @@ addLoopProducerOptions(
     json?: boolean;
   }) => {
     const syncOrgs = csvFlag(opts.syncOrgs);
+    // --sync-max-repos is now OPTIONAL: when omitted, every repo across the orgs is
+    // paginated. A bounded value is still honored for deliberately capped runs.
     const syncMaxRepos = optionalIntFlag(opts.syncMaxRepos, "--sync-max-repos", 1);
-    if (syncOrgs?.length && !syncMaxRepos) {
-      console.error(chalk.red("Error: --sync-orgs requires --sync-max-repos to keep multi-repo sync bounded."));
-      process.exit(1);
-    }
     const result = buildPrQueue({
       sync: Boolean(opts.sync || syncOrgs),
       syncOrgs,
@@ -842,7 +840,7 @@ addLoopProducerOptions(
     }
     console.log(chalk.bold(`PR queue: ${result.summary.items} item(s), ${result.summary.task_seeds} task seed(s)`));
     if (result.synced) {
-      console.log(chalk.dim(`synced repos=${result.synced.repos_synced}/${result.synced.repos_checked} prs=${result.synced.total_synced} truncated=${result.synced.truncated ? "yes" : "no"} errors=${result.synced.errors.length}`));
+      console.log(chalk.dim(`synced repos=${result.synced.repos_synced}/${result.synced.repos_checked} prs=${result.synced.total_synced} truncated=${result.synced.truncated ? "yes" : "no"} skipped=${result.synced.skipped.length} errors=${result.synced.errors.length}`));
     }
     for (const item of result.items.slice(0, 50)) {
       console.log(`${chalk.green(item.repo.full_name)}#${item.pr.number} ${item.pr.title}`);
