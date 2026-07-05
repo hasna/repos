@@ -1043,6 +1043,14 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
         `PR: ${prUrl}`,
         `Base: ${row.base_branch ?? "unknown"}`,
         `Head: ${row.head_branch ?? "unknown"}`,
+        // State/Author lines are the delivery channel for the open-loops
+        // (@hasna/loops >=0.4.10) freshness gate + bot-login fast path on the
+        // seeded TODOS TASK: the todos CLI has no metadata flag, so
+        // upsertTaskSeeds cannot persist task_seed.metadata. The gate's text
+        // extractors (prStateFromEvidence / authorFromPrText) read exactly
+        // these `State: <open|merged|closed>` / `Author: <login>` lines.
+        `State: ${row.state}`,
+        `Author: ${row.author}`,
         "",
         "Start a durable goal. Inspect GitHub PR state, checks, branch freshness, review status, and conflicts. Use an adversarial reviewer for non-trivial changes. Merge only when validation and policy allow it; otherwise update the PR/task with exact blockers.",
       ].join("\n"),

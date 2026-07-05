@@ -70,6 +70,12 @@ describe("ops producers", () => {
     // freshness gate / bot-login fast path avoids a per-task live `gh pr view`.
     expect(result.items[0]!.task_seed.metadata["pr_author"]).toBe("andrei-hasna");
     expect(result.items[0]!.task_seed.metadata["pr_state"]).toBe("open");
+    // ...and the SAME facts must land in the task BODY: the todos CLI has no
+    // metadata flag (upsertTaskSeeds cannot persist task_seed.metadata), so
+    // the open-loops gate reads its fast path from these description lines
+    // on the seeded todos task (prStateFromEvidence / authorFromPrText).
+    expect(result.items[0]!.task_seed.body).toContain("State: open");
+    expect(result.items[0]!.task_seed.body).toContain("Author: andrei-hasna");
     expect(result.task_suggestions[0]!.fingerprint).toBe("github-pr:hasna/loops#12");
   });
 
