@@ -1047,10 +1047,20 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
         // (@hasna/loops >=0.4.10) freshness gate + bot-login fast path on the
         // seeded TODOS TASK: the todos CLI has no metadata flag, so
         // upsertTaskSeeds cannot persist task_seed.metadata. The gate's text
-        // extractors (prStateFromEvidence / authorFromPrText) read exactly
-        // these `State: <open|merged|closed>` / `Author: <login>` lines.
+        // extractors parse these lines; formats are contract-pinned to
+        // open-loops src/lib/route/pr-review.ts and enforced by the
+        // "gate-parseable" contract test in ops-producers.test.ts:
+        // - `State: <open|merged|closed>` — prStateFromEvidence permits `\s*`
+        //   before the separator, so the plain-colon form parses.
+        // - `Author is <login>` — authorFromPrText requires WHITESPACE before
+        //   the separator (`\bauthor\s+(?:is|=|:)\s+`), so a bare `Author:`
+        //   line silently does NOT parse (review-repos-pr11 finding).
+        // Note: listPrRows filters pr.state='open', so State is effectively
+        // always "open" at seed time — it still saves the gate a live state
+        // resolution; merged/closed values only appear if the producer is
+        // ever pointed at non-open PR sets.
         `State: ${row.state}`,
-        `Author: ${row.author}`,
+        `Author is ${row.author}`,
         "",
         "Start a durable goal. Inspect GitHub PR state, checks, branch freshness, review status, and conflicts. Use an adversarial reviewer for non-trivial changes. Merge only when validation and policy allow it; otherwise update the PR/task with exact blockers.",
       ].join("\n"),
