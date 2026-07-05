@@ -73,6 +73,70 @@ describe("ops producers", () => {
     expect(result.task_suggestions[0]!.fingerprint).toBe("github-pr:hasna/loops#12");
   });
 
+  test("seed body State/Author lines are gate-parseable (cross-package contract with open-loops)", () => {
+    // CONTRACT TEST — guards against "seed-body cross-package format drift"
+    // (review-repos-pr11 BLOCK finding; tracked as task 21261ad4): a presence
+    // assertion (`toContain`) passed CI while the gate could not PARSE the
+    // line. These regexes are copied VERBATIM from @hasna/loops 0.4.11
+    // open-loops src/lib/route/pr-review.ts — authorFromPrText (:278-290)
+    // and the prStateFromEvidence text fallback (:191). The todos CLI drops
+    // task_seed.metadata, so the persisted todos task description is the ONLY
+    // channel the gate can read; if open-loops changes these patterns, this
+    // test must be updated in lockstep (and vice versa).
+    const AUTHOR_FROM_PR_TEXT_PATTERNS = [
+      /\bauthor\s+(?:is\s+also|is|=|:)\s+@?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/i,
+      /\bPR\s*#?\d+\s+author\s+(?:is\s+also|is|=|:)\s+@?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/i,
+      /\bgithub\s+author\s+(?:is\s+also|is|=|:)\s+@?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/i,
+    ];
+    const PR_STATE_TEXT_PATTERN =
+      /\b(?:pr[_\s-]?state|pull[_\s-]?request[_\s-]?state|state)\s*[:=]\s*(MERGED|CLOSED|OPEN)\b/i;
+
+    const repo = upsertRepo({
+      path: "/workspace/open-loops-contract",
+      name: "open-loops-contract",
+      org: "hasna",
+      remote_url: "git@github.com:hasna/loops-contract.git",
+    });
+    bulkInsertPullRequests([
+      {
+        repo_id: repo.id,
+        number: 77,
+        title: "Contract probe PR",
+        state: "open",
+        author: "andrei-hasna",
+        created_at: "2026-07-05T00:00:00Z",
+        updated_at: "2026-07-05T01:00:00Z",
+        merged_at: null,
+        closed_at: null,
+        url: "https://github.com/hasna/loops-contract/pull/77",
+        base_branch: "main",
+        head_branch: "probe/contract",
+        additions: 1,
+        deletions: 1,
+        changed_files: 1,
+      },
+    ]);
+
+    const body = buildPrQueue({ org: "hasna", repo: "open-loops-contract" }).items[0]!.task_seed.body;
+
+    // Author fast path: at least one gate pattern must EXTRACT the login.
+    const authorMatch = AUTHOR_FROM_PR_TEXT_PATTERNS
+      .map((pattern) => pattern.exec(body)?.[1])
+      .find((login) => Boolean(login));
+    expect(authorMatch).toBe("andrei-hasna");
+
+    // State fast path: the gate pattern must extract + normalize the state.
+    const stateMatch = PR_STATE_TEXT_PATTERN.exec(body)?.[1]?.toUpperCase();
+    expect(stateMatch).toBe("OPEN");
+
+    // Regression pin for the exact BLOCK finding: a bare `Author: <login>`
+    // line (no whitespace before the separator) must NOT be what we emit —
+    // the gate patterns require `\bauthor\s+` before the separator.
+    expect(body).not.toMatch(/^Author:\s/m);
+    expect(body).toMatch(/^Author is andrei-hasna$/m);
+    expect(body).toMatch(/^State: open$/m);
+  });
+
   test("keeps large PR queue JSON stable with escaped task seed content", () => {
     const repo = upsertRepo({
       path: "/workspace/open-repos",
