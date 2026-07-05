@@ -85,7 +85,6 @@ Examples:
 ```bash
 repos ops pr-queue \
   --sync-orgs hasna,hasnaxyz,hasnatools,hasnastudio,hasnaai,hasnaeducation,hasnafamily \
-  --sync-max-repos 80 \
   --state open \
   --limit 100 \
   --report-dir ~/.hasna/loops/reports/repo-pr-sync-producer \
@@ -139,7 +138,11 @@ repos ops workspace-worktree-hygiene \
   --json
 ```
 
-`--sync-orgs` requires `--sync-max-repos`; GitHub sync errors make the command
+`--sync-max-repos` is optional with `--sync-orgs`: omit it to paginate every
+repo across the orgs (the default for the merge-queue producer, so no repo is
+starved by a cap); pass it only to deliberately bound a run. Renamed or deleted
+remotes (GitHub 404s) are skipped-and-continued and reported under
+`synced.skipped`, never as errors. Genuine GitHub sync errors make the command
 exit non-zero by default so loop health cannot silently run on stale metadata.
 Use `--allow-sync-errors` only for exploratory reads where stale cached PR data
 is acceptable.
