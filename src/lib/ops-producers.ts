@@ -48,6 +48,7 @@ export interface RepoPrQueueResult {
     total_synced: number;
     truncated: boolean;
     errors: string[];
+    skipped: string[];
   };
   filters: {
     org?: string;
@@ -88,12 +89,15 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
   if (options.sync) {
     if (options.repo) {
       const result = syncGithubPRs(options.repo, { limit, state });
-      synced = { repos_seen: 1, repos_checked: 1, repos_synced: 1, total_synced: result.synced, truncated: false, errors: [] };
+      synced = { repos_seen: 1, repos_checked: 1, repos_synced: 1, total_synced: result.synced, truncated: false, errors: [], skipped: [] };
     } else if (options.syncOrgs?.length) {
-      synced = { repos_seen: 0, repos_checked: 0, repos_synced: 0, total_synced: 0, truncated: false, errors: [] };
+      synced = { repos_seen: 0, repos_checked: 0, repos_synced: 0, total_synced: 0, truncated: false, errors: [], skipped: [] };
+      // When --sync-max-repos is omitted the budget is unbounded and EVERY repo in
+      // every org is paginated (no 100-repo cap starving later orgs/repos).
+      const bounded = Boolean(options.syncMaxRepos);
       let remainingRepos = normalizePositiveInteger(options.syncMaxRepos, 0);
       for (const org of options.syncOrgs) {
-        if (options.syncMaxRepos && remainingRepos <= 0) {
+        if (bounded && remainingRepos <= 0) {
           synced.truncated = true;
           break;
         }
@@ -101,7 +105,7 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
           org,
           limit,
           state,
-          ...(options.syncMaxRepos ? { maxRepos: remainingRepos } : {}),
+          ...(bounded ? { maxRepos: remainingRepos } : {}),
         });
         synced.repos_seen += result.repos_seen;
         synced.repos_checked += result.repos_checked;
@@ -109,6 +113,7 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
         synced.total_synced += result.total_synced;
         synced.truncated = synced.truncated || result.truncated;
         synced.errors.push(...result.errors.map((error) => `${org}: ${error}`));
+        synced.skipped.push(...result.skipped.map((skip) => `${org}: ${skip}`));
         remainingRepos -= result.repos_checked;
       }
     } else {

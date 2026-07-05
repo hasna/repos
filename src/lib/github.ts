@@ -96,9 +96,23 @@ export function syncGithubPRs(
   return { synced, repo_name: repo.name };
 }
 
+// Stale/renamed/deleted GitHub repos surface as resolvable-only errors from `gh`.
+// These are expected (a repo in the local inventory was renamed or removed on the
+// remote) and must NOT abort or fail a fleet-wide sync — they are skipped, not errored.
+const MISSING_REPO_PATTERNS: RegExp[] = [
+  /could not resolve to a repository/i,
+  /http 404/i,
+  /404: not found/i,
+  /repository not found/i,
+];
+
+export function isMissingRepoError(message: string): boolean {
+  return MISSING_REPO_PATTERNS.some((pattern) => pattern.test(message));
+}
+
 export function syncAllGithubPRs(
   opts: { org?: string; limit?: number; state?: string; maxRepos?: number; onProgress?: (msg: string) => void } = {}
-): { total_synced: number; repos_seen: number; repos_checked: number; repos_synced: number; truncated: boolean; errors: string[] } {
+): { total_synced: number; repos_seen: number; repos_checked: number; repos_synced: number; truncated: boolean; errors: string[]; skipped: string[] } {
   const db = getDb();
   const { org, limit = 50, state = "all", maxRepos, onProgress } = opts;
 
@@ -115,6 +129,7 @@ export function syncAllGithubPRs(
   let total_synced = 0;
   let repos_synced = 0;
   const errors: string[] = [];
+  const skipped: string[] = [];
 
   for (let i = 0; i < repos.length; i++) {
     const repo = repos[i]!;
@@ -124,11 +139,17 @@ export function syncAllGithubPRs(
       total_synced += result.synced;
       repos_synced++;
     } catch (err) {
-      errors.push(`${repo.name}: ${err instanceof Error ? err.message : String(err)}`);
+      const message = err instanceof Error ? err.message : String(err);
+      // A renamed/deleted remote (404) is skipped-and-continued, never a hard error.
+      if (isMissingRepoError(message)) {
+        skipped.push(`${repo.name}: ${message}`);
+      } else {
+        errors.push(`${repo.name}: ${message}`);
+      }
     }
   }
 
-  return { total_synced, repos_seen, repos_checked: repos.length, repos_synced, truncated: repos.length < repos_seen, errors };
+  return { total_synced, repos_seen, repos_checked: repos.length, repos_synced, truncated: repos.length < repos_seen, errors, skipped };
 }
 
 export function fetchRepoMetadata(repoIdOrName: string | number): {
