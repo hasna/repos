@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { getDb } from "../db/database.js";
 import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
+import { getReleasePipelineParity, type OpsCommandRunner } from "./repo-ops.js";
 import type { PullRequest } from "../types/index.js";
 
 export interface TaskSeed {
@@ -1869,6 +1870,104 @@ function packageDuplicateTaskSeed(row: PackageHygieneResult["npm_global_duplicat
       npm_version: row.version,
       source: "open-repos.package-hygiene.v1",
     },
+  };
+}
+
+export interface ReleasePipelineParityQueueOptions {
+  paths: string[];
+  includeRegistry?: boolean;
+  limit?: number;
+  runner?: OpsCommandRunner;
+}
+
+export interface ReleasePipelineParityItem {
+  root: string;
+  status: "ok" | "warn" | "fail";
+  issue_codes: string[];
+  workflows: ReturnType<typeof getReleasePipelineParity>["workflows"];
+  registry: ReturnType<typeof getReleasePipelineParity>["registry"];
+  task_seed?: TaskSeed;
+}
+
+export interface ReleasePipelineParityQueueResult {
+  schema: "open-repos.release-pipeline-parity.v1";
+  generated_at: string;
+  options: {
+    include_registry: boolean;
+  };
+  summary: {
+    repos: number;
+    flagged: number;
+    task_seeds: number;
+  };
+  task_suggestions: TaskSeed[];
+  items: ReleasePipelineParityItem[];
+}
+
+function releaseParityTaskSeed(path: string, item: Omit<ReleasePipelineParityItem, "task_seed">): TaskSeed {
+  const repoName = basename(resolve(path));
+  const lines = [
+    `Repository: ${path}`,
+    `Issues: ${item.issue_codes.join(", ") || "none"}`,
+    "",
+    "Bring this repo to release-pipeline parity: add the standard .github/workflows/ci.yml + tag-triggered publish.yml pair,",
+    "and if the npm latest version has no matching git tag, backfill the tag (and record the release with `releases record`)",
+    "so future publishes go through the tag pipeline.",
+  ];
+  return {
+    fingerprint: `release-pipeline-parity:${repoName}`,
+    title: `Fix release pipeline parity for ${repoName}`,
+    body: lines.join("\n"),
+    priority: item.issue_codes.includes("npm_latest_without_git_tag") ? "high" : "medium",
+    tags: ["auto:route", "area:repoops", "release-pipeline-parity"],
+    metadata: {
+      repo_path: path,
+      issue_codes: item.issue_codes,
+      source: "open-repos.release-pipeline-parity.v1",
+    },
+  };
+}
+
+/**
+ * Release-pipeline parity producer: flags repos missing the standard
+ * ci.yml + tag-publish publish.yml workflow pair and repos whose npm latest
+ * version has no matching git tag (publishes bypassing the tag pipeline),
+ * emitting deduped task seeds per flagged repo.
+ */
+export function buildReleasePipelineParity(options: ReleasePipelineParityQueueOptions): ReleasePipelineParityQueueResult {
+  const includeRegistry = options.includeRegistry !== false;
+  const items: ReleasePipelineParityItem[] = options.paths.map((path) => {
+    const report = getReleasePipelineParity({
+      cwd: path,
+      limit: options.limit,
+      includeRegistry,
+      runner: options.runner,
+    });
+    const base: ReleasePipelineParityItem = {
+      root: report.root,
+      status: report.status,
+      issue_codes: report.issues.filter((issue) => issue.severity !== "info").map((issue) => issue.code),
+      workflows: report.workflows,
+      registry: report.registry,
+    };
+    if (base.issue_codes.length > 0) base.task_seed = releaseParityTaskSeed(path, base);
+    return base;
+  });
+  const seeds = items
+    .map((item) => item.task_seed)
+    .filter((seed): seed is TaskSeed => Boolean(seed));
+
+  return {
+    schema: "open-repos.release-pipeline-parity.v1",
+    generated_at: new Date().toISOString(),
+    options: { include_registry: includeRegistry },
+    summary: {
+      repos: items.length,
+      flagged: seeds.length,
+      task_seeds: seeds.length,
+    },
+    task_suggestions: seeds,
+    items,
   };
 }
 

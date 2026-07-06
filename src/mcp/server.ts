@@ -23,6 +23,7 @@ import {
   getPackageDrift,
   getPackageHealth,
   getReleaseHealth,
+  getReleasePipelineParity,
   resolvePackageBin,
   scanPorts,
   triageBranches,
@@ -265,16 +266,29 @@ server.tool("docs_drift", "Check README coverage for package name, bins, and age
   ...todosShape,
 }, async (args) => jsonText(withTodos(getDocsDrift({ cwd: args.cwd, limit: args.limit }), todosArgs(args))));
 
-server.tool("release_health", "Combine package, drift, docs, and branch checks for release readiness", {
+server.tool("release_health", "Combine package, drift, docs, branch, and release-pipeline checks for release readiness", {
   cwd: z.string().optional().describe("Package root"),
   include_git: z.boolean().optional().describe("Include git branch checks; default true"),
+  include_registry: z.boolean().optional().describe("Also check npm registry latest vs local git tags; default false"),
   stale_days: z.number().optional().describe("Stale local branch threshold"),
   limit: z.number().optional().describe("Max returned items"),
   ...todosShape,
 }, async (args) => jsonText(withTodos(getReleaseHealth({
   cwd: args.cwd,
   includeGit: args.include_git,
+  includeRegistry: args.include_registry,
   staleDays: args.stale_days,
+  limit: args.limit,
+}), todosArgs(args))));
+
+server.tool("release_pipeline_parity", "Check the standard ci.yml + tag-publish publish.yml pair and npm-latest-without-git-tag drift", {
+  cwd: z.string().optional().describe("Repo root"),
+  include_registry: z.boolean().optional().describe("Check npm registry latest vs local git tags; default true"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(getReleasePipelineParity({
+  cwd: args.cwd,
+  includeRegistry: args.include_registry,
   limit: args.limit,
 }), todosArgs(args))));
 

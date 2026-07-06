@@ -60,12 +60,18 @@ interface PackageJson {
   publishConfig?: Record<string, unknown>;
 }
 
-interface CommandResult {
+export interface CommandResult {
   ok: boolean;
   stdout: string;
   stderr: string;
   exitCode: number | null;
 }
+
+export type OpsCommandRunner = (
+  command: string,
+  args: string[],
+  options?: { cwd?: string; timeout?: number; maxBuffer?: number },
+) => CommandResult;
 
 const SCHEMA_VERSION = "1.0" as const;
 const DEFAULT_LIMIT = 20;
@@ -79,6 +85,7 @@ const OPS_COMMAND_MENTIONS = [
   "repos triage prs",
   "repos docs drift",
   "repos release health",
+  "repos release parity",
   "repos no-cloud inventory",
 ];
 
@@ -1154,13 +1161,155 @@ export function getDocsDrift(options: { cwd?: string; limit?: number } = {}): Op
   };
 }
 
-export function getReleaseHealth(options: { cwd?: string; limit?: number; includeGit?: boolean; staleDays?: number } = {}): OpsReport & {
+const CI_WORKFLOW_NAMES = ["ci.yml", "ci.yaml"];
+const PUBLISH_WORKFLOW_NAMES = ["publish.yml", "publish.yaml"];
+
+function findWorkflowPath(root: string, names: string[]): string | null {
+  for (const name of names) {
+    const path = join(root, ".github", "workflows", name);
+    if (existsSync(path)) return path;
+  }
+  return null;
+}
+
+function isTagTriggeredPublish(text: string): boolean {
+  // The standard publish workflow runs on tag pushes: `on: push: tags: [...]`.
+  return /(^|\n)\s*on\s*:/.test(text) && /push\s*:[\s\S]{0,400}?tags\s*:/.test(text);
+}
+
+export function getReleasePipelineParity(options: {
+  cwd?: string;
+  limit?: number;
+  includeRegistry?: boolean;
+  runner?: OpsCommandRunner;
+} = {}): OpsReport & {
+  kind: "release_pipeline_parity";
+  workflows: {
+    ci: { present: boolean; path: string | null };
+    publish: { present: boolean; path: string | null; tag_triggered: boolean };
+    standard_pair: boolean;
+  };
+  registry: {
+    checked: boolean;
+    package: string | null;
+    npm_latest: string | null;
+    git_tag_for_latest: string | null;
+    npm_latest_without_git_tag: boolean;
+  };
+} {
+  const root = rootOf(options.cwd);
+  const limit = capLimit(options.limit);
+  const runner = options.runner ?? run;
+  const { path: packagePath, pkg } = readPackage(root);
+  const issues: OpsIssue[] = [];
+  const artifacts = [artifact(root, "package", packagePath)];
+
+  const ciPath = findWorkflowPath(root, CI_WORKFLOW_NAMES);
+  const publishPath = findWorkflowPath(root, PUBLISH_WORKFLOW_NAMES);
+  let publishTagTriggered = false;
+  if (ciPath) artifacts.push(artifact(root, "workflow", ciPath));
+  if (publishPath) artifacts.push(artifact(root, "workflow", publishPath));
+
+  if (!ciPath) {
+    issues.push({ code: "ci_workflow_missing", severity: "warning", message: "Standard CI workflow is missing", ref: ".github/workflows/ci.yml" });
+  }
+  if (!publishPath) {
+    issues.push({ code: "publish_workflow_missing", severity: "warning", message: "Standard tag-publish workflow is missing", ref: ".github/workflows/publish.yml" });
+  } else {
+    try {
+      publishTagTriggered = isTagTriggeredPublish(readFileSync(publishPath, "utf-8"));
+    } catch {
+      publishTagTriggered = false;
+    }
+    if (!publishTagTriggered) {
+      issues.push({
+        code: "publish_workflow_not_tag_triggered",
+        severity: "warning",
+        message: "Publish workflow does not run on tag pushes (expected on: push: tags)",
+        ref: ".github/workflows/publish.yml",
+      });
+    }
+  }
+
+  const registry: ReturnType<typeof getReleasePipelineParity>["registry"] = {
+    checked: false,
+    package: redactMaybe(pkg?.name),
+    npm_latest: null,
+    git_tag_for_latest: null,
+    npm_latest_without_git_tag: false,
+  };
+
+  if (options.includeRegistry !== false) {
+    if (!pkg?.name) {
+      issues.push({ code: "registry_check_skipped", severity: "info", message: "No package name; skipping npm registry drift check", ref: "package.json" });
+    } else if (pkg.private) {
+      issues.push({ code: "registry_check_skipped", severity: "info", message: "Package is private; skipping npm registry drift check", ref: "package.json" });
+    } else {
+      const npm = runner("npm", ["view", pkg.name, "version"], { cwd: root, timeout: 15_000 });
+      if (!npm.ok || !npm.stdout.trim()) {
+        if (/E404|404 Not Found|is not in this registry/i.test(npm.stderr)) {
+          issues.push({ code: "npm_package_not_published", severity: "info", message: "Package has no published version on the npm registry", ref: redactText(pkg.name) });
+        } else {
+          issues.push({ code: "npm_registry_unreachable", severity: "info", message: "Could not read npm registry latest (offline or npm unavailable)", ref: redactText(pkg.name) });
+        }
+      } else {
+        registry.checked = true;
+        const latest = npm.stdout.trim().split("\n")[0]!.replace(/^"|"$/g, "");
+        registry.npm_latest = redactText(latest);
+        const inside = git(root, ["rev-parse", "--is-inside-work-tree"], 3000);
+        if (!inside.ok || inside.stdout !== "true") {
+          issues.push({ code: "tag_check_skipped", severity: "info", message: "Path is not a git repository; skipping npm-latest tag check" });
+        } else {
+          const tags = git(root, ["tag", "--list", `v${latest}`, latest], 5000);
+          const tag = tags.stdout.split("\n").map((line) => line.trim()).filter(Boolean)[0] ?? null;
+          registry.git_tag_for_latest = tag ? redactText(tag) : null;
+          if (!tag) {
+            registry.npm_latest_without_git_tag = true;
+            issues.push({
+              code: "npm_latest_without_git_tag",
+              severity: "warning",
+              message: `npm latest ${redactText(latest)} has no matching local git tag (publish bypassed the tag pipeline?)`,
+              ref: redactText(latest),
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const workflows = {
+    ci: { present: Boolean(ciPath), path: ciPath ? artifact(root, "workflow", ciPath).path : null },
+    publish: { present: Boolean(publishPath), path: publishPath ? artifact(root, "workflow", publishPath).path : null, tag_triggered: publishTagTriggered },
+    standard_pair: Boolean(ciPath) && Boolean(publishPath) && publishTagTriggered,
+  };
+
+  return {
+    kind: "release_pipeline_parity",
+    schema_version: SCHEMA_VERSION,
+    status: statusFor(issues),
+    root: redactPath(root),
+    workflows,
+    registry,
+    summary: {
+      issues: issues.length,
+      standard_pair: workflows.standard_pair,
+      registry_checked: registry.checked,
+      npm_latest_without_git_tag: registry.npm_latest_without_git_tag,
+    },
+    issues: redactIssues(issues, limit),
+    artifacts,
+    truncated: issues.length > limit,
+  };
+}
+
+export function getReleaseHealth(options: { cwd?: string; limit?: number; includeGit?: boolean; includeRegistry?: boolean; staleDays?: number } = {}): OpsReport & {
   kind: "release_health";
   checks: {
     package: Pick<ReturnType<typeof getPackageHealth>, "status" | "summary" | "truncated">;
     drift: Pick<ReturnType<typeof getPackageDrift>, "status" | "summary" | "truncated">;
     docs: Pick<ReturnType<typeof getDocsDrift>, "status" | "summary" | "truncated">;
     branches: Pick<ReturnType<typeof triageBranches>, "status" | "summary" | "truncated"> | null;
+    pipeline: Pick<ReturnType<typeof getReleasePipelineParity>, "status" | "summary" | "truncated">;
   };
 } {
   const root = rootOf(options.cwd);
@@ -1169,6 +1318,9 @@ export function getReleaseHealth(options: { cwd?: string; limit?: number; includ
   const packageDrift = getPackageDrift({ cwd: root, limit });
   const docsDrift = getDocsDrift({ cwd: root, limit });
   const branchTriage = options.includeGit === false ? null : triageBranches({ cwd: root, limit, staleDays: options.staleDays });
+  // Registry drift needs the network, so inside the aggregate health surface it is opt-in;
+  // `repos release parity` checks the registry by default.
+  const pipelineParity = getReleasePipelineParity({ cwd: root, limit, includeRegistry: options.includeRegistry === true });
   const issues: OpsIssue[] = [];
   const seenIssues = new Set<string>();
 
@@ -1177,6 +1329,7 @@ export function getReleaseHealth(options: { cwd?: string; limit?: number; includ
     ["drift", packageDrift],
     ["docs", docsDrift],
     ["branches", branchTriage],
+    ["pipeline", pipelineParity],
   ] as const) {
     if (!report) continue;
     for (const issue of report.issues) {
@@ -1198,15 +1351,17 @@ export function getReleaseHealth(options: { cwd?: string; limit?: number; includ
       drift: { status: packageDrift.status, summary: packageDrift.summary, truncated: packageDrift.truncated },
       docs: { status: docsDrift.status, summary: docsDrift.summary, truncated: docsDrift.truncated },
       branches: branchTriage ? { status: branchTriage.status, summary: branchTriage.summary, truncated: branchTriage.truncated } : null,
+      pipeline: { status: pipelineParity.status, summary: pipelineParity.summary, truncated: pipelineParity.truncated },
     },
     summary: {
       issues: issues.length,
       ready: issues.length === 0,
       git_checked: Boolean(branchTriage),
+      pipeline_standard_pair: pipelineParity.workflows.standard_pair,
     },
     issues: redactIssues(issues, limit),
-    artifacts: dedupeBy([...packageHealth.artifacts, ...packageDrift.artifacts, ...docsDrift.artifacts], (entry) => `${entry.kind}:${entry.path}`),
-    truncated: issues.length > limit || packageHealth.truncated || packageDrift.truncated || docsDrift.truncated || Boolean(branchTriage?.truncated),
+    artifacts: dedupeBy([...packageHealth.artifacts, ...packageDrift.artifacts, ...docsDrift.artifacts, ...pipelineParity.artifacts], (entry) => `${entry.kind}:${entry.path}`),
+    truncated: issues.length > limit || packageHealth.truncated || packageDrift.truncated || docsDrift.truncated || pipelineParity.truncated || Boolean(branchTriage?.truncated),
   };
 }
 

@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { closeDb, getDb } from "../db/database.js";
 import { bulkInsertPullRequests, upsertRepo } from "../db/repos.js";
 import {
@@ -10,6 +11,7 @@ import {
   buildPrQueue,
   buildProtectedRelease,
   buildReleaseCandidates,
+  buildReleasePipelineParity,
   buildTaskRouteHealth,
   buildWorkspaceWorktreeHygiene,
   inspectPackageHygiene,
@@ -492,6 +494,54 @@ describe("ops producers", () => {
     expect(result.summary.status).toBe("ready");
     expect(result.task_suggestions[0]!.tags).toContain("protected-release");
     expect(result.task_suggestions[0]!.priority).toBe("critical");
+  });
+
+  test("release pipeline parity flags repos without the standard workflow pair", () => {
+    const compliant = mkdtempSync(join(tmpdir(), "open-repos-parity-ok-"));
+    const missing = mkdtempSync(join(tmpdir(), "open-repos-parity-gap-"));
+    tempDirs.push(compliant, missing);
+    for (const dir of [compliant, missing]) {
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: `@hasna/${basename(dir)}`, version: "1.0.0" }));
+    }
+    mkdirSync(join(compliant, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(compliant, ".github", "workflows", "ci.yml"), "on:\n  push:\n    branches: [main]\njobs: {}\n");
+    writeFileSync(join(compliant, ".github", "workflows", "publish.yml"), "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n");
+
+    const result = buildReleasePipelineParity({ paths: [compliant, missing], includeRegistry: false });
+
+    expect(result.schema).toBe("open-repos.release-pipeline-parity.v1");
+    expect(result.summary).toMatchObject({ repos: 2, flagged: 1, task_seeds: 1 });
+    const seed = result.task_suggestions[0]!;
+    expect(seed.fingerprint).toBe(`release-pipeline-parity:${basename(missing)}`);
+    expect(seed.tags).toContain("release-pipeline-parity");
+    expect(seed.priority).toBe("medium");
+    expect((seed.metadata["issue_codes"] as string[])).toContain("ci_workflow_missing");
+    const okItem = result.items.find((item) => item.issue_codes.length === 0)!;
+    expect(okItem.task_seed).toBeUndefined();
+    expect(okItem.workflows.standard_pair).toBe(true);
+  });
+
+  test("release pipeline parity emits high priority seeds for npm tag drift", () => {
+    const repo = mkdtempSync(join(tmpdir(), "open-repos-parity-drift-"));
+    tempDirs.push(repo);
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "@hasna/parity-drift", version: "1.0.0" }));
+    mkdirSync(join(repo, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(repo, ".github", "workflows", "ci.yml"), "on:\n  push:\n    branches: [main]\njobs: {}\n");
+    writeFileSync(join(repo, ".github", "workflows", "publish.yml"), "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n");
+    execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["commit", "--allow-empty", "-m", "initial"], { cwd: repo, stdio: "pipe" });
+
+    const result = buildReleasePipelineParity({
+      paths: [repo],
+      runner: () => ({ ok: true, stdout: "2.0.0", stderr: "", exitCode: 0 }),
+    });
+
+    expect(result.summary.flagged).toBe(1);
+    const seed = result.task_suggestions[0]!;
+    expect(seed.priority).toBe("high");
+    expect((seed.metadata["issue_codes"] as string[])).toContain("npm_latest_without_git_tag");
   });
 });
 
