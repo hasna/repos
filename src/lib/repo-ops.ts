@@ -1174,7 +1174,12 @@ function findWorkflowPath(root: string, names: string[]): string | null {
 
 function isTagTriggeredPublish(text: string): boolean {
   // The standard publish workflow runs on tag pushes: `on: push: tags: [...]`.
-  return /(^|\n)\s*on\s*:/.test(text) && /push\s*:[\s\S]{0,400}?tags\s*:/.test(text);
+  // Only inspect the trigger section (everything before the first top-level
+  // `jobs:` key) so `tags:` inputs inside job steps — e.g.
+  // docker/build-push-action's `tags:` — cannot false-positive the check.
+  const jobsIndex = text.search(/^jobs\s*:/m);
+  const triggerSection = jobsIndex === -1 ? text : text.slice(0, jobsIndex);
+  return /(^|\n)\s*on\s*:/.test(triggerSection) && /push\s*:[\s\S]{0,400}?tags\s*:/.test(triggerSection);
 }
 
 export function getReleasePipelineParity(options: {
@@ -1261,14 +1266,30 @@ export function getReleasePipelineParity(options: {
           issues.push({ code: "tag_check_skipped", severity: "info", message: "Path is not a git repository; skipping npm-latest tag check" });
         } else {
           const tags = git(root, ["tag", "--list", `v${latest}`, latest], 5000);
-          const tag = tags.stdout.split("\n").map((line) => line.trim()).filter(Boolean)[0] ?? null;
+          let tag = tags.stdout.split("\n").map((line) => line.trim()).filter(Boolean)[0] ?? null;
+          if (!tag) {
+            // Local tags can be missing entirely (shallow/partial clones, CI
+            // checkouts with fetch-tags disabled). The registry path is already
+            // network-opt-in, so consult the remote before flagging drift.
+            const remote = git(root, ["ls-remote", "--tags", "origin", `v${latest}`, latest], 10_000);
+            if (remote.ok) {
+              tag =
+                remote.stdout
+                  .split("\n")
+                  .map((line) => line.trim())
+                  .filter(Boolean)
+                  .map((line) => line.split(/\s+/).pop() ?? "")
+                  .map((ref) => ref.replace(/^refs\/tags\//, "").replace(/\^\{\}$/, ""))
+                  .filter(Boolean)[0] ?? null;
+            }
+          }
           registry.git_tag_for_latest = tag ? redactText(tag) : null;
           if (!tag) {
             registry.npm_latest_without_git_tag = true;
             issues.push({
               code: "npm_latest_without_git_tag",
               severity: "warning",
-              message: `npm latest ${redactText(latest)} has no matching local git tag (publish bypassed the tag pipeline?)`,
+              message: `npm latest ${redactText(latest)} has no matching git tag locally or on origin (publish bypassed the tag pipeline?)`,
               ref: redactText(latest),
             });
           }

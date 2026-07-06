@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   getDocsDrift,
   getPackageDrift,
@@ -245,6 +245,57 @@ describe("repo ops primitives", () => {
     expect(result.status).toBe("warn");
     expect(result.issues.map((issue) => issue.code)).toContain("publish_workflow_not_tag_triggered");
     expect(result.workflows.standard_pair).toBe(false);
+  });
+
+  it("does not mistake job-step tags: inputs for a tag trigger", () => {
+    writePackage();
+    // Branch-triggered publish whose first job step uses docker/build-push-action's `tags:` input.
+    writeWorkflows({
+      publish: [
+        "on:",
+        "  push:",
+        "    branches: [main]",
+        "jobs:",
+        "  docker:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - uses: docker/build-push-action@v6",
+        "        with:",
+        "          push: true",
+        "          tags: user/app:latest",
+        "",
+      ].join("\n"),
+    });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, includeRegistry: false });
+
+    expect(result.workflows.publish.tag_triggered).toBe(false);
+    expect(result.workflows.standard_pair).toBe(false);
+    expect(result.issues.map((issue) => issue.code)).toContain("publish_workflow_not_tag_triggered");
+  });
+
+  it("falls back to origin tags when the local clone has not fetched them", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    // Tag exists on origin but not locally (e.g. shallow clone / fetch-tags disabled).
+    const remoteDir = join(tempDir, "..", `${basename(tempDir)}-origin.git`);
+    execFileSync("git", ["init", "--bare", remoteDir], { stdio: "pipe" });
+    execFileSync("git", ["remote", "add", "origin", remoteDir], { cwd: tempDir, stdio: "pipe" });
+    execFileSync("git", ["tag", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
+    execFileSync("git", ["push", "origin", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
+    execFileSync("git", ["tag", "-d", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
+    const runner: OpsCommandRunner = () => ({ ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 });
+
+    try {
+      const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+      expect(result.status).toBe("ok");
+      expect(result.registry.git_tag_for_latest).toBe("v9.9.9");
+      expect(result.registry.npm_latest_without_git_tag).toBe(false);
+    } finally {
+      rmSync(remoteDir, { recursive: true, force: true });
+    }
   });
 
   it("detects npm-latest-without-git-tag drift", () => {
