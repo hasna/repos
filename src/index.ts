@@ -32,13 +32,14 @@ export {
   getPackageDrift,
   getPackageHealth,
   getReleaseHealth,
+  getReleasePipelineParity,
   resolvePackageBin,
   scanPorts,
   triageBranches,
   triagePullRequests,
   withTodos,
 } from "./lib/repo-ops.js";
-export type { OpsIssue, OpsReport, TodosIntegrationOptions, TodosIntegrationResult } from "./lib/repo-ops.js";
+export type { CommandResult, OpsCommandRunner, OpsIssue, OpsReport, TodosIntegrationOptions, TodosIntegrationResult } from "./lib/repo-ops.js";
 export {
   listRepos,
   getRepo,
@@ -58,6 +59,7 @@ export {
   buildPrQueue,
   buildProtectedRelease,
   buildReleaseCandidates,
+  buildReleasePipelineParity,
   buildTaskRouteHealth,
   buildWorkspaceWorktreeHygiene,
   inspectPackageHygiene,
@@ -82,6 +84,9 @@ export type {
   RepoPrQueueResult,
   ReleaseCandidateOptions,
   ReleaseCandidateResult,
+  ReleasePipelineParityItem,
+  ReleasePipelineParityQueueOptions,
+  ReleasePipelineParityQueueResult,
   TaskRouteHealthOptions,
   TaskRouteHealthResult,
   TaskSeed,

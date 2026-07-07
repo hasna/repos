@@ -54,12 +54,14 @@ repos-serve  # http://localhost:19450
 | `repos triage branches [path]` | Summarize branch, dirty, stale, merged, ahead/behind state |
 | `repos triage prs [path]` | Summarize GitHub PR state through `gh` |
 | `repos docs drift [path]` | Check README coverage for package and agent ops commands |
-| `repos release health [path]` | Combine package, drift, docs, and branch release checks |
+| `repos release health [path]` | Combine package, drift, docs, branch, and release-pipeline checks |
+| `repos release parity [path]` | Check the standard ci.yml + tag-publish publish.yml pair and npm-latest-without-git-tag drift |
 | `repos no-cloud inventory [path]` | Scan repos for legacy cloud package references and route-safe remediation metadata |
 | `repos ops pr-queue` | Emit PR merge task seeds, optional bounded GitHub sync, reports, and todos upserts |
 | `repos ops global-cli-smoke` | Check global CLIs, emit task seeds for failures, reports, and todos upserts |
 | `repos ops package-hygiene` | Check Bun/npm Hasna package hygiene |
 | `repos ops release-candidates` | Detect releasable repo changes or release blockers and emit task seeds |
+| `repos ops release-pipeline-parity` | Flag repos missing the standard CI + tag-publish workflow pair or with npm-latest-without-git-tag drift |
 | `repos ops docs-rules-drift` | Detect code changes that need docs, changelog, prompt, skill, or agent-rule updates |
 | `repos ops dependency-refresh` | Detect dependency refresh needs and emit lifecycle-routed task seeds |
 | `repos ops workspace-worktree-hygiene` | Scan workspace repos for stale, dirty, detached, or missing loop worktrees |

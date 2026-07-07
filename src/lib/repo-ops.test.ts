@@ -2,16 +2,18 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   getDocsDrift,
   getPackageDrift,
   getPackageHealth,
   getReleaseHealth,
+  getReleasePipelineParity,
   resolvePackageBin,
   scanPorts,
   triageBranches,
   withTodos,
+  type OpsCommandRunner,
 } from "./repo-ops";
 
 let tempDir = "";
@@ -84,6 +86,14 @@ function initGitRepo() {
   execFileSync("git", ["commit", "-m", "initial"], { cwd: tempDir, stdio: "pipe" });
 }
 
+function writeWorkflows(options: { ci?: string; publish?: string } = {}) {
+  mkdirSync(join(tempDir, ".github", "workflows"), { recursive: true });
+  writeFileSync(join(tempDir, ".github", "workflows", "ci.yml"), options.ci ?? "on:\n  push:\n    branches: [main]\njobs: {}\n");
+  if (options.publish !== undefined) {
+    writeFileSync(join(tempDir, ".github", "workflows", "publish.yml"), options.publish);
+  }
+}
+
 beforeEach(() => {
   tempDir = join(tmpdir(), `repos-ops-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   mkdirSync(tempDir, { recursive: true });
@@ -152,7 +162,7 @@ describe("repo ops primitives", () => {
         "repos repos-mcp repos-serve",
         "repos package health repos package drift repos package resolve-bin",
         "repos ports scan repos triage branches repos triage prs",
-        "repos docs drift repos release health repos no-cloud inventory",
+        "repos docs drift repos release health repos release parity repos no-cloud inventory",
       ].join("\n"),
     });
 
@@ -200,6 +210,143 @@ describe("repo ops primitives", () => {
 
     expect(result.project_ports).toContainEqual({ port: 3456, source: "script:dev" });
     expect(result.summary.project_ports).toBe(1);
+  });
+
+  it("flags repos missing the standard ci.yml + tag-publish publish.yml pair", () => {
+    writePackage();
+
+    const result = getReleasePipelineParity({ cwd: tempDir, includeRegistry: false });
+
+    expect(result.kind).toBe("release_pipeline_parity");
+    expect(result.status).toBe("warn");
+    expect(result.workflows.standard_pair).toBe(false);
+    const codes = result.issues.map((issue) => issue.code);
+    expect(codes).toContain("ci_workflow_missing");
+    expect(codes).toContain("publish_workflow_missing");
+  });
+
+  it("accepts the standard workflow pair with a tag-triggered publish", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags:\n      - \"v*\"\njobs: {}\n" });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, includeRegistry: false });
+
+    expect(result.status).toBe("ok");
+    expect(result.workflows.standard_pair).toBe(true);
+    expect(result.workflows.publish.tag_triggered).toBe(true);
+  });
+
+  it("flags a publish workflow that is not tag-triggered", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  workflow_dispatch: {}\njobs: {}\n" });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, includeRegistry: false });
+
+    expect(result.status).toBe("warn");
+    expect(result.issues.map((issue) => issue.code)).toContain("publish_workflow_not_tag_triggered");
+    expect(result.workflows.standard_pair).toBe(false);
+  });
+
+  it("does not mistake job-step tags: inputs for a tag trigger", () => {
+    writePackage();
+    // Branch-triggered publish whose first job step uses docker/build-push-action's `tags:` input.
+    writeWorkflows({
+      publish: [
+        "on:",
+        "  push:",
+        "    branches: [main]",
+        "jobs:",
+        "  docker:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - uses: docker/build-push-action@v6",
+        "        with:",
+        "          push: true",
+        "          tags: user/app:latest",
+        "",
+      ].join("\n"),
+    });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, includeRegistry: false });
+
+    expect(result.workflows.publish.tag_triggered).toBe(false);
+    expect(result.workflows.standard_pair).toBe(false);
+    expect(result.issues.map((issue) => issue.code)).toContain("publish_workflow_not_tag_triggered");
+  });
+
+  it("falls back to origin tags when the local clone has not fetched them", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    // Tag exists on origin but not locally (e.g. shallow clone / fetch-tags disabled).
+    const remoteDir = join(tempDir, "..", `${basename(tempDir)}-origin.git`);
+    execFileSync("git", ["init", "--bare", remoteDir], { stdio: "pipe" });
+    execFileSync("git", ["remote", "add", "origin", remoteDir], { cwd: tempDir, stdio: "pipe" });
+    execFileSync("git", ["tag", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
+    execFileSync("git", ["push", "origin", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
+    execFileSync("git", ["tag", "-d", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
+    const runner: OpsCommandRunner = () => ({ ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 });
+
+    try {
+      const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+      expect(result.status).toBe("ok");
+      expect(result.registry.git_tag_for_latest).toBe("v9.9.9");
+      expect(result.registry.npm_latest_without_git_tag).toBe(false);
+    } finally {
+      rmSync(remoteDir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects npm-latest-without-git-tag drift", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner: OpsCommandRunner = () => ({ ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.checked).toBe(true);
+    expect(result.registry.npm_latest).toBe("9.9.9");
+    expect(result.registry.npm_latest_without_git_tag).toBe(true);
+    expect(result.issues.map((issue) => issue.code)).toContain("npm_latest_without_git_tag");
+    expect(result.status).toBe("warn");
+  });
+
+  it("passes the registry check when the npm latest version is tagged", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    execFileSync("git", ["tag", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
+    const runner: OpsCommandRunner = () => ({ ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.status).toBe("ok");
+    expect(result.registry.git_tag_for_latest).toBe("v9.9.9");
+    expect(result.registry.npm_latest_without_git_tag).toBe(false);
+  });
+
+  it("degrades to an info issue when the npm registry is unreachable", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    const runner: OpsCommandRunner = () => ({ ok: false, stdout: "", stderr: "ETIMEDOUT registry.npmjs.org", exitCode: 1 });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.status).toBe("ok");
+    expect(result.registry.checked).toBe(false);
+    expect(result.issues.map((issue) => issue.code)).toContain("npm_registry_unreachable");
+  });
+
+  it("includes the release pipeline parity check in release health", () => {
+    writePackage({ readme: "# @hasna/repos\nrepos\n" });
+
+    const result = getReleaseHealth({ cwd: tempDir, includeGit: false, limit: 20 });
+
+    expect(result.checks.pipeline.status).toBe("warn");
+    expect(result.summary.pipeline_standard_pair).toBe(false);
+    expect(result.issues.map((issue) => issue.code)).toContain("pipeline_ci_workflow_missing");
   });
 
   it("keeps todos integration as a dry-run unless apply is requested", () => {

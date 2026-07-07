@@ -30,6 +30,7 @@ import {
   buildPrQueue,
   buildProtectedRelease,
   buildReleaseCandidates,
+  buildReleasePipelineParity,
   buildTaskRouteHealth,
   buildWorkspaceWorktreeHygiene,
   inspectPackageHygiene,
@@ -43,6 +44,7 @@ import {
   getPackageDrift,
   getPackageHealth,
   getReleaseHealth,
+  getReleasePipelineParity,
   resolvePackageBin,
   scanPorts,
   triageBranches,
@@ -918,6 +920,45 @@ ops
 
 addLoopProducerOptions(
   ops
+    .command("release-pipeline-parity")
+    .description("Flag repos missing the standard CI + tag-publish workflow pair or with npm-latest-without-git-tag drift")
+    .requiredOption("--paths <paths>", "Comma-separated local repo paths to check")
+    .option("--no-registry", "Skip npm registry drift checks")
+    .option("--json", "Output JSON")
+    .addHelpText("after", "\nLoop use: add --report-dir <dir> --upsert-tasks --todos-project <path> --task-list release-pipeline-parity."),
+  20,
+)
+  .action((opts: LoopProducerOpts & { paths: string; registry?: boolean; json?: boolean }) => {
+    const result = buildReleasePipelineParity({
+      paths: csvFlag(opts.paths) ?? [],
+      includeRegistry: opts.registry !== false,
+    });
+    const envelope = applyLoopProducerArtifacts(result, result.task_suggestions, opts, {
+      reportPrefix: "release-pipeline-parity",
+      taskList: "release-pipeline-parity",
+      taskListName: "Release Pipeline Parity",
+      taskListDescription: "Release pipeline parity gaps (missing CI/tag-publish workflows, npm-latest-without-git-tag drift) created by deterministic OpenRepos producers.",
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(envelope, null, 2));
+      if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+      return;
+    }
+    const status = result.summary.flagged === 0 ? chalk.green("ok") : chalk.yellow("gaps");
+    console.log(`${status} repos=${result.summary.repos} flagged=${result.summary.flagged} task_seeds=${result.summary.task_seeds}`);
+    for (const item of result.items.filter((entry) => entry.issue_codes.length > 0).slice(0, 30)) {
+      console.log(`${chalk.yellow(item.root)} ${chalk.dim(item.issue_codes.join(", "))}`);
+    }
+    if (envelope.loop?.task_upsert) {
+      const upsert = envelope.loop.task_upsert.summary;
+      console.log(chalk.dim(`tasks created=${upsert.created} existing=${upsert.existing} skipped=${upsert.skipped} errors=${upsert.errors}`));
+    }
+    if (envelope.loop?.report_path) console.log(chalk.dim(`report=${envelope.loop.report_path}`));
+    if (loopProducerHadErrors(envelope)) process.exitCode = 1;
+  });
+
+addLoopProducerOptions(
+  ops
     .command("release-candidates")
     .description("Detect releasable repo changes or release blockers and emit task seeds")
     .requiredOption("--repo <path-or-name>", "Local repo path or repos registry name")
@@ -1619,8 +1660,9 @@ const releaseOps = program.command("release").description("Release readiness pri
 
 addOpsOptions(releaseOps
   .command("health [path]")
-  .description("Combine package, drift, docs, and branch checks for release readiness")
+  .description("Combine package, drift, docs, branch, and release-pipeline checks for release readiness")
   .option("--no-git", "Skip git branch checks")
+  .option("--registry", "Also check npm registry latest vs local git tags")
   .option("--stale-days <n>", "Stale local branch threshold", "30"))
   .action((path: string | undefined, opts: any) => {
     const cwd = path ?? process.cwd();
@@ -1628,7 +1670,25 @@ addOpsOptions(releaseOps
       getReleaseHealth({
         cwd,
         includeGit: opts.git,
+        includeRegistry: Boolean(opts.registry),
         staleDays: intFlag(opts.staleDays, "--stale-days", 1),
+        limit: intFlag(opts.limit, "--limit", 1),
+      }),
+      todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+addOpsOptions(releaseOps
+  .command("parity [path]")
+  .description("Check the standard ci.yml + tag-publish publish.yml pair and npm-latest-without-git-tag drift")
+  .option("--no-registry", "Skip the npm registry drift check"))
+  .action((path: string | undefined, opts: any) => {
+    const cwd = path ?? process.cwd();
+    const report = withTodos(
+      getReleasePipelineParity({
+        cwd,
+        includeRegistry: opts.registry !== false,
         limit: intFlag(opts.limit, "--limit", 1),
       }),
       todosOpts(opts, cwd)
