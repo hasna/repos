@@ -66,11 +66,14 @@ describe("ops producers", () => {
     expect(result.items[0]!.repo.full_name).toBe("hasna/loops");
     expect(result.items[0]!.task_seed.fingerprint).toBe("github-pr:hasna/loops#12");
     expect(result.items[0]!.task_seed.tags).toContain("auto:route");
+    expect(result.items[0]!.task_seed.body).toContain("GitHub author is andrei-hasna");
+    expect(result.items[0]!.task_seed.metadata["github_author"]).toBe("andrei-hasna");
     // pr_author + pr_state must be seeded into metadata so the open-loops
     // freshness gate / bot-login fast path avoids a per-task live `gh pr view`.
     expect(result.items[0]!.task_seed.metadata["pr_author"]).toBe("andrei-hasna");
     expect(result.items[0]!.task_seed.metadata["pr_state"]).toBe("open");
     expect(result.task_suggestions[0]!.fingerprint).toBe("github-pr:hasna/loops#12");
+    expect(result.task_suggestions[0]!.metadata["github_author"]).toBe("andrei-hasna");
   });
 
   test("seed body State/Author lines are gate-parseable (cross-package contract with open-loops)", () => {

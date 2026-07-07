@@ -106,6 +106,8 @@ export function upsertTaskSeeds(seeds: TaskSeed[], options: UpsertTaskSeedsOptio
     const activeTask = existing.tasks?.find((task) => !TERMINAL_STATUSES.has(String(task.status ?? "")));
     if (activeTask) {
       result.summary.existing += 1;
+      // Older tasks may only have the fingerprint in their description; upserting by
+      // metadata fingerprint here would create a duplicate instead of updating them.
       result.actions.push({
         action: "exists",
         fingerprint: seed.fingerprint,
@@ -126,25 +128,30 @@ export function upsertTaskSeeds(seeds: TaskSeed[], options: UpsertTaskSeedsOptio
       continue;
     }
 
-    const added = addTaskSeed(options, seed, runner, timeoutMs);
-    if (added.error) {
+    const upserted = upsertTaskSeed(options, seed, runner, timeoutMs);
+    if (upserted.error) {
       result.summary.errors += 1;
-      result.errors.push(added.error);
+      result.errors.push(upserted.error);
       result.actions.push({
         action: "error",
         fingerprint: seed.fingerprint,
         title: seed.title,
-        error: added.error,
+        error: upserted.error,
       });
       continue;
     }
 
-    result.summary.created += 1;
+    if (upserted.created) {
+      result.summary.created += 1;
+    } else {
+      result.summary.existing += 1;
+    }
     result.actions.push({
-      action: "created",
+      action: upserted.created ? "created" : "exists",
       fingerprint: seed.fingerprint,
       title: seed.title,
-      task_id: String(added.task?.id ?? ""),
+      task_id: String(upserted.task?.id ?? ""),
+      ...(upserted.created ? {} : { reason: "upsert reused existing metadata fingerprint" }),
     });
   }
 
@@ -220,22 +227,27 @@ function findExistingTask(
   }
 }
 
-function addTaskSeed(
+function upsertTaskSeed(
   options: UpsertTaskSeedsOptions,
   seed: TaskSeed,
   runner: TodosRunner,
   timeoutMs: number,
-): { task?: Record<string, unknown>; error?: string } {
+): { task?: Record<string, unknown>; created?: boolean; error?: string } {
   const body = seed.body.includes(seed.fingerprint)
     ? seed.body
     : `Fingerprint: ${seed.fingerprint}\n${seed.body}`;
+  const metadata = taskSeedMetadata(seed);
   const result = runner([
     "--project",
     options.project,
     "-j",
-    "add",
+    "task",
+    "upsert",
+    "--fingerprint",
+    seed.fingerprint,
+    "--title",
     seed.title,
-    "-d",
+    "--description",
     body,
     "--priority",
     seed.priority,
@@ -243,15 +255,30 @@ function addTaskSeed(
     options.taskList,
     "--tags",
     Array.from(new Set(seed.tags)).join(","),
-    "--reason",
-    `Deterministic OpenRepos ops producer generated ${seed.fingerprint}.`,
+    "--metadata-json",
+    JSON.stringify(metadata),
+    "--working-dir",
+    taskSeedWorkingDir(metadata, options),
   ], { timeoutMs });
-  if (result.status !== 0) return { error: compactError(result, `failed to add task ${seed.fingerprint}`) };
+  if (result.status !== 0) return { error: compactError(result, `failed to upsert task ${seed.fingerprint}`) };
   try {
-    return { task: JSON.parse(result.stdout || "{}") as Record<string, unknown> };
+    const parsed = JSON.parse(result.stdout || "{}") as { task?: Record<string, unknown>; created?: boolean };
+    return { task: parsed.task, created: Boolean(parsed.created) };
   } catch (error) {
-    return { error: `failed to parse todos add JSON for ${seed.fingerprint}: ${(error as Error).message}` };
+    return { error: `failed to parse todos task upsert JSON for ${seed.fingerprint}: ${(error as Error).message}` };
   }
+}
+
+function taskSeedMetadata(seed: TaskSeed): Record<string, unknown> {
+  return { ...seed.metadata, fingerprint: seed.fingerprint };
+}
+
+function taskSeedWorkingDir(metadata: Record<string, unknown>, options: UpsertTaskSeedsOptions): string {
+  const explicit = metadata["working_dir"];
+  if (typeof explicit === "string" && explicit.trim()) return explicit;
+  const repoPath = metadata["repo_path"];
+  if (typeof repoPath === "string" && repoPath.trim()) return repoPath;
+  return options.project;
 }
 
 function runTodos(args: string[], opts: { timeoutMs: number }): TodosCommandResult {

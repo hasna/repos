@@ -1041,6 +1041,7 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
       body: [
         `Repository: ${row.repo_path}`,
         `PR: ${prUrl}`,
+        `GitHub author is ${row.author}`,
         `Base: ${row.base_branch ?? "unknown"}`,
         `Head: ${row.head_branch ?? "unknown"}`,
         // State/Author lines are the delivery channel for the open-loops
@@ -1071,6 +1072,7 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
         repo_full_name: fullName,
         pr_number: row.number,
         pr_url: prUrl,
+        github_author: row.author,
         // pr_author + pr_state feed the open-loops (@hasna/loops >=0.4.10) PR
         // freshness gate + bot-login normalization fast path, letting it skip a
         // per-task live `gh pr view` fallback. Values are already fetched into
