@@ -289,4 +289,26 @@ const MIGRATIONS = [
       );
     `,
   },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE IF NOT EXISTS repo_relocation_audit (
+        id TEXT PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE RESTRICT,
+        operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
+        actor TEXT NOT NULL,
+        expected_current_path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        expected_remote TEXT NOT NULL,
+        expected_head TEXT NOT NULL,
+        source_state TEXT NOT NULL CHECK (source_state IN ('matched', 'missing')),
+        before_json TEXT NOT NULL,
+        after_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_repo_relocation_audit_repo
+        ON repo_relocation_audit(repo_id, created_at);
+    `,
+  },
 ];

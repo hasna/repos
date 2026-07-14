@@ -71,6 +71,12 @@ describe("repos", () => {
     expect(repo!.path).toBe("/tmp/test-repo");
   });
 
+  it("fails closed when an exact repo name matches multiple rows", () => {
+    upsertRepo({ path: "/tmp/test-repo-a", name: "duplicate-name" });
+    upsertRepo({ path: "/tmp/test-repo-b", name: "duplicate-name" });
+    expect(() => getRepo("duplicate-name")).toThrow("Multiple repos have the exact name");
+  });
+
   it("should get repo by ID", () => {
     const created = upsertRepo({ path: "/tmp/test-repo", name: "test-repo" });
     const repo = getRepo(created.id);

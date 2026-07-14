@@ -15,7 +15,12 @@ import {
   searchAll,
   getGlobalStats,
   getRepoStats,
+  AmbiguousRepoNameError,
 } from "../db/repos.js";
+import {
+  PrimaryRelocationError,
+  relocatePrimaryRepo,
+} from "../db/primary-relocation.js";
 import { ensureWorkspaceBootstrap, startAutoIndexWorker } from "../lib/auto-index.js";
 import { getFilterAlias } from "../lib/config.js";
 import { getReposStatus } from "../lib/status.js";
@@ -78,6 +83,7 @@ const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set([
   "release",
   "no-cloud",
   "release-health",
+  "registry",
 ]);
 
 program
@@ -86,7 +92,16 @@ program
   .version(getCliVersion());
 
 function requireRepo(repoInput: string) {
-  const repo = getRepo(repoInput);
+  let repo;
+  try {
+    repo = getRepo(repoInput);
+  } catch (error) {
+    if (error instanceof AmbiguousRepoNameError) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+    throw error;
+  }
   if (repo) return repo;
 
   const suggestion = fuzzyFindRepo(repoInput);
@@ -385,6 +400,64 @@ program
           console.log(`    ${chalk.yellow(c.sha.slice(0, 8))} ${c.message.slice(0, 80)} ${chalk.dim(c.date.slice(0, 10))}`);
         }
       }
+    }
+  });
+
+// ── Registry safety operations ──
+const registry = program
+  .command("registry")
+  .description("Fail-closed local registry maintenance operations");
+
+registry
+  .command("relocate-primary")
+  .description("Validate and relocate one existing repo row to a canonical task worktree")
+  .requiredOption("--repo-id <id>", "Existing numeric repo row ID")
+  .requiredOption("--expected-current-path <path>", "Expected path currently stored on the repo row")
+  .requiredOption("--target-path <path>", "Canonical target Git checkout/worktree path")
+  .requiredOption("--expected-remote <host/owner/name>", "Credential-free expected remote identity")
+  .requiredOption("--expected-head <sha>", "Exact lowercase target HEAD object ID")
+  .requiredOption("--actor <actor>", "Auditable operator or workflow identity")
+  .option("--dry-run", "Validate and print the proposed receipt without writing (default)")
+  .option("--apply", "Atomically update the existing row and append an audit receipt")
+  .option("--json", "Output the versioned JSON result")
+  .action((opts) => {
+    const json = Boolean(opts.json);
+    try {
+      if (opts.apply && opts.dryRun) {
+        throw new PrimaryRelocationError(
+          "INVALID_REQUEST",
+          "--apply and --dry-run are mutually exclusive",
+        );
+      }
+      const result = relocatePrimaryRepo({
+        repoId: parseIntOption(opts.repoId, "--repo-id", 1),
+        expectedCurrentPath: opts.expectedCurrentPath,
+        targetPath: opts.targetPath,
+        expectedRemote: opts.expectedRemote,
+        expectedHead: opts.expectedHead,
+        actor: opts.actor,
+        apply: Boolean(opts.apply),
+      });
+      if (json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else if (result.applied) {
+        console.log(chalk.green(`✓ Relocated repo ${result.repo_id}`));
+        console.log(`  ${result.before.path} → ${result.after.path}`);
+        console.log(chalk.dim(`  Receipt: ${result.receipt!.id}`));
+      } else {
+        console.log(chalk.yellow(`Dry run: repo ${result.repo_id} is safe to relocate`));
+        console.log(`  ${result.before.path} → ${result.after.path}`);
+        console.log(chalk.dim("  Re-run with --apply to write the path and audit receipt."));
+      }
+    } catch (error) {
+      const code = error instanceof PrimaryRelocationError ? error.code : "UNEXPECTED_ERROR";
+      const message = error instanceof Error ? error.message : "unknown relocation error";
+      if (json) {
+        console.log(JSON.stringify({ schema: "open-repos.primary-relocation.v1", ok: false, error: { code, message } }, null, 2));
+      } else {
+        console.error(chalk.red(`${code}: ${message}`));
+      }
+      process.exitCode = 1;
     }
   });
 

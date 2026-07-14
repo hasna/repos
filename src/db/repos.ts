@@ -13,6 +13,13 @@ import type {
 
 // ── Repos ──
 
+export class AmbiguousRepoNameError extends Error {
+  constructor(public readonly repoName: string) {
+    super(`Multiple repos have the exact name '${repoName}'; use an explicit repo ID or path`);
+    this.name = "AmbiguousRepoNameError";
+  }
+}
+
 export function listRepos(opts: ListOptions & { org?: string; query?: string } = {}): Repo[] {
   const db = getDb();
   const { limit = 50, offset = 0, org, query } = opts;
@@ -41,10 +48,16 @@ export function getRepo(idOrPath: string | number): Repo | null {
   if (typeof idOrPath === "number") {
     return db.query("SELECT * FROM repos WHERE id = ?").get(idOrPath) as Repo | null;
   }
-  return (
-    (db.query("SELECT * FROM repos WHERE path = ?").get(idOrPath) as Repo | null) ||
-    (db.query("SELECT * FROM repos WHERE name = ?").get(idOrPath) as Repo | null)
-  );
+  const byPath = db.query("SELECT * FROM repos WHERE path = ?").get(idOrPath) as Repo | null;
+  if (byPath) return byPath;
+
+  const byName = db
+    .query("SELECT * FROM repos WHERE name = ? ORDER BY id LIMIT 2")
+    .all(idOrPath) as Repo[];
+  if (byName.length > 1) {
+    throw new AmbiguousRepoNameError(idOrPath);
+  }
+  return byName[0] || null;
 }
 
 export function upsertRepo(repo: Partial<Repo> & { path: string; name: string }): Repo {

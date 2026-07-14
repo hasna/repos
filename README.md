@@ -34,6 +34,7 @@ repos-serve  # http://localhost:19450
 | `repos scan` | Discover and index all git repos |
 | `repos repos` | List repositories |
 | `repos repo <name>` | Get repo details |
+| `repos registry relocate-primary` | Safely repoint one existing repo row to a verified canonical worktree |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
 | `repos tags` | List tags |
@@ -69,6 +70,51 @@ repos-serve  # http://localhost:19450
 | `repos ops protected-release` | Emit a protected release task only when release-candidate gates are green |
 
 Legacy list/search/status commands support `--json` for machine-readable output.
+
+### Primary registry relocation
+
+`repos registry relocate-primary` repairs a stale primary path without deleting,
+merging, or rescanning registry rows. It is a dry run unless `--apply` is given.
+Both modes require the existing numeric row ID, its expected current path, a
+canonical checkout below `~/.hasna/repos/worktrees`, a credential-free remote
+identity in `host/owner/name` form, and the target's exact HEAD object ID.
+
+```bash
+# Validation only (default)
+repos registry relocate-primary \
+  --repo-id 663 \
+  --expected-current-path /dev/shm/infinity-local-build-20260710/repos/infinity \
+  --target-path ~/.hasna/repos/worktrees/infinity-machine/infinity/task-663 \
+  --expected-remote github.com/hasna/infinity \
+  --expected-head <exact-lowercase-sha> \
+  --actor operator:<identity> \
+  --json
+
+# Apply only after reviewing the dry-run envelope
+repos registry relocate-primary \
+  --repo-id 663 \
+  --expected-current-path /dev/shm/infinity-local-build-20260710/repos/infinity \
+  --target-path ~/.hasna/repos/worktrees/infinity-machine/infinity/task-663 \
+  --expected-remote github.com/hasna/infinity \
+  --expected-head <exact-lowercase-sha> \
+  --actor operator:<identity> \
+  --apply \
+  --json
+```
+
+The operation fails closed if the source path is stale, the exact repo name is
+ambiguous, the target is missing/non-canonical/already registered/dirty, or the row,
+source checkout, target origin, and exact HEAD do not agree. If the stored source
+path exists, it must itself be the canonical Git top-level with the same origin
+and HEAD as the target and must have no dirty or untracked state; a genuinely
+absent stale source is allowed but is
+explicitly recorded as `source_state: missing`. Source state and target identity
+are checked again inside the transaction. Apply changes only the existing row's
+`path` while preserving its ID and child commit/branch/tag/remote/PR records. The
+same transaction appends a before/after receipt to `repo_relocation_audit`; a
+receipt failure rolls back the path change. Raw credential-bearing or local-path
+remote URLs are neither accepted as expected identities nor written to
+relocation receipts.
 
 Agent-loop ops commands emit compact JSON by default and bound returned lists with
 `--limit`. Each supports `--pretty` for readable JSON, `--todo <id>` for a dry-run

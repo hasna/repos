@@ -1,5 +1,16 @@
 export * from "./types/index.js";
 export { getDb, closeDb } from "./db/database.js";
+export {
+  PrimaryRelocationError,
+  relocatePrimaryRepo,
+  sanitizeGitRemoteUrl,
+} from "./db/primary-relocation.js";
+export type {
+  PrimaryRelocationErrorCode,
+  PrimaryRelocationReceipt,
+  PrimaryRelocationRequest,
+  PrimaryRelocationResult,
+} from "./db/primary-relocation.js";
 export { ensureWorkspaceBootstrap, startAutoIndexWorker, syncRepoCatalog } from "./lib/auto-index.js";
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
 export { discoverRepos, scanRepoPaths, scanRepos, watchRepos } from "./lib/scanner.js";
@@ -52,6 +63,7 @@ export {
   searchAll,
   getRepoStats,
   getGlobalStats,
+  AmbiguousRepoNameError,
 } from "./db/repos.js";
 export {
   buildDependencyRefresh,
