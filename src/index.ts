@@ -16,7 +16,17 @@ export type {
   SafeErrorDetails,
   TableReconcileCounts,
 } from "./db/primary-relocation.js";
-export { ensureWorkspaceBootstrap, startAutoIndexWorker, syncRepoCatalog } from "./lib/auto-index.js";
+export {
+  cleanupRemoteIdentities,
+  ensureWorkspaceBootstrap,
+  startAutoIndexWorker,
+  syncRepoCatalog,
+} from "./lib/auto-index.js";
+export type {
+  RemoteIdentityCleanupCounts,
+  RemoteIdentityCleanupOptions,
+  RemoteIdentityCleanupSummary,
+} from "./lib/auto-index.js";
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
 export { discoverRepos, scanRepoPaths, scanRepos, watchRepos } from "./lib/scanner.js";
 export { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "./lib/github.js";
@@ -58,6 +68,7 @@ export {
 export type { CommandResult, OpsCommandRunner, OpsIssue, OpsReport, TodosIntegrationOptions, TodosIntegrationResult } from "./lib/repo-ops.js";
 export {
   listRepos,
+  listAllRepos,
   getRepo,
   searchRepos,
   listCommits,

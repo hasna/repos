@@ -1,7 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { getDb } from "../db/database.js";
-import { getRepo, bulkInsertPullRequests } from "../db/repos.js";
-import { listRepos } from "../db/repos.js";
+import { getRepo, bulkInsertPullRequests, listAllRepos } from "../db/repos.js";
 import type { PullRequest } from "../types/index.js";
 
 function gh(args: string[]): string {
@@ -15,10 +14,12 @@ function gh(args: string[]): string {
   } catch (error) {
     const err = error as Error & { stderr?: Buffer | string; status?: number | null; signal?: NodeJS.Signals | null };
     const stderr = Buffer.isBuffer(err.stderr) ? err.stderr.toString("utf8") : err.stderr;
-    const detail = (stderr || err.message || "unknown gh error").replace(/\s+/g, " ").trim();
+    const detail = (stderr || err.message || "").replace(/\s+/g, " ").trim();
     const status = err.status == null ? "" : ` exit=${err.status}`;
     const signal = err.signal ? ` signal=${err.signal}` : "";
-    throw new Error(`gh ${args.join(" ")} failed${status}${signal}: ${detail}`);
+    throw new Error(isMissingRepoError(detail)
+      ? "GitHub repository is unavailable"
+      : `GitHub CLI request failed${status}${signal}`);
   }
 }
 
@@ -66,13 +67,13 @@ export function syncGithubPRs(
     "number,title,state,author,createdAt,updatedAt,mergedAt,closedAt,url,baseRefName,headRefName,additions,deletions,changedFiles",
   ]);
 
-  if (!output) throw new Error(`gh pr list returned empty output for ${ghRepo}`);
+  if (!output) throw new Error("GitHub CLI returned empty output");
 
   let prs: GhPr[];
   try {
     prs = JSON.parse(output);
-  } catch (error) {
-    throw new Error(`gh pr list returned invalid JSON for ${ghRepo}: ${(error as Error).message}`);
+  } catch {
+    throw new Error("GitHub CLI returned invalid JSON");
   }
 
   const prRows: Array<Omit<PullRequest, "id">> = prs.map((pr) => ({
@@ -101,6 +102,7 @@ export function syncGithubPRs(
 // These are expected (a repo in the local inventory was renamed or removed on the
 // remote) and must NOT abort or fail a fleet-wide sync — they are skipped, not errored.
 const MISSING_REPO_PATTERNS: RegExp[] = [
+  /GitHub repository is unavailable/i,
   /could not resolve to a repository/i,
   /http 404/i,
   /404: not found/i,
@@ -116,7 +118,7 @@ export function syncAllGithubPRs(
 ): { total_synced: number; repos_seen: number; repos_checked: number; repos_synced: number; truncated: boolean; errors: string[]; skipped: string[] } {
   const { org, limit = 50, state = "all", maxRepos, onProgress } = opts;
 
-  let repos = listRepos({ ...(org ? { org } : {}), limit: 100_000, offset: 0 })
+  let repos = listAllRepos(org ? { org } : {})
     .filter((repo) => repo.remote_url?.startsWith("github.com/"))
     .sort((left, right) => `${left.org ?? ""}/${left.name}`.localeCompare(`${right.org ?? ""}/${right.name}`));
   const repos_seen = repos.length;

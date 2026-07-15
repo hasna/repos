@@ -54,8 +54,40 @@ export function listRepos(opts: ListOptions & { org?: string; query?: string } =
   params.push(limit, offset);
 
   return (db
-    .query(`SELECT * FROM repos ${whereClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+    .query(`SELECT * FROM repos ${whereClause} ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?`)
     .all(...params) as Repo[]).map(sanitizeRepoForOutput);
+}
+
+export function listAllRepos(
+  opts: Omit<ListOptions, "limit" | "offset"> & { org?: string; query?: string } = {},
+  pageSize = 500,
+): Repo[] {
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1) {
+    throw new Error("repository page size must be a positive integer");
+  }
+  const db = getDb();
+  const repos: Repo[] = [];
+  let lastId = 0;
+  while (true) {
+    const params: Array<string | number> = [lastId];
+    const where = ["id > ?"];
+    if (opts.org) {
+      where.push("org = ?");
+      params.push(opts.org);
+    }
+    if (opts.query) {
+      where.push("(name LIKE ? OR description LIKE ? OR remote_url LIKE ?)");
+      const query = `%${opts.query}%`;
+      params.push(query, query, query);
+    }
+    params.push(pageSize);
+    const page = (db
+      .query(`SELECT * FROM repos WHERE ${where.join(" AND ")} ORDER BY id ASC LIMIT ?`)
+      .all(...params) as Repo[]).map(sanitizeRepoForOutput);
+    repos.push(...page);
+    if (page.length < pageSize) return repos;
+    lastId = page[page.length - 1]!.id;
+  }
 }
 
 export function getRepo(idOrPath: string | number): Repo | null {

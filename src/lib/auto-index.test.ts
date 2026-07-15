@@ -4,7 +4,12 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
 import { listRepos } from "../db/repos";
-import { ensureWorkspaceBootstrap, syncRepoCatalog, type ReposRemoteSyncClient } from "./auto-index";
+import {
+  cleanupRemoteIdentities,
+  ensureWorkspaceBootstrap,
+  syncRepoCatalog,
+  type ReposRemoteSyncClient,
+} from "./auto-index";
 import { HOOK_MARKER_START } from "./repo-hooks";
 
 const TEST_DIR = join(import.meta.dir, "../../.test-auto-index");
@@ -116,6 +121,84 @@ class FakeRemoteSyncClient implements ReposRemoteSyncClient {
       };
     }
     throw new Error(`unexpected query: ${normalized}`);
+  }
+}
+
+class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
+  readonly queries: string[] = [];
+  readonly audits = new Map<string, Record<string, unknown>>();
+  readonly repos = new Map<number, Record<string, unknown>>();
+  readonly remotes = new Map<number, Record<string, unknown>>();
+  searchVectorsValid = false;
+
+  async query(sql: string, params: unknown[] = []) {
+    const normalized = sql.replace(/\s+/g, " ").trim();
+    this.queries.push(normalized);
+    if (
+      normalized === "BEGIN"
+      || normalized === "COMMIT"
+      || normalized === "ROLLBACK"
+      || normalized.startsWith("CREATE TABLE IF NOT EXISTS repos_remote_identity_cleanup_audit")
+      || normalized.startsWith("CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_remote_identity_cleanup_idempotency")
+    ) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (normalized.startsWith("SELECT version, mode, actor, plan_hash, counts_json FROM repos_remote_identity_cleanup_audit")) {
+      const row = this.audits.get(String(params[0]));
+      return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+    }
+    if (normalized.startsWith("SELECT table_name, column_name FROM information_schema.columns")) {
+      return {
+        rows: [
+          ...["id", "name", "org", "description", "remote_url", "search_vector"].map((column_name) => ({ table_name: "repos", column_name })),
+          ...["id", "url", "fetch_url"].map((column_name) => ({ table_name: "remotes", column_name })),
+        ],
+        rowCount: 9,
+      };
+    }
+    if (normalized.startsWith("SELECT id, remote_url FROM repos ORDER BY id")) {
+      return { rows: [...this.repos.values()].sort((a, b) => Number(a.id) - Number(b.id)), rowCount: this.repos.size };
+    }
+    if (normalized.startsWith("SELECT id, url, fetch_url FROM remotes ORDER BY id")) {
+      return { rows: [...this.remotes.values()].sort((a, b) => Number(a.id) - Number(b.id)), rowCount: this.remotes.size };
+    }
+    if (normalized.startsWith("UPDATE repos SET remote_url = $1 WHERE id = $2")) {
+      const id = Number(params[1]);
+      const row = this.repos.get(id);
+      const changed = Boolean(row && row.remote_url === params[2]);
+      if (changed) this.repos.set(id, { ...row, remote_url: params[0] });
+      return { rows: [], rowCount: changed ? 1 : 0 };
+    }
+    if (normalized.startsWith("UPDATE remotes SET url = $1, fetch_url = $2 WHERE id = $3")) {
+      const id = Number(params[2]);
+      const row = this.remotes.get(id);
+      const changed = Boolean(row && row.url === params[3] && row.fetch_url === params[4]);
+      if (changed) this.remotes.set(id, { ...row, url: params[0], fetch_url: params[1] });
+      return { rows: [], rowCount: changed ? 1 : 0 };
+    }
+    if (normalized.startsWith("DELETE FROM remotes WHERE id = $1")) {
+      const changed = this.remotes.delete(Number(params[0]));
+      return { rows: [], rowCount: changed ? 1 : 0 };
+    }
+    if (normalized.startsWith("UPDATE repos SET search_vector = to_tsvector")) {
+      const changed = this.searchVectorsValid ? 0 : this.repos.size;
+      this.searchVectorsValid = true;
+      return { rows: [], rowCount: changed };
+    }
+    if (normalized.startsWith("SELECT COUNT(*)::int AS count FROM repos WHERE search_vector IS DISTINCT FROM")) {
+      return { rows: [{ count: this.searchVectorsValid ? 0 : this.repos.size }], rowCount: 1 };
+    }
+    if (normalized.startsWith("INSERT INTO repos_remote_identity_cleanup_audit")) {
+      this.audits.set(String(params[0]), {
+        version: params[1],
+        mode: params[2],
+        actor: params[3],
+        plan_hash: params[4],
+        counts_json: params[5],
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    throw new Error(`unexpected cleanup query: ${normalized}`);
   }
 }
 
@@ -256,7 +339,7 @@ describe("auto-index", () => {
     });
   });
 
-  it("sanitizes existing app-owned remote rows before sync reads them", async () => {
+  it("sanitizes app-owned remote rows on read without mutating the remote store", async () => {
     process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
     closeDb();
     getDb();
@@ -283,8 +366,104 @@ describe("auto-index", () => {
     const result = await syncRepoCatalog("pull", undefined, { remoteClient: remote });
 
     expect(result.errors).toEqual([]);
-    expect(remote.repos.get(repoPath)?.remote_url).toBe("git.example.test/team/tool");
-    expect(JSON.stringify(remote.repos.get(repoPath))).not.toContain("phrase");
+    expect(remote.repos.get(repoPath)?.remote_url).toBe(unsafe);
+    expect(listRepos({ query: "remote-cleanup" })[0]?.remote_url).toBe("git.example.test/team/tool");
+  });
+
+  it("does not run remote identity cleanup during ordinary synchronization", async () => {
+    process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
+    closeDb();
+    getDb();
+    const remote = new FakeRemoteSyncClient();
+    const result = await syncRepoCatalog("pull", undefined, {
+      remoteClient: remote,
+      databaseUrl: "postgres://repos@example.invalid/repos",
+    });
+    expect(result.errors).toEqual([]);
+    expect(remote.repos.size).toBe(0);
+  });
+
+  it("plans and applies a versioned audited PostgreSQL remote cleanup idempotently", async () => {
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?token=marker`;
+    const remote = new FakeRemoteCleanupClient();
+    remote.repos.set(1, { id: 1, remote_url: unsafe });
+    remote.remotes.set(1, { id: 1, url: unsafe, fetch_url: unsafe });
+    remote.remotes.set(2, { id: 2, url: "file:///tmp/tool", fetch_url: null });
+
+    const dryRun = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "dry-run-1",
+      remoteClient: remote,
+    });
+    expect(dryRun).toMatchObject({
+      schema: "open-repos.remote-identity-cleanup.v1",
+      version: 1,
+      applied: false,
+      replayed: false,
+      counts: { repos_update: 1, remotes_update: 1, remotes_delete: 1 },
+    });
+    expect(remote.repos.get(1)?.remote_url).toBe(unsafe);
+    expect(remote.remotes.size).toBe(2);
+
+    remote.repos.get(1)!.remote_url = "https://other:credential@git.example.test/team/tool?changed=1";
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "apply-stale",
+      expectedPlanHash: dryRun.plan_hash,
+      apply: true,
+      remoteClient: remote,
+    })).rejects.toThrow("remote identity cleanup plan mismatch");
+    remote.repos.get(1)!.remote_url = unsafe;
+
+    const applied = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "apply-1",
+      expectedPlanHash: dryRun.plan_hash,
+      apply: true,
+      remoteClient: remote,
+    });
+    expect(applied.applied).toBe(true);
+    expect(remote.repos.get(1)?.remote_url).toBe("git.example.test/team/tool");
+    expect(remote.remotes.get(1)).toMatchObject({
+      url: "git.example.test/team/tool",
+      fetch_url: "git.example.test/team/tool",
+    });
+    expect(remote.remotes.has(2)).toBe(false);
+    expect(remote.searchVectorsValid).toBe(true);
+
+    const replay = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "apply-1",
+      expectedPlanHash: dryRun.plan_hash,
+      apply: true,
+      remoteClient: remote,
+    });
+    expect(replay).toEqual({ ...applied, replayed: true });
+    expect(remote.audits.size).toBe(2);
+  });
+
+  it("returns generic synchronization and cleanup errors without raw remote material", async () => {
+    process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
+    closeDb();
+    getDb();
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const failing: ReposRemoteSyncClient = {
+      async query() {
+        throw new Error(`remote failure for ${unsafe}`);
+      },
+    };
+    const sync = await syncRepoCatalog("pull", undefined, {
+      remoteClient: failing,
+      databaseUrl: "postgres://actor:phrase@example.invalid/repos",
+    });
+    expect(sync.errors).toEqual(["remote repository catalog synchronization failed"]);
+    expect(JSON.stringify(sync)).not.toContain("phrase");
+
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "cleanup-failure",
+      remoteClient: failing,
+    })).rejects.toThrow("remote identity cleanup failed");
   });
 
   it("stays local for legacy shared RDS envs without repo-owned database config", async () => {

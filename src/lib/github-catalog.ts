@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { listRepos } from "../db/repos.js";
+import { listAllRepos } from "../db/repos.js";
 import type { Repo } from "../types/index.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
@@ -214,7 +214,10 @@ export function loadGithubRepoCatalog(cachePath = getDefaultGithubCatalogCachePa
     const parsed = JSON.parse(readFileSync(cachePath, "utf-8")) as GithubRepoCatalogCache;
     if (parsed.schemaVersion !== GITHUB_REPO_CATALOG_SCHEMA_VERSION) return null;
     if (!Array.isArray(parsed.repositories)) return null;
-    return parsed;
+    return {
+      ...parsed,
+      repositories: parsed.repositories.map(sanitizeCatalogRecord),
+    };
   } catch {
     return null;
   }
@@ -857,7 +860,7 @@ function emptyCache(now: Date, staleMs: number): GithubRepoCatalogCache {
 
 function safeListLocalRepos(): Repo[] {
   try {
-    return listRepos({ limit: 100_000, offset: 0 });
+    return listAllRepos();
   } catch {
     return [];
   }
@@ -888,19 +891,31 @@ function countGitStatus(lines: string[]): { staged: number; modified: number; un
 
 function sanitizeCloneUrl(value: string | null): string | null {
   if (!value) return null;
+  const identity = sanitizeRemoteIdentity(value);
+  if (!identity) return null;
   try {
     const url = new URL(value);
-    if (url.username || url.password) {
-      url.username = "";
-      url.password = "";
-    }
-    return url.toString();
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
   } catch {
-    if (/github\.com[:/][^/\s]+\/[^/\s]+/i.test(value) && !/[A-Za-z0-9_]{20,}@/.test(value)) {
-      return value;
-    }
-    return null;
+    return value.includes(":") && !value.includes("://")
+      ? `ssh://${identity}.git`
+      : identity;
   }
+}
+
+function sanitizeCatalogRecord(record: GithubRepoCatalogRecord): GithubRepoCatalogRecord {
+  return {
+    ...record,
+    html_url: sanitizeCloneUrl(record.html_url),
+    clone_urls: {
+      https: sanitizeCloneUrl(record.clone_urls?.https ?? null),
+      ssh: sanitizeCloneUrl(record.clone_urls?.ssh ?? null),
+    },
+  };
 }
 
 function normalizeFullNameParts(owner: string | undefined, repo: string | undefined): string | null {

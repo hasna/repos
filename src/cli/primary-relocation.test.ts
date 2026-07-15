@@ -113,6 +113,23 @@ afterEach(() => {
 });
 
 describe("registry relocate-primary CLI", () => {
+  it("exposes explicit audited remote cleanup dry-run/apply controls", () => {
+    const result = Bun.spawnSync({
+      cmd: ["bun", "run", "src/cli/index.tsx", "registry", "--help"],
+      cwd: join(import.meta.dir, "../.."),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        HASNA_REPOS_DB_PATH: dbPath,
+        HASNA_REPOS_AUTO_BOOTSTRAP: "0",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = new TextDecoder().decode(result.stdout);
+    expect(result.exitCode).toBe(0);
+    expect(stdout).toContain("cleanup-remote-identities");
+  });
   it("is a dry run by default and performs no registry write", () => {
     const result = runCli([]);
     expect(result.exitCode).toBe(0);

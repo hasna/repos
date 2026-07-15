@@ -106,23 +106,22 @@ export function sanitizeRemoteOutput(value: unknown): unknown {
   if (prototype !== Object.prototype && prototype !== null) return value;
   const input = value as Record<string, unknown>;
   const output = Object.fromEntries(
-    Object.entries(input).map(([key, entry]) => [key, sanitizeRemoteOutput(entry)]),
+    Object.entries(input)
+      .filter(([key]) => key !== "toJSON")
+      .map(([key, entry]) => [key, sanitizeRemoteOutput(entry)]),
   );
   if (Object.prototype.hasOwnProperty.call(input, "remote_url")) {
     output["remote_url"] = sanitizeRemoteIdentity(input["remote_url"]);
   }
-  if (Object.prototype.hasOwnProperty.call(input, "fetch_url")) {
-    output["fetch_url"] = sanitizeRemoteIdentity(input["fetch_url"]);
-  }
-  if (
-    Object.prototype.hasOwnProperty.call(input, "url")
-    && Object.prototype.hasOwnProperty.call(input, "fetch_url")
-    && (
-      Object.prototype.hasOwnProperty.call(input, "repo_id")
-      || Object.prototype.hasOwnProperty.call(input, "name")
-    )
-  ) {
+  const isRemoteRecord =
+    Object.prototype.hasOwnProperty.call(input, "repo_id")
+    && Object.prototype.hasOwnProperty.call(input, "name")
+    && Object.prototype.hasOwnProperty.call(input, "url");
+  if (isRemoteRecord) {
     output["url"] = sanitizeRemoteIdentity(input["url"]);
+    if (Object.prototype.hasOwnProperty.call(input, "fetch_url")) {
+      output["fetch_url"] = sanitizeRemoteIdentity(input["fetch_url"]);
+    }
   }
   return output;
 }

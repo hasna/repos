@@ -44,6 +44,7 @@ export function getDbPath(): string {
 
 let _db: Database | null = null;
 let _dbPath: string | null = null;
+let _dbMigrated = false;
 const WAL_NEGOTIATION_TIMEOUT_MS = 5_000;
 const WAL_NEGOTIATION_WAIT_MS = 10;
 const walNegotiationWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
@@ -85,15 +86,42 @@ function normalizeDbPath(path: string): string {
   return resolve(path);
 }
 
+function getExplicitNonDefaultDbPath(customPath?: string): string {
+  const configured = customPath
+    ?? process.env["HASNA_REPOS_DB_PATH"]
+    ?? process.env["REPOS_DB_PATH"];
+  if (!configured) {
+    throw new Error("migrate:false requires an explicit non-default Repos database path");
+  }
+  const path = normalizeDbPath(configured);
+  if (path === ":memory:" || path.startsWith("file::memory:")) return path;
+
+  const home = process.env["HOME"] || process.env["USERPROFILE"] || "~";
+  const defaults = [
+    normalizeDbPath(join(home, ".hasna", "repos", "repos.db")),
+    normalizeDbPath(join(home, ".git-local", "repos.db")),
+  ];
+  if (defaults.includes(path)) {
+    throw new Error("migrate:false requires an explicit non-default Repos database path");
+  }
+  return path;
+}
+
 export function getDb(customPath?: string, options: DatabaseOpenOptions = {}): Database {
   if (_db) {
     if (customPath !== undefined && normalizeDbPath(customPath) !== _dbPath) {
       throw new Error("cannot switch Repos database paths while a database is open; call closeDb() first");
     }
+    if (options.migrate !== false && !_dbMigrated) {
+      runMigrations(_db);
+      _dbMigrated = true;
+    }
     return _db;
   }
 
-  const path = normalizeDbPath(customPath ?? getDbPath());
+  const path = options.migrate === false
+    ? getExplicitNonDefaultDbPath(customPath)
+    : normalizeDbPath(customPath ?? getDbPath());
 
   if (path !== ":memory:" && !path.startsWith("file::memory:")) {
     const dir = dirname(path);
@@ -112,9 +140,13 @@ export function getDb(customPath?: string, options: DatabaseOpenOptions = {}): D
     db.exec("PRAGMA synchronous = NORMAL");
     db.exec("PRAGMA foreign_keys = ON");
 
-    if (options.migrate !== false) runMigrations(db);
+    if (options.migrate !== false) {
+      runMigrations(db);
+      _dbMigrated = true;
+    }
   } catch (error) {
     db.close();
+    _dbMigrated = false;
     throw error;
   }
 
@@ -133,6 +165,7 @@ export function closeDb(): void {
     _db.close();
     _db = null;
     _dbPath = null;
+    _dbMigrated = false;
   }
 }
 
@@ -526,56 +559,58 @@ const MIGRATIONS: Migration[] = [
         (db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name),
       );
       const repoColumns = tableColumns("repos");
-      if (repoColumns.has("id") && repoColumns.has("remote_url")) {
-        const rows = db.query("SELECT id, remote_url FROM repos").all() as Array<{
-          id: number;
-          remote_url: string | null;
-        }>;
-        const update = db.query("UPDATE repos SET remote_url = ? WHERE id = ?");
-        for (const row of rows) update.run(sanitizeRemoteIdentity(row.remote_url), row.id);
-      }
-
       const remoteColumns = tableColumns("remotes");
-      if (remoteColumns.has("id") && remoteColumns.has("url") && remoteColumns.has("fetch_url")) {
-        const rows = db.query("SELECT id, url, fetch_url FROM remotes").all() as Array<{
-          id: number;
-          url: string;
-          fetch_url: string | null;
-        }>;
-        const update = db.query("UPDATE remotes SET url = ?, fetch_url = ? WHERE id = ?");
-        const remove = db.query("DELETE FROM remotes WHERE id = ?");
-        for (const row of rows) {
-          const url = sanitizeRemoteIdentity(row.url);
-          if (!url) {
-            remove.run(row.id);
-            continue;
-          }
-          update.run(url, sanitizeRemoteIdentity(row.fetch_url), row.id);
-        }
+      const auditColumns = tableColumns("repo_relocation_audit");
+      const required = [
+        [repoColumns, ["id", "remote_url"]],
+        [remoteColumns, ["id", "url", "fetch_url"]],
+        [auditColumns, ["id", "expected_remote", "source_json", "target_json", "after_json"]],
+      ] as const;
+      if (required.some(([columns, names]) => names.some((name) => !columns.has(name)))) {
+        throw new Error("v9 requires the exact remote-bearing schema");
       }
 
-      const auditColumns = tableColumns("repo_relocation_audit");
-      const auditFields = ["id", "expected_remote", "source_json", "target_json", "after_json"];
-      if (auditFields.every((field) => auditColumns.has(field))) {
-        const rows = db.query(`SELECT id, expected_remote, source_json, target_json, after_json
-          FROM repo_relocation_audit`).all() as Array<{
-          id: string;
-          expected_remote: string;
-          source_json: string;
-          target_json: string;
-          after_json: string;
-        }>;
-        const update = db.query(`UPDATE repo_relocation_audit SET
-          expected_remote = ?, source_json = ?, target_json = ?, after_json = ? WHERE id = ?`);
-        for (const row of rows) {
-          update.run(
-            sanitizeRemoteIdentity(row.expected_remote) ?? "",
-            sanitizeRelocationSnapshot(row.source_json),
-            sanitizeRelocationSnapshot(row.target_json),
-            sanitizeRelocationSnapshot(row.after_json),
-            row.id,
-          );
+      const repoRows = db.query("SELECT id, remote_url FROM repos").all() as Array<{
+        id: number;
+        remote_url: string | null;
+      }>;
+      const updateRepo = db.query("UPDATE repos SET remote_url = ? WHERE id = ?");
+      for (const row of repoRows) updateRepo.run(sanitizeRemoteIdentity(row.remote_url), row.id);
+
+      const remoteRows = db.query("SELECT id, url, fetch_url FROM remotes").all() as Array<{
+        id: number;
+        url: string;
+        fetch_url: string | null;
+      }>;
+      const updateRemote = db.query("UPDATE remotes SET url = ?, fetch_url = ? WHERE id = ?");
+      const removeRemote = db.query("DELETE FROM remotes WHERE id = ?");
+      for (const row of remoteRows) {
+        const url = sanitizeRemoteIdentity(row.url);
+        if (!url) {
+          removeRemote.run(row.id);
+          continue;
         }
+        updateRemote.run(url, sanitizeRemoteIdentity(row.fetch_url), row.id);
+      }
+
+      const auditRows = db.query(`SELECT id, expected_remote, source_json, target_json, after_json
+        FROM repo_relocation_audit`).all() as Array<{
+        id: string;
+        expected_remote: string;
+        source_json: string;
+        target_json: string;
+        after_json: string;
+      }>;
+      const updateAudit = db.query(`UPDATE repo_relocation_audit SET
+        expected_remote = ?, source_json = ?, target_json = ?, after_json = ? WHERE id = ?`);
+      for (const row of auditRows) {
+        updateAudit.run(
+          sanitizeRemoteIdentity(row.expected_remote) ?? "",
+          sanitizeRelocationSnapshot(row.source_json),
+          sanitizeRelocationSnapshot(row.target_json),
+          sanitizeRelocationSnapshot(row.after_json),
+          row.id,
+        );
       }
 
       if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'fts_repos'").get()) {

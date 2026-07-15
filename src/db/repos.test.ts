@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterAll } from "bun:test";
 import { getDb, closeDb } from "./database";
 import {
   listRepos,
+  listAllRepos,
   getRepo,
   upsertRepo,
   deleteRepo,
@@ -108,6 +109,17 @@ describe("repos", () => {
     }
     expect(listRepos({ limit: 2 }).length).toBe(2);
     expect(listRepos({ limit: 2, offset: 3 }).length).toBe(2);
+  });
+
+  it("enumerates every repository deterministically across small pages", () => {
+    for (let i = 0; i < 7; i++) {
+      upsertRepo({ path: `/tmp/all-${i}`, name: `all-${i}` });
+    }
+    const first = listAllRepos({}, 2);
+    const second = listAllRepos({}, 3);
+    expect(first.map((repo) => repo.id)).toEqual(second.map((repo) => repo.id));
+    expect(first).toHaveLength(7);
+    expect(new Set(first.map((repo) => repo.id)).size).toBe(7);
   });
 
   it("should search repos via FTS5", () => {

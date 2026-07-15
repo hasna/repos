@@ -60,17 +60,44 @@ describe("sanitizeRemoteOutput", () => {
     const output = sanitizeRemoteOutput({
       created_at: createdAt,
       pull_request: { url: "https://github.com/team/tool/pull/1" },
-      remote: { name: "origin", url: unsafe, fetch_url: unsafe },
+      remote: { repo_id: 1, name: "origin", url: unsafe, fetch_url: unsafe },
     });
     expect(output).toEqual({
       created_at: createdAt,
       pull_request: { url: "https://github.com/team/tool/pull/1" },
       remote: {
+        repo_id: 1,
         name: "origin",
         url: "git.example.test/team/tool",
         fetch_url: "git.example.test/team/tool",
       },
     });
     expect(JSON.stringify(output)).not.toContain("phrase");
+  });
+
+  it("does not rewrite ordinary URL objects and neutralizes hostile own toJSON methods", () => {
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const bytes = Buffer.from([1, 2, 3]);
+    const ordinary = { name: "link", url: unsafe, fetch_url: unsafe };
+    const hostile = {
+      repo_id: 1,
+      name: "origin",
+      url: unsafe,
+      fetch_url: unsafe,
+      toJSON() {
+        return { url: unsafe, fetch_url: unsafe };
+      },
+    };
+    const output = sanitizeRemoteOutput({ ordinary, bytes, hostile }) as Record<string, unknown>;
+
+    expect(output["ordinary"]).toEqual(ordinary);
+    expect(output["bytes"]).toBe(bytes);
+    expect(output["hostile"]).toEqual({
+      repo_id: 1,
+      name: "origin",
+      url: "git.example.test/team/tool",
+      fetch_url: "git.example.test/team/tool",
+    });
+    expect(JSON.stringify(output["hostile"])).not.toContain("phrase");
   });
 });
