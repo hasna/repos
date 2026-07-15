@@ -186,11 +186,44 @@ describe("primary relocation v2 reconciliation", () => {
     for (const table of ["commits", "branches", "tags", "remotes", "pull_requests"]) {
       expect(getDb().query(`SELECT count(*) AS count FROM ${table} WHERE repo_id = ?`).get(pair.targetId)).toEqual({ count: 0 });
     }
+    expect(getDb().query("SELECT url, fetch_url FROM remotes WHERE name = 'upstream'").get()).toEqual({
+      url: "github.com/hasna/upstream",
+      fetch_url: null,
+    });
     expect(getDb().query("PRAGMA foreign_key_check").all()).toEqual([]);
     const audit = getDb().query("SELECT * FROM repo_relocation_audit").get() as Record<string, unknown>;
     expect(audit.plan_hash).toBe(dry.plan.plan_hash);
     expect(JSON.stringify(audit)).not.toContain("legacy-token");
     expect(JSON.stringify(audit)).not.toContain("credential@");
+  });
+
+  it("persists only the normalized remote identity when registry and checkout inputs contain credentials", () => {
+    const pair = seedPair("remote-persistence");
+    const unsafe = `https://${["member", "phrase"].join(":")}@github.com/hasna/${pair.name}.git?query=marker`;
+    getDb().query("UPDATE repos SET remote_url = ? WHERE id IN (?, ?)").run(unsafe, pair.legacyId, pair.targetId);
+    git(pair.path, "remote", "set-url", "origin", unsafe);
+
+    const { applied } = applyReviewed(pair);
+    expect(getDb().query("SELECT remote_url FROM repos WHERE id = ?").get(pair.legacyId)).toEqual({
+      remote_url: `github.com/hasna/${pair.name}`,
+    });
+    expect(JSON.stringify(applied)).not.toContain(unsafe);
+    expect(JSON.stringify(applied)).not.toContain("phrase");
+  });
+
+  it("blocks rejected child remote identities without exposing or persisting their input", () => {
+    const pair = seedPair("invalid-child-remote");
+    const unsafe = "file:///tmp/private-repo";
+    getDb().query("INSERT INTO remotes (repo_id, name, url) VALUES (?, 'local', ?)").run(pair.targetId, unsafe);
+
+    const dry = relocatePrimaryRepo(requestFor(pair));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "remotes", decision: "block" }));
+    expect(JSON.stringify(dry)).not.toContain(unsafe);
+    expect(() => relocatePrimaryRepo({ ...requestFor(pair), apply: true, expectedPlanHash: dry.plan.plan_hash }))
+      .toThrow(PrimaryRelocationError);
+    expect(getDb().query("SELECT url FROM remotes WHERE repo_id = ? AND name = 'local'").get(pair.targetId))
+      .toEqual({ url: unsafe });
   });
 
   it("absorbs canonical target operational metadata while preserving the legacy ID and earliest creation time", () => {
@@ -220,7 +253,7 @@ describe("primary relocation v2 reconciliation", () => {
       path: pair.path,
       name: "accounts",
       org: "hasna",
-      remote_url: "git@github.com:hasna/accounts.git",
+      remote_url: "github.com/hasna/accounts",
       default_branch: "main",
       description: "canonical description",
       last_scanned: "2026-07-15T00:00:00Z",

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 type InventoryStatus = "verify-clean" | "needs-remediation";
 type InventoryRouting = "canonical" | "duplicate" | "unkeyed";
@@ -195,29 +196,9 @@ function isPolicyExcludedDir(path: string): boolean {
 }
 
 function remoteRepoKey(remote: string | null): string | null {
-  if (!remote) return null;
-  const trimmed = remote.trim();
-  const scpLike = trimmed.match(/^git@github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?$/i);
-  if (scpLike?.[1] && scpLike[2] && isSafeRepoSegment(scpLike[1]) && isSafeRepoSegment(scpLike[2].replace(/\.git$/, ""))) {
-    return `${scpLike[1].toLowerCase()}/${scpLike[2].toLowerCase().replace(/\.git$/, "")}`;
-  }
-
-  try {
-    const url = new URL(trimmed);
-    if (url.hostname.toLowerCase() !== "github.com") return null;
-    const parts = url.pathname.replace(/^\/+/, "").split("/");
-    const owner = parts[0];
-    const repo = parts[1];
-    const repoName = repo?.replace(/\.git$/, "");
-    if (!owner || !repoName || parts.length !== 2 || !isSafeRepoSegment(owner) || !isSafeRepoSegment(repoName)) return null;
-    return `${owner.toLowerCase()}/${repoName.toLowerCase()}`;
-  } catch {
-    return null;
-  }
-}
-
-function isSafeRepoSegment(value: string): boolean {
-  return /^[A-Za-z0-9_.-]+$/.test(value);
+  const identity = sanitizeRemoteIdentity(remote);
+  if (!identity?.startsWith("github.com/")) return null;
+  return identity.slice("github.com/".length).toLowerCase();
 }
 
 function parseAheadBehind(raw: string | null): { ahead: number | null; behind: number | null } {
@@ -375,7 +356,7 @@ function repoFinding(root: string, base: string, nestedParentPath: string | null
     behind: drift.behind,
     head: runGit(root, ["rev-parse", "--short", "HEAD"]),
     dirty,
-    remote: remote ? redactText(remote) : null,
+    remote: sanitizeRemoteIdentity(remote),
     files: files.length,
     package: counts.package,
     lock: counts.lock,

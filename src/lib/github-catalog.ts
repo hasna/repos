@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { listRepos } from "../db/repos.js";
 import type { Repo } from "../types/index.js";
+import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 export const GITHUB_REPO_CATALOG_SCHEMA_VERSION = "open-repos.github-catalog.v1" as const;
 
@@ -430,23 +431,10 @@ export function applyGithubCatalogFilter(
 }
 
 export function extractGithubFullNameFromRemote(remoteUrl: string | null): string | null {
-  if (!remoteUrl) return null;
-  const trimmed = remoteUrl.trim();
-  if (!trimmed) return null;
-
-  const scp = trimmed.match(/^(?:[^@]+@)?github\.com:([^/\s]+)\/(.+?)(?:\.git)?$/i);
-  if (scp) return normalizeFullNameParts(scp[1], scp[2]);
-
-  try {
-    const url = new URL(trimmed);
-    if (url.hostname.toLowerCase() !== "github.com") return null;
-    const parts = url.pathname.replace(/^\/+/, "").split("/");
-    return normalizeFullNameParts(parts[0], parts[1]);
-  } catch {
-    const generic = trimmed.match(/github\.com[:/]([^/\s]+)\/(.+?)(?:\.git)?(?:[?#].*)?$/i);
-    if (!generic) return null;
-    return normalizeFullNameParts(generic[1], generic[2]);
-  }
+  const identity = sanitizeRemoteIdentity(remoteUrl);
+  if (!identity?.startsWith("github.com/")) return null;
+  const [, owner, repo] = identity.split("/");
+  return normalizeFullNameParts(owner, repo);
 }
 
 function ghApiJson(endpoint: string): unknown {

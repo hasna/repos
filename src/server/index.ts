@@ -19,6 +19,7 @@ import { ensureWorkspaceBootstrap, startAutoIndexWorker } from "../lib/auto-inde
 import { getHealthReport } from "../lib/utils.js";
 import { handleMcpHttpRoutes } from "../mcp/http.js";
 import { getCliVersion } from "../cli/version.js";
+import { apiJsonResponse } from "./output.js";
 
 const VERSION = getCliVersion();
 
@@ -61,15 +62,7 @@ function broadcast(event: string, data?: unknown) {
 }
 
 function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    },
-  });
+  return apiJsonResponse(data, status);
 }
 
 function parseQuery(url: URL): Record<string, string> {

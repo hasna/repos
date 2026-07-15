@@ -117,6 +117,25 @@ describe("repos", () => {
     expect(results.length).toBe(1);
     expect(results[0]!.name).toBe("open-todos");
   });
+
+  it("sanitizes contaminated direct rows at list, get, FTS search, and unified search outputs", () => {
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker#fragment`;
+    db.query("INSERT INTO repos (path, name, remote_url) VALUES ('/tmp/unsafe', 'unsafeoutput', ?)").run(unsafe);
+
+    expect(listRepos({ query: "unsafeoutput" })[0]!.remote_url).toBe("git.example.test/team/tool");
+    expect(getRepo("unsafeoutput")!.remote_url).toBe("git.example.test/team/tool");
+    expect(searchRepos("unsafeoutput")[0]!.remote_url).toBe("git.example.test/team/tool");
+    expect(searchAll("unsafeoutput")[0]!.snippet).toBe("git.example.test/team/tool");
+    expect(JSON.stringify({ list: listRepos(), repo: getRepo("unsafeoutput"), search: searchAll("unsafeoutput") }))
+      .not.toContain(unsafe);
+  });
+
+  it("clears rejected repository remotes instead of preserving contaminated values", () => {
+    const repo = upsertRepo({ path: "/tmp/rejected", name: "rejected", remote_url: "github.com/team/tool" });
+    const updated = upsertRepo({ path: repo.path, name: repo.name, remote_url: "file:///tmp/tool" });
+    expect(updated.remote_url).toBeNull();
+    expect(db.query("SELECT remote_url FROM repos WHERE id = ?").get(repo.id)).toEqual({ remote_url: null });
+  });
 });
 
 describe("commits", () => {
@@ -212,6 +231,23 @@ describe("remotes", () => {
     ]);
     expect(count).toBe(1);
     expect(listRemotes(repo.id).length).toBe(1);
+  });
+
+  it("sanitizes remote rows and removes rejected required URLs at write and read boundaries", () => {
+    const repo = upsertRepo({ path: "/tmp/remote-boundary", name: "remote-boundary" });
+    const unsafe = `ssh://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    db.query("INSERT INTO remotes (repo_id, name, url, fetch_url) VALUES (?, 'origin', ?, ?)")
+      .run(repo.id, unsafe, unsafe);
+    db.query("INSERT INTO remotes (repo_id, name, url) VALUES (?, 'local', 'file:///tmp/tool')").run(repo.id);
+
+    expect(listRemotes(repo.id)).toEqual([expect.objectContaining({
+      name: "origin",
+      url: "git.example.test/team/tool",
+      fetch_url: "git.example.test/team/tool",
+    })]);
+
+    expect(bulkInsertRemotes([{ repo_id: repo.id, name: "origin", url: "/tmp/tool", fetch_url: null }])).toBe(0);
+    expect(listRemotes(repo.id)).toEqual([]);
   });
 });
 

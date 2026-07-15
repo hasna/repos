@@ -17,7 +17,10 @@ import type { Stats } from "node:fs";
 import { userInfo } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getDb } from "./database.js";
+import { sanitizeGitRemoteUrl } from "../lib/remote-identity.js";
 import type { Repo } from "../types/index.js";
+
+export { sanitizeGitRemoteUrl } from "../lib/remote-identity.js";
 
 const SCHEMA = "open-repos.primary-relocation.v2" as const;
 // The receipt payload remains v6. Migration 7 changes only the storage FK so
@@ -248,48 +251,11 @@ function isWithin(root: string, candidate: string): boolean {
   return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
-/** Return only a credential-free host/owner/name identity. */
-export function sanitizeGitRemoteUrl(remote: string): string {
-  const trimmed = remote.trim();
-  if (!trimmed || trimmed.includes("\0") || trimmed.includes("\\") || trimmed.startsWith("/")) return "";
-  let host = "";
-  let pathname = "";
-  try {
-    if (trimmed.includes("://")) {
-      const url = new URL(trimmed);
-      if (!["git:", "http:", "https:", "ssh:"].includes(url.protocol)) return "";
-      host = url.hostname.toLowerCase();
-      pathname = url.pathname;
-    } else {
-      const scp = trimmed.match(/^(?:[^@/:]+@)?([^/:]+):(.+)$/);
-      if (scp) {
-        host = scp[1]!.toLowerCase();
-        pathname = scp[2]!;
-      } else {
-        const parts = trimmed.split("/");
-        host = (parts.shift() || "").toLowerCase();
-        pathname = parts.join("/");
-      }
-    }
-  } catch {
-    return "";
-  }
-  const labels = host.split(".");
-  const segments = pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "").split("/").filter(Boolean);
-  if (
-    host.length > 253
-    || !labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
-    || segments.length !== 2
-    || !segments.every((segment) => segment !== "." && segment !== ".." && /^[A-Za-z0-9._-]+$/.test(segment))
-  ) return "";
-  return `${host}/${segments[0]}/${segments[1]}`;
-}
-
 function sanitizeCheckoutRemoteUrl(remote: string): string {
   const trimmed = remote.trim();
   const isNetworkUrl = trimmed.includes("://");
   const isScpSsh = /^(?:[^@/:]+@)?[^/:]+:.+$/.test(trimmed);
-  return isNetworkUrl || isScpSsh ? sanitizeGitRemoteUrl(trimmed) : "";
+  return isNetworkUrl || isScpSsh ? sanitizeGitRemoteUrl(trimmed) || "" : "";
 }
 
 function canonicalRoot(): string {
@@ -997,11 +963,23 @@ function buildChildPlan(request: ValidatedRequest): {
   const decisions: InternalDecision[] = [];
   const digests: Record<string, string> = {};
   for (const spec of CHILD_TABLES) {
-    const rows = getDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
+    const rawRows = getDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
       request.legacyRepoId,
       request.targetRepoId,
     ) as Array<Record<string, unknown>>;
-    digests[spec.table] = hash(rows);
+    digests[spec.table] = hash(rawRows);
+    const invalidRemoteIds = new Set<number>();
+    const rows: Array<Record<string, unknown>> = spec.table === "remotes"
+      ? rawRows.map((row) => {
+          const url = sanitizeGitRemoteUrl(String(row.url ?? ""));
+          if (!url) invalidRemoteIds.add(Number(row.id));
+          return {
+            ...row,
+            url: url || null,
+            fetch_url: sanitizeGitRemoteUrl(String(row.fetch_url ?? "")) || null,
+          } as Record<string, unknown>;
+        })
+      : rawRows;
     const legacyRows = rows.filter((row) => row.repo_id === request.legacyRepoId);
     const targetRows = rows.filter((row) => row.repo_id === request.targetRepoId);
     const legacyByKey = new Map(legacyRows.map((row) => [stable(keyFor(row, spec.key)), row]));
@@ -1012,9 +990,25 @@ function buildChildPlan(request: ValidatedRequest): {
       dedupe: 0,
       block: 0,
     };
+    for (const row of rows.filter((candidate) => invalidRemoteIds.has(Number(candidate.id)))) {
+      const logicalKey = keyFor(row, spec.key);
+      const payload = rowWithout(row, ["id", "repo_id"]);
+      const blocked: CollisionDecision = {
+        table: spec.table,
+        key_hash: hash(logicalKey),
+        source_hash: row.repo_id === request.legacyRepoId ? hash(payload) : null,
+        target_hash: hash(payload),
+        decision: "block",
+      };
+      tableCounts.block++;
+      collisions.push(blocked);
+      decisions.push({ ...blocked, row_id: Number(row.id) });
+    }
     for (const target of targetRows) {
+      if (invalidRemoteIds.has(Number(target.id))) continue;
       const logicalKey = keyFor(target, spec.key);
       const source = legacyByKey.get(stable(logicalKey));
+      if (source && invalidRemoteIds.has(Number(source.id))) continue;
       const targetPayload = rowWithout(target, ["id", "repo_id"]);
       const sourcePayload = source ? rowWithout(source, ["id", "repo_id"]) : null;
       const decision: CollisionDecision["decision"] = !source
@@ -1034,6 +1028,20 @@ function buildChildPlan(request: ValidatedRequest): {
     counts[spec.table] = tableCounts;
   }
   return { counts, collisions, decisions, digests };
+}
+
+function normalizeRelocationRemotes(request: ValidatedRequest): void {
+  const db = getDb();
+  const rows = db.query("SELECT id, url, fetch_url FROM remotes WHERE repo_id IN (?, ?)").all(
+    request.legacyRepoId,
+    request.targetRepoId,
+  ) as Array<{ id: number; url: string; fetch_url: string | null }>;
+  const update = db.query("UPDATE remotes SET url = ?, fetch_url = ? WHERE id = ?");
+  for (const row of rows) {
+    const url = sanitizeGitRemoteUrl(row.url);
+    if (!url) fail("TRANSACTION_CONFLICT", "remote identity changed after dry-run review");
+    update.run(url, sanitizeGitRemoteUrl(row.fetch_url || "") || null, row.id);
+  }
 }
 
 function buildEdgePlan(request: ValidatedRequest): {
@@ -1232,13 +1240,13 @@ function receiptFromRow(row: Record<string, unknown>): PrimaryRelocationReceipt 
     actor: String(row.actor),
     expected_current_path: String(row.expected_current_path),
     target_path: String(row.target_path),
-    expected_remote: String(row.expected_remote),
+    expected_remote: sanitizeGitRemoteUrl(String(row.expected_remote)),
     expected_head: String(row.expected_head),
     source_revision: String(row.source_revision),
     target_revision: String(row.target_revision),
-    source: JSON.parse(String(row.source_json)),
-    target: JSON.parse(String(row.target_json)),
-    after: JSON.parse(String(row.after_json)),
+    source: safeRepo(JSON.parse(String(row.source_json)) as Repo),
+    target: safeRepo(JSON.parse(String(row.target_json)) as Repo),
+    after: safeRepo(JSON.parse(String(row.after_json)) as Repo),
     counts: JSON.parse(String(row.counts_json)),
     collisions: JSON.parse(String(row.collisions_json)),
     created_at: String(row.created_at),
@@ -1384,6 +1392,7 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
       });
     }
 
+    normalizeRelocationRemotes(validated);
     applyDecisions(validated, currentPlan);
     if (tableExists("worktree_leases")) {
       db.query(`UPDATE worktree_leases SET repo_catalog_id = ?, repo_path = ?
@@ -1420,7 +1429,7 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
       validated.targetPath,
       currentPlan.targetRow.name,
       currentPlan.targetRow.org,
-      currentPlan.targetRow.remote_url,
+      validated.remote,
       currentPlan.targetRow.default_branch,
       currentPlan.targetRow.description,
       currentPlan.targetRow.last_scanned,

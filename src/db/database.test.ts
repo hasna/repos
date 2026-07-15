@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDb, closeDb } from "./database";
+import { listRepos } from "./repos";
 
 describe("database", () => {
   beforeAll(() => {
@@ -21,6 +22,36 @@ describe("database", () => {
     const result = db.query("PRAGMA journal_mode").get() as any;
     // In-memory DBs use "memory" journal mode; file-backed DBs use "wal"
     expect(["wal", "memory"]).toContain(result.journal_mode);
+  });
+
+  it("keeps parameterless SDK reads inside the active explicit database context", () => {
+    closeDb();
+    const previousPrimary = process.env["HASNA_REPOS_DB_PATH"];
+    const previousFallback = process.env["REPOS_DB_PATH"];
+    const previousRequirement = process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+    delete process.env["HASNA_REPOS_DB_PATH"];
+    delete process.env["REPOS_DB_PATH"];
+    process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] = "1";
+
+    try {
+      const isolated = getDb(":memory:");
+      isolated.query("INSERT INTO repos (path, name) VALUES ('/tmp/sdk-review', 'sdk-review')").run();
+
+      expect(listRepos({ query: "sdk-review" })).toHaveLength(1);
+      expect(getDb()).toBe(isolated);
+      expect(() => getDb(join(tmpdir(), "different-repos.db"))).toThrow(
+        "cannot switch Repos database paths while a database is open",
+      );
+    } finally {
+      closeDb();
+      if (previousPrimary === undefined) delete process.env["HASNA_REPOS_DB_PATH"];
+      else process.env["HASNA_REPOS_DB_PATH"] = previousPrimary;
+      if (previousFallback === undefined) delete process.env["REPOS_DB_PATH"];
+      else process.env["REPOS_DB_PATH"] = previousFallback;
+      if (previousRequirement === undefined) delete process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+      else process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] = previousRequirement;
+      getDb(":memory:");
+    }
   });
 
   it("should create repos table", () => {
@@ -91,7 +122,7 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9]);
   });
 
   it("upgrades the live migration-5 worktree schema without skipping relocation audit", () => {
@@ -138,7 +169,7 @@ describe("database", () => {
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       closeDb();
@@ -224,6 +255,159 @@ describe("database", () => {
     }
   });
 
+  it("atomically sanitizes repository and remote identities, rebuilds FTS, and reopens idempotently", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v8-remote-sanitize-"));
+    const path = join(dir, "repos.db");
+    const credential = ["member", "phrase"].join(":");
+    const queryMarker = ["access", "marker"].join("");
+    const unsafe = `https://${credential}@Code.Example.test:8443/team/tool.git?key=${queryMarker}#fragment`;
+    try {
+      const initial = getDb(path);
+      initial.query("DELETE FROM migrations WHERE version = 8").run();
+      const repo = initial.query("INSERT INTO repos (path, name, remote_url) VALUES (?, ?, ?) RETURNING id")
+        .get(join(dir, "repo"), "repo", unsafe) as { id: number };
+      initial.query("INSERT INTO remotes (repo_id, name, url, fetch_url) VALUES (?, 'origin', ?, ?)")
+        .run(repo.id, unsafe, "file:///local/fetch");
+      initial.query("INSERT INTO remotes (repo_id, name, url) VALUES (?, 'local', 'file:///local/repo')").run(repo.id);
+      closeDb();
+
+      const migrated = getDb(path);
+      expect(migrated.query("SELECT remote_url FROM repos WHERE id = ?").get(repo.id)).toEqual({
+        remote_url: "code.example.test/team/tool",
+      });
+      expect(migrated.query("SELECT name, url, fetch_url FROM remotes WHERE repo_id = ? ORDER BY name").all(repo.id)).toEqual([{
+        name: "origin",
+        url: "code.example.test/team/tool",
+        fetch_url: null,
+      }]);
+      expect(migrated.query("SELECT rowid FROM fts_repos WHERE fts_repos MATCH ?").all(queryMarker)).toEqual([]);
+      expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 8").get()).toEqual({ count: 1 });
+      closeDb();
+
+      const reopened = getDb(path);
+      expect(reopened.query("SELECT remote_url FROM repos WHERE id = ?").get(repo.id)).toEqual({
+        remote_url: "code.example.test/team/tool",
+      });
+      expect(reopened.query("SELECT count(*) AS count FROM migrations WHERE version = 8").get()).toEqual({ count: 1 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back every v8 rewrite and its marker when a synthetic migration step fails", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v8-remote-rollback-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `ssh://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    let repoId = 0;
+    try {
+      const initial = getDb(path);
+      initial.query("DELETE FROM migrations WHERE version = 8").run();
+      repoId = Number((initial.query("INSERT INTO repos (path, name, remote_url) VALUES (?, ?, ?) RETURNING id")
+        .get(join(dir, "repo"), "repo", unsafe) as { id: number }).id);
+      initial.exec(`
+        CREATE TRIGGER synthetic_v8_failure BEFORE UPDATE OF remote_url ON repos
+        WHEN NEW.id = ${repoId}
+        BEGIN SELECT RAISE(ABORT, 'synthetic migration failure'); END;
+      `);
+      closeDb();
+
+      expect(() => getDb(path)).toThrow("synthetic migration failure");
+      closeDb();
+      const afterFailure = new Database(path);
+      expect(afterFailure.query("SELECT remote_url FROM repos WHERE id = ?").get(repoId)).toEqual({ remote_url: unsafe });
+      expect(afterFailure.query("SELECT version FROM migrations WHERE version = 8").get()).toBeNull();
+      afterFailure.exec("DROP TRIGGER synthetic_v8_failure");
+      afterFailure.close();
+
+      const recovered = getDb(path);
+      expect(recovered.query("SELECT remote_url FROM repos WHERE id = ?").get(repoId)).toEqual({
+        remote_url: "git.example.test/team/tool",
+      });
+      expect(recovered.query("SELECT count(*) AS count FROM migrations WHERE version = 8").get()).toEqual({ count: 1 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("applies v9 after an exact v8 marker and sanitizes later remote-bearing state", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-after-v8-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (
+        id INTEGER PRIMARY KEY,
+        path TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        remote_url TEXT
+      );
+      CREATE TABLE remotes (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        fetch_url TEXT
+      );
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY,
+        expected_remote TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL
+      );
+    `);
+    seed.query("INSERT INTO repos (id, path, name, remote_url) VALUES (1, '/tmp/v9', 'v9', ?)").run(unsafe);
+    seed.query("INSERT INTO remotes (id, repo_id, name, url, fetch_url) VALUES (1, 1, 'origin', ?, ?)")
+      .run(unsafe, unsafe);
+    seed.query("INSERT INTO remotes (id, repo_id, name, url) VALUES (2, 1, 'local', 'file:///tmp/v9')").run();
+    const snapshot = JSON.stringify({ id: 1, path: "/tmp/v9", name: "v9", remote_url: unsafe });
+    seed.query(`INSERT INTO repo_relocation_audit
+      (id, expected_remote, source_json, target_json, after_json) VALUES ('receipt-v9', ?, ?, ?, ?)`)
+      .run(unsafe, snapshot, snapshot, snapshot);
+    seed.close();
+
+    try {
+      const migrated = getDb(path);
+      expect(migrated.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({
+        remote_url: "git.example.test/team/tool",
+      });
+      expect(migrated.query("SELECT name, url, fetch_url FROM remotes ORDER BY id").all()).toEqual([{
+        name: "origin",
+        url: "git.example.test/team/tool",
+        fetch_url: "git.example.test/team/tool",
+      }]);
+      const receipt = migrated.query(`SELECT expected_remote, source_json, target_json, after_json
+        FROM repo_relocation_audit WHERE id = 'receipt-v9'`).get() as Record<string, string>;
+      expect(receipt.expected_remote).toBe("git.example.test/team/tool");
+      for (const field of ["source_json", "target_json", "after_json"]) {
+        expect(JSON.parse(receipt[field]!)).toMatchObject({ remote_url: "git.example.test/team/tool" });
+      }
+      expect(JSON.stringify(receipt)).not.toContain("phrase");
+      expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get()).toEqual({ count: 1 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
   it("serializes concurrent first-open migrations across processes", async () => {
     closeDb();
     const dir = mkdtempSync(join(tmpdir(), "repos-concurrent-first-open-"));
@@ -266,7 +450,7 @@ describe("database", () => {
       const results = await Promise.all(children.map(({ completed }) => completed));
       expect(results).toEqual(Array.from({ length: 8 }, () => ({
         code: 0,
-        stdout: JSON.stringify([1, 2, 3, 4, 6, 7].map((version) => ({ version }))),
+        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9].map((version) => ({ version }))),
         stderr: "",
       })));
     } finally {

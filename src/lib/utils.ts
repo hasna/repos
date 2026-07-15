@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getDb } from "../db/database.js";
+import { listRepos } from "../db/repos.js";
 
 function git(repoPath: string, args: string[], timeout = 10_000): string {
   try {
@@ -353,8 +354,8 @@ export function getLanguages(): Array<{
 // ── repos import/export ──
 
 export function exportRepos(format: "json" | "csv" = "json"): string {
-  const db = getDb();
-  const repos = db.query("SELECT name, path, org, remote_url, default_branch, commit_count, branch_count, tag_count, last_scanned FROM repos ORDER BY name").all() as any[];
+  const repos = listRepos({ limit: 100_000, offset: 0 })
+    .sort((left, right) => left.name.localeCompare(right.name));
 
   if (format === "csv") {
     const header = "name,path,org,remote_url,default_branch,commits,branches,tags,last_scanned";

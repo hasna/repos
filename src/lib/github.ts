@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { getDb } from "../db/database.js";
 import { getRepo, bulkInsertPullRequests } from "../db/repos.js";
+import { listRepos } from "../db/repos.js";
 import type { PullRequest } from "../types/index.js";
 
 function gh(args: string[]): string {
@@ -47,7 +48,7 @@ export function syncGithubPRs(
   if (!repo.remote_url) throw new Error(`Repo has no remote URL: ${repo.name}`);
 
   // Extract owner/repo from remote URL
-  const match = repo.remote_url.match(/github\.com[:/]([^/]+\/[^/.]+)/);
+  const match = repo.remote_url.match(/^github\.com\/([^/]+\/[^/]+)$/);
   if (!match) throw new Error(`Cannot parse GitHub repo from: ${repo.remote_url}`);
   const ghRepo = match[1]!.replace(/\.git$/, "");
 
@@ -113,15 +114,11 @@ export function isMissingRepoError(message: string): boolean {
 export function syncAllGithubPRs(
   opts: { org?: string; limit?: number; state?: string; maxRepos?: number; onProgress?: (msg: string) => void } = {}
 ): { total_synced: number; repos_seen: number; repos_checked: number; repos_synced: number; truncated: boolean; errors: string[]; skipped: string[] } {
-  const db = getDb();
   const { org, limit = 50, state = "all", maxRepos, onProgress } = opts;
 
-  let repos;
-  if (org) {
-    repos = db.query("SELECT * FROM repos WHERE org = ? AND remote_url LIKE '%github.com%' ORDER BY name ASC").all(org) as any[];
-  } else {
-    repos = db.query("SELECT * FROM repos WHERE remote_url LIKE '%github.com%' ORDER BY org ASC, name ASC").all() as any[];
-  }
+  let repos = listRepos({ ...(org ? { org } : {}), limit: 100_000, offset: 0 })
+    .filter((repo) => repo.remote_url?.startsWith("github.com/"))
+    .sort((left, right) => `${left.org ?? ""}/${left.name}`.localeCompare(`${right.org ?? ""}/${right.name}`));
   const repos_seen = repos.length;
   const normalizedMaxRepos = normalizePositiveInteger(maxRepos);
   if (normalizedMaxRepos && repos.length > normalizedMaxRepos) repos = repos.slice(0, normalizedMaxRepos);
@@ -162,7 +159,7 @@ export function fetchRepoMetadata(repoIdOrName: string | number): {
   const repo = typeof repoIdOrName === "number" ? getRepo(repoIdOrName) : getRepo(repoIdOrName);
   if (!repo?.remote_url) return null;
 
-  const match = repo.remote_url.match(/github\.com[:/]([^/]+\/[^/.]+)/);
+  const match = repo.remote_url.match(/^github\.com\/([^/]+\/[^/]+)$/);
   if (!match) return null;
   const ghRepo = match[1]!.replace(/\.git$/, "");
 

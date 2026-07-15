@@ -122,7 +122,7 @@ describe("getReposStatus", () => {
           unscanned: 0,
           withRemote: 1,
           withoutRemote: 0,
-          withCredentialLikeRemote: 1,
+          withCredentialLikeRemote: 0,
           orgs: 1,
         },
         commits: 1,
@@ -139,10 +139,10 @@ describe("getReposStatus", () => {
         },
       },
       health: {
-        status: "warn",
+        status: "ok",
         databaseReachable: true,
         hasRepos: true,
-        hasCredentialLikeRemoteUrls: true,
+        hasCredentialLikeRemoteUrls: false,
       },
       safety: {
         includesRepoNames: false,

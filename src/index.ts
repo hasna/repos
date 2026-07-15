@@ -1,5 +1,7 @@
 export * from "./types/index.js";
-export { getDb, closeDb } from "./db/database.js";
+export { getDb, getDbPath, migrateDb, closeDb } from "./db/database.js";
+export type { DatabaseOpenOptions } from "./db/database.js";
+export { sanitizeRemoteIdentity, sanitizeRemoteOutput } from "./lib/remote-identity.js";
 export {
   PrimaryRelocationError,
   relocatePrimaryRepo,

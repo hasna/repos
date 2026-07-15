@@ -7,6 +7,7 @@ import type { ScanResult } from "../types/index.js";
 import { getConfig, getHookQueuePath, getWorkspaceRoots } from "./config.js";
 import { drainHookQueue, installPostCommitHooks } from "./repo-hooks.js";
 import { discoverRepos, scanRepoPaths } from "./scanner.js";
+import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 const WORKSPACE_BOOTSTRAP_STATE_KEY = "workspace_bootstrap";
 
@@ -213,6 +214,7 @@ function normalizePayload(row: Record<string, unknown>, spec: SyncTableSpec): Re
     payload[column] = row[column] ?? null;
   }
   if (spec.table === "repos" && !payload["default_branch"]) payload["default_branch"] = "main";
+  if (spec.table === "repos") payload["remote_url"] = sanitizeRemoteIdentity(payload["remote_url"]);
   return payload;
 }
 
@@ -270,6 +272,29 @@ async function ensureRemoteSyncSchema(remote: ReposRemoteSyncClient): Promise<vo
     )
   `);
   await remote.query(`CREATE INDEX IF NOT EXISTS idx_repos_sync_records_updated_at ON ${SYNC_RECORD_TABLE}(updated_at)`);
+}
+
+async function sanitizeRemoteSyncStore(remote: ReposRemoteSyncClient): Promise<number> {
+  await remote.query("BEGIN");
+  try {
+    const result = await remote.query("SELECT path, remote_url FROM repos WHERE remote_url IS NOT NULL");
+    let rowsChanged = 0;
+    for (const row of result.rows) {
+      const current = row["remote_url"];
+      const sanitized = sanitizeRemoteIdentity(current);
+      if (sanitized === current) continue;
+      const updated = await remote.query(
+        "UPDATE repos SET remote_url = $1 WHERE path = $2 AND remote_url IS NOT DISTINCT FROM $3",
+        [sanitized, row["path"], current],
+      );
+      rowsChanged += updated.rowCount ?? 0;
+    }
+    await remote.query("COMMIT");
+    return rowsChanged;
+  } catch (error) {
+    try { await remote.query("ROLLBACK"); } catch { /* preserve the cleanup failure */ }
+    throw error;
+  }
 }
 
 function getLocalRows(spec: SyncTableSpec): Array<Record<string, unknown>> {
@@ -447,6 +472,7 @@ export async function syncRepoCatalog(
     if (ownsRemote) await remote.connect?.();
     await prepareRemoteSearchPath(remote, getReposDatabaseSchema(options));
     await ensureRemoteSyncSchema(remote);
+    await sanitizeRemoteSyncStore(remote);
     onProgress?.(`[sync] ${direction} repo catalog`);
     const rowsSynced = direction === "push"
       ? await pushLocalSyncRecords(remote)

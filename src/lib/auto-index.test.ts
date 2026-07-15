@@ -37,6 +37,9 @@ class FakeRemoteSyncClient implements ReposRemoteSyncClient {
       || normalized.startsWith("CREATE TABLE")
       || normalized.startsWith("ALTER TABLE")
       || normalized.startsWith("CREATE INDEX")
+      || normalized === "BEGIN"
+      || normalized === "COMMIT"
+      || normalized === "ROLLBACK"
     ) {
       return { rows: [], rowCount: 0 };
     }
@@ -68,6 +71,19 @@ class FakeRemoteSyncClient implements ReposRemoteSyncClient {
       }
       this.seedRepo(path, payload);
       return { rows: [], rowCount: 1 };
+    }
+    if (normalized === "SELECT path, remote_url FROM repos WHERE remote_url IS NOT NULL") {
+      const rows = [...this.repos.values()]
+        .filter((repo) => repo.remote_url !== null && repo.remote_url !== undefined)
+        .map((repo) => ({ path: repo.path, remote_url: repo.remote_url }));
+      return { rows, rowCount: rows.length };
+    }
+    if (normalized === "UPDATE repos SET remote_url = $1 WHERE path = $2 AND remote_url IS NOT DISTINCT FROM $3") {
+      const path = String(params[1]);
+      const existing = this.repos.get(path);
+      const matches = existing && existing.remote_url === params[2];
+      if (matches) this.repos.set(path, { ...existing, remote_url: params[0] ?? null });
+      return { rows: [], rowCount: matches ? 1 : 0 };
     }
     if (normalized.startsWith("INSERT INTO repos_sync_records")) {
       const tableName = String(params[0]);
@@ -168,6 +184,8 @@ describe("auto-index", () => {
     closeDb();
     const repoPath = createTestRepo("sync-push-repo", 1);
     await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
+    getDb().query("UPDATE repos SET remote_url = ? WHERE path = ?").run(unsafe, repoPath);
     process.env["HASNA_REPOS_DATABASE_URL"] = "postgres://repos@example.invalid/repos";
     const remote = new FakeRemoteSyncClient();
 
@@ -179,7 +197,9 @@ describe("auto-index", () => {
     expect(remote.repos.get(repoPath)).toMatchObject({
       path: repoPath,
       name: "sync-push-repo",
+      remote_url: "git.example.test/team/tool",
     });
+    expect(JSON.stringify(remote.repos.get(repoPath))).not.toContain(unsafe);
   });
 
   it("honors an explicit databaseUrl option without separate storage mode", async () => {
@@ -214,7 +234,7 @@ describe("auto-index", () => {
       path: repoPath,
       name: "remote-repo",
       org: "hasna",
-      remote_url: "https://github.com/hasna/remote-repo.git",
+      remote_url: `ssh://${["member", "phrase"].join(":")}@github.com/hasna/remote-repo.git?query=marker`,
       default_branch: "main",
       description: null,
       last_scanned: null,
@@ -232,7 +252,39 @@ describe("auto-index", () => {
     expect(listRepos({ limit: 10 }).find((repo) => repo.path === repoPath)).toMatchObject({
       name: "remote-repo",
       org: "hasna",
+      remote_url: "github.com/hasna/remote-repo",
     });
+  });
+
+  it("sanitizes existing app-owned remote rows before sync reads them", async () => {
+    process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
+    closeDb();
+    getDb();
+    process.env["HASNA_REPOS_STORAGE_MODE"] = "remote";
+    const remote = new FakeRemoteSyncClient();
+    const repoPath = join(TEST_DIR, "remote-cleanup");
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
+    remote.seedRepo(repoPath, {
+      path: repoPath,
+      name: "remote-cleanup",
+      org: "team",
+      remote_url: unsafe,
+      default_branch: "main",
+      description: null,
+      last_scanned: null,
+      commit_count: 0,
+      branch_count: 0,
+      tag_count: 0,
+      created_at: "2026-07-15T00:00:00.000Z",
+      updated_at: "2026-07-15T00:01:00.000Z",
+      source_machine_id: "remote-machine",
+    });
+
+    const result = await syncRepoCatalog("pull", undefined, { remoteClient: remote });
+
+    expect(result.errors).toEqual([]);
+    expect(remote.repos.get(repoPath)?.remote_url).toBe("git.example.test/team/tool");
+    expect(JSON.stringify(remote.repos.get(repoPath))).not.toContain("phrase");
   });
 
   it("stays local for legacy shared RDS envs without repo-owned database config", async () => {
