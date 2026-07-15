@@ -81,6 +81,19 @@ for both rows, a canonical target below the trusted user worktree root, a
 credential-free `host/owner/name` remote, the target's exact HEAD, and a stable
 idempotency key.
 
+For the Infinity Machine cutover, the reviewed live registry map is exact:
+
+| Repository | Preserved legacy ID | Absorbed canonical ID |
+|------------|--------------------:|----------------------:|
+| `hasna/codewith` | 661 | 1510 |
+| `hasna/infinity` | 662 | 1511 |
+| `hasna/sandboxes` | 663 | 1509 |
+| `hasna/accounts` | 664 | 1508 |
+
+Do not infer these IDs from alphabetical order or from an older snapshot. Each
+apply still requires both live row revisions, the exact canonical path and HEAD,
+and the reviewed dry-run plan hash.
+
 ```bash
 # Validation only (default)
 repos registry relocate-primary \
@@ -121,8 +134,10 @@ aliases. Dry run emits a request hash, plan hash, per-table counts, and hashed
 collision decisions. Exact duplicate children may be deduplicated; divergent
 commit, branch, tag, remote, PR, edge, or unknown foreign-key state blocks apply
 without choosing a winner. Apply revalidates the plan under one immediate SQLite
-transaction, reparents supported children and worktree leases, deletes only the
-absorbed target row, updates the legacy path, verifies foreign keys, and writes a
+transaction, reparents supported children and catalog- or path-bound worktree
+leases, converges graph edges by their final mapped identity, deletes only the
+absorbed target row, absorbs the target's operational metadata while retaining
+the legacy ID and earliest creation time, verifies foreign keys, and writes a
 sanitized receipt. Any failure rolls back everything, and an exact idempotent
 retry reads back the original receipt.
 

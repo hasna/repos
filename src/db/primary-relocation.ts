@@ -43,6 +43,7 @@ export type PrimaryRelocationErrorCode =
   | "HEAD_MISMATCH"
   | "THIRD_PATH_ALIAS"
   | "DIVERGENT_COLLISION"
+  | "WORKTREE_LEASE_CONFLICT"
   | "UNKNOWN_REPO_FOREIGN_KEY"
   | "PLAN_HASH_REQUIRED"
   | "PLAN_HASH_MISMATCH"
@@ -208,6 +209,15 @@ function stable(value: unknown): string {
 
 function hash(value: unknown): string {
   return createHash("sha256").update(stable(value)).digest("hex");
+}
+
+function earliestTimestamp(left: string, right: string): string {
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+    return leftTime <= rightTime ? left : right;
+  }
+  return left <= right ? left : right;
 }
 
 function normalizeAbsolutePath(path: string, label: string): string {
@@ -389,15 +399,45 @@ function safeRepo(repo: Repo): Repo {
 
 function runGit(path: string, args: string[]): string {
   try {
-    return execFileSync("git", ["-C", path, ...args], {
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key, value]) => !/^GIT_/i.test(key) && value !== undefined),
+    );
+    const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+    return execFileSync("git", [
+      "-c", "core.fsmonitor=false",
+      "-c", "core.untrackedCache=false",
+      "-c", `core.hooksPath=${nullDevice}`,
+      "-C", path,
+      ...args,
+    ], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
-      env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+      env: {
+        ...env,
+        GIT_ATTR_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: nullDevice,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_NO_LAZY_FETCH: "1",
+        GIT_OPTIONAL_LOCKS: "0",
+        GIT_TERMINAL_PROMPT: "0",
+      },
     }).trim();
   } catch (cause) {
     fail("TARGET_NOT_GIT_CHECKOUT", "target is not a readable Git checkout", undefined, cause);
   }
+}
+
+function rawOriginUrl(path: string): string {
+  const urls = runGit(path, [
+    "config",
+    "--local",
+    "--no-includes",
+    "--get-all",
+    "remote.origin.url",
+  ]).split("\n").map((url) => url.trim()).filter(Boolean);
+  if (urls.length !== 1) fail("REMOTE_MISMATCH", "target must have exactly one raw origin URL");
+  return urls[0]!;
 }
 
 function validateTarget(targetPath: string, root: string, remote: string, head: string): void {
@@ -414,13 +454,20 @@ function validateTarget(targetPath: string, root: string, remote: string, head: 
     if (realpathSync(runGit(realTarget, ["rev-parse", "--show-toplevel"])) !== realTarget) {
       fail("TARGET_NOT_GIT_CHECKOUT", "target must be the checkout top-level");
     }
-    if (sanitizeCheckoutRemoteUrl(runGit(realTarget, ["remote", "get-url", "origin"])) !== remote) {
+    // Read the local config value directly: `remote get-url` applies url.*.insteadOf
+    // rewrites and can make a different raw origin impersonate the expected one.
+    if (sanitizeCheckoutRemoteUrl(rawOriginUrl(realTarget)) !== remote) {
       fail("REMOTE_MISMATCH", "target origin does not match the expected remote");
     }
     if (runGit(realTarget, ["rev-parse", "--verify", "HEAD^{commit}"]) !== head) {
       fail("HEAD_MISMATCH", "target HEAD does not match the exact expected object ID");
     }
-    if (runGit(realTarget, ["status", "--porcelain=v1"])) fail("TARGET_DIRTY", "target checkout is dirty");
+    if (runGit(realTarget, [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+      "--ignore-submodules=none",
+    ])) fail("TARGET_DIRTY", "target checkout is dirty");
   } catch (error) {
     if (error instanceof PrimaryRelocationError) throw error;
     fail("TARGET_NOT_GIT_CHECKOUT", "target cannot be inspected safely", undefined, error);
@@ -545,11 +592,22 @@ function buildEdgePlan(request: ValidatedRequest): {
        OR (target_type = 'repo' AND target_id IN (?, ?)) ORDER BY id`).all(
     legacy, target, legacy, target,
   ) as Array<Record<string, unknown>>;
-  const targetRows = rows.filter((row) =>
-    (row.source_type === "repo" && row.source_id === target)
-    || (row.target_type === "repo" && row.target_id === target));
+  const mappedRows = rows.map((row) => {
+    const containsTarget = (row.source_type === "repo" && row.source_id === target)
+      || (row.target_type === "repo" && row.target_id === target);
+    return {
+      row,
+      containsTarget,
+      mapped: {
+        ...row,
+        source_id: row.source_type === "repo" && row.source_id === target ? legacy : row.source_id,
+        target_id: row.target_type === "repo" && row.target_id === target ? legacy : row.target_id,
+      },
+    };
+  });
+  const targetRows = mappedRows.filter(({ containsTarget }) => containsTarget);
   const result: TableReconcileCounts = {
-    legacy: rows.length - targetRows.length,
+    legacy: mappedRows.length - targetRows.length,
     target: targetRows.length,
     move: 0,
     dedupe: 0,
@@ -557,30 +615,38 @@ function buildEdgePlan(request: ValidatedRequest): {
   };
   const collisions: CollisionDecision[] = [];
   const decisions: InternalDecision[] = [];
-  for (const row of targetRows) {
-    const mapped = {
-      ...row,
-      source_id: row.source_type === "repo" && row.source_id === target ? legacy : row.source_id,
-      target_id: row.target_type === "repo" && row.target_id === target ? legacy : row.target_id,
-    };
-    const key = rowWithout(mapped, ["id", "weight", "metadata"]);
-    const existing = rows.find((candidate) => Number(candidate.id) !== Number(row.id)
-      && stable(rowWithout(candidate, ["id", "weight", "metadata"])) === stable(key));
-    const targetPayload = rowWithout(mapped, ["id"]);
-    const sourcePayload = existing ? rowWithout(existing, ["id"]) : null;
-    const decision: CollisionDecision["decision"] = !existing
-      ? "move"
-      : stable(sourcePayload) === stable(targetPayload) ? "dedupe" : "block";
-    result[decision]++;
-    const safeDecision: CollisionDecision = {
-      table: "edges",
-      key_hash: hash(key),
-      source_hash: sourcePayload ? hash(sourcePayload) : null,
-      target_hash: hash(targetPayload),
-      decision,
-    };
-    collisions.push(safeDecision);
-    decisions.push({ ...safeDecision, row_id: Number(row.id) });
+  const groups = new Map<string, typeof mappedRows>();
+  for (const mappedRow of mappedRows) {
+    const keyHash = stable(rowWithout(mappedRow.mapped, ["id", "weight", "metadata"]));
+    const group = groups.get(keyHash) || [];
+    group.push(mappedRow);
+    groups.set(keyHash, group);
+  }
+  for (const group of groups.values()) {
+    const affected = group.filter(({ containsTarget }) => containsTarget);
+    if (!affected.length) continue;
+    // Prefer a row that is already canonical. If every row contains the target
+    // ID, deterministically move the lowest-ID row and converge the rest onto it.
+    const anchor = group.find(({ containsTarget }) => !containsTarget) || affected[0]!;
+    const key = rowWithout(anchor.mapped, ["id", "weight", "metadata"]);
+    const anchorPayload = rowWithout(anchor.mapped, ["id"]);
+    for (const candidate of affected) {
+      const targetPayload = rowWithout(candidate.mapped, ["id"]);
+      const isAnchor = candidate === anchor;
+      const decision: CollisionDecision["decision"] = isAnchor
+        ? "move"
+        : stable(anchorPayload) === stable(targetPayload) ? "dedupe" : "block";
+      result[decision]++;
+      const safeDecision: CollisionDecision = {
+        table: "edges",
+        key_hash: hash(key),
+        source_hash: isAnchor ? null : hash(anchorPayload),
+        target_hash: hash(targetPayload),
+        decision,
+      };
+      collisions.push(safeDecision);
+      decisions.push({ ...safeDecision, row_id: Number(candidate.row.id) });
+    }
   }
   return { count: result, collisions, decisions, digest: hash(rows) };
 }
@@ -606,18 +672,40 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
   let leaseDigest = hash([]);
   if (tableExists("worktree_leases")) {
     const columns = getDb().query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>;
-    if (!["repo_catalog_id", "repo_path"].every((column) => columns.some(({ name }) => name === column))) {
+    if (!["lease_id", "repo_catalog_id", "repo_path"].every((column) => columns.some(({ name }) => name === column))) {
       fail("UNKNOWN_REPO_FOREIGN_KEY", "worktree_leases has an unsupported schema", { tables: ["worktree_leases"] });
     }
-    const leases = getDb().query("SELECT * FROM worktree_leases WHERE repo_catalog_id IN (?, ?) ORDER BY lease_id").all(
+    const leases = getDb().query(`SELECT * FROM worktree_leases
+      WHERE repo_catalog_id IN (?, ?)
+         OR repo_path IN (?, ?)
+      ORDER BY lease_id`).all(
       request.legacyRepoId,
       request.targetRepoId,
+      request.legacyPath,
+      request.targetPath,
     );
     leaseCount = leases.length;
     leaseDigest = hash(leases);
-    const legacyLeases = (leases as Array<Record<string, unknown>>).filter((row) => row.repo_catalog_id === request.legacyRepoId).length;
+    const leaseRows = leases as Array<Record<string, unknown>>;
+    const conflictingLease = leaseRows.some((row) =>
+      (row.repo_path === request.legacyPath || row.repo_path === request.targetPath)
+      && row.repo_catalog_id !== null
+      && row.repo_catalog_id !== request.legacyRepoId
+      && row.repo_catalog_id !== request.targetRepoId);
+    if (conflictingLease) {
+      fail(
+        "WORKTREE_LEASE_CONFLICT",
+        "a relocation-path worktree lease belongs to a different registered repo",
+        { tables: ["worktree_leases"] },
+      );
+    }
+    const legacyLeases = leaseRows.filter((row) =>
+      row.repo_catalog_id === request.legacyRepoId
+      || (row.repo_catalog_id === null && row.repo_path === request.legacyPath)).length;
     const targetLeases = leaseCount - legacyLeases;
-    counts.worktree_leases = { legacy: legacyLeases, target: targetLeases, move: targetLeases, dedupe: 0, block: 0 };
+    const movedLeases = leaseRows.filter((row) =>
+      row.repo_catalog_id !== request.legacyRepoId || row.repo_path !== request.targetPath).length;
+    counts.worktree_leases = { legacy: legacyLeases, target: targetLeases, move: movedLeases, dedupe: 0, block: 0 };
   }
   const audits = getDb().query("SELECT * FROM repo_relocation_audit WHERE repo_id IN (?, ?) ORDER BY id").all(
     request.legacyRepoId,
@@ -637,14 +725,23 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
   const after = safeRepo({
     ...sourceRow,
     path: request.targetPath,
+    name: targetRow.name,
+    org: targetRow.org,
+    remote_url: targetRow.remote_url,
+    default_branch: targetRow.default_branch,
+    description: targetRow.description,
+    last_scanned: targetRow.last_scanned,
     commit_count: commitCount,
     branch_count: branchCount,
     tag_count: tagCount,
+    created_at: earliestTimestamp(sourceRow.created_at, targetRow.created_at),
   });
   const planEnvelope = {
     request_hash: request.requestHash,
     source: safeRepo(sourceRow),
     target: safeRepo(targetRow),
+    source_row_digest: hash(sourceRow),
+    target_row_digest: hash(targetRow),
     after: { ...after, updated_at: "<apply-revision>" },
     counts,
     collisions,
@@ -734,7 +831,14 @@ function existingIdempotentResult(request: ValidatedRequest): PrimaryRelocationR
 
 function applyDecisions(request: ValidatedRequest, plan: ReconcilePlan): void {
   const db = getDb();
-  for (const decision of plan.decisions) {
+  // Remove converged duplicates before moving their surviving row. This avoids
+  // transient UNIQUE violations when multiple target-bearing edges map to the
+  // same canonical post-relocation key.
+  const ordered = [...plan.decisions].sort((left, right) => {
+    const rank = (decision: InternalDecision) => decision.decision === "dedupe" ? 0 : 1;
+    return rank(left) - rank(right) || left.row_id - right.row_id;
+  });
+  for (const decision of ordered) {
     if (decision.decision === "dedupe") {
       if (decision.table === "edges") {
         db.query("DELETE FROM edges WHERE id = ?").run(decision.row_id);
@@ -831,11 +935,15 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
       validated.targetRepoId,
     );
     if (tableExists("worktree_leases")) {
-      db.query("UPDATE worktree_leases SET repo_catalog_id = ?, repo_path = ? WHERE repo_catalog_id IN (?, ?)").run(
+      db.query(`UPDATE worktree_leases SET repo_catalog_id = ?, repo_path = ?
+        WHERE repo_catalog_id IN (?, ?)
+           OR repo_path IN (?, ?)`).run(
         validated.legacyRepoId,
         validated.targetPath,
         validated.legacyRepoId,
         validated.targetRepoId,
+        validated.legacyPath,
+        validated.targetPath,
       );
     }
     const deleted = db.query("DELETE FROM repos WHERE id = ? AND path = ? AND updated_at = ?").run(
@@ -850,12 +958,25 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
     }
 
     const createdAt = new Date().toISOString();
-    const updated = db.query(`UPDATE repos SET path = ?, commit_count = ?, branch_count = ?, tag_count = ?, updated_at = ?
+    const survivorCreatedAt = earliestTimestamp(
+      currentPlan.sourceRow.created_at,
+      currentPlan.targetRow.created_at,
+    );
+    const updated = db.query(`UPDATE repos SET
+      path = ?, name = ?, org = ?, remote_url = ?, default_branch = ?, description = ?, last_scanned = ?,
+      commit_count = ?, branch_count = ?, tag_count = ?, created_at = ?, updated_at = ?
       WHERE id = ? AND path = ? AND updated_at = ?`).run(
       validated.targetPath,
+      currentPlan.targetRow.name,
+      currentPlan.targetRow.org,
+      currentPlan.targetRow.remote_url,
+      currentPlan.targetRow.default_branch,
+      currentPlan.targetRow.description,
+      currentPlan.targetRow.last_scanned,
       currentPlan.counts.commits!.legacy + currentPlan.counts.commits!.move,
       currentPlan.counts.branches!.legacy + currentPlan.counts.branches!.move,
       currentPlan.counts.tags!.legacy + currentPlan.counts.tags!.move,
+      survivorCreatedAt,
       createdAt,
       validated.legacyRepoId,
       validated.legacyPath,

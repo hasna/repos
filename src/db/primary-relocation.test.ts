@@ -161,6 +161,43 @@ describe("primary relocation v2 reconciliation", () => {
     expect(JSON.stringify(audit)).not.toContain("credential@");
   });
 
+  it("absorbs canonical target operational metadata while preserving the legacy ID and earliest creation time", () => {
+    const pair = seedPair();
+    const db = getDb();
+    db.query(`UPDATE repos SET
+      name = 'stale-accounts', org = 'legacy-org', default_branch = 'develop',
+      description = 'legacy description', last_scanned = '2026-06-01T00:00:00Z',
+      created_at = '2026-01-01T00:00:00Z'
+      WHERE id = ?`).run(pair.legacyId);
+    db.query(`UPDATE repos SET
+      name = 'accounts', org = 'hasna', default_branch = 'main',
+      description = 'canonical description', last_scanned = '2026-07-15T00:00:00Z',
+      created_at = '2026-02-01T00:00:00Z'
+      WHERE id = ?`).run(pair.targetId);
+
+    const { dry, applied } = applyReviewed(pair);
+    expect(dry.before).toMatchObject({ id: pair.legacyId, name: "stale-accounts", created_at: "2026-01-01T00:00:00Z" });
+    expect(dry.target).toMatchObject({ id: pair.targetId, name: "accounts", created_at: "2026-02-01T00:00:00Z" });
+    expect(dry.after).toMatchObject({ id: pair.legacyId, name: "accounts", created_at: "2026-01-01T00:00:00Z" });
+    expect(applied.receipt?.source).toEqual(dry.before);
+    expect(applied.receipt?.target).toEqual(dry.target);
+    expect(applied.receipt?.after).toEqual(applied.after);
+    expect(db.query(`SELECT id, path, name, org, remote_url, default_branch, description,
+      last_scanned, created_at FROM repos WHERE id = ?`).get(pair.legacyId)).toEqual({
+      id: pair.legacyId,
+      path: pair.path,
+      name: "accounts",
+      org: "hasna",
+      remote_url: "git@github.com:hasna/accounts.git",
+      default_branch: "main",
+      description: "canonical description",
+      last_scanned: "2026-07-15T00:00:00Z",
+      created_at: "2026-01-01T00:00:00Z",
+    });
+    expect(JSON.stringify(applied.receipt)).not.toContain("legacy description");
+    expect(JSON.stringify(applied.receipt)).not.toContain("canonical description");
+  });
+
   it("allows missing, dirty, divergent, non-Git, and unreadable legacy filesystem state without accessing it", () => {
     const pair = seedPair();
     mkdirSync(pair.sourcePath, { recursive: true });
@@ -234,6 +271,59 @@ describe("primary relocation v2 reconciliation", () => {
     expectCode(() => relocatePrimaryRepo(requestFor({ ...pair, path: escaped, head: git(escaped, "rev-parse", "HEAD") })), "TARGET_OUTSIDE_ROOT");
   });
 
+  it("ignores inherited Git controls and cannot be tricked into hiding untracked target files", () => {
+    const pair = seedPair();
+    writeFileSync(join(pair.path, "dirty-untracked.txt"), "dirty\n");
+    const previous = {
+      count: process.env["GIT_CONFIG_COUNT"],
+      key: process.env["GIT_CONFIG_KEY_0"],
+      value: process.env["GIT_CONFIG_VALUE_0"],
+    };
+    process.env["GIT_CONFIG_COUNT"] = "1";
+    process.env["GIT_CONFIG_KEY_0"] = "status.showUntrackedFiles";
+    process.env["GIT_CONFIG_VALUE_0"] = "no";
+    try {
+      expectCode(() => relocatePrimaryRepo(requestFor(pair)), "TARGET_DIRTY");
+    } finally {
+      for (const [key, value] of [
+        ["GIT_CONFIG_COUNT", previous.count],
+        ["GIT_CONFIG_KEY_0", previous.key],
+        ["GIT_CONFIG_VALUE_0", previous.value],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it("validates the raw local origin before url.insteadOf rewriting", () => {
+    const pair = seedPair();
+    git(pair.path, "remote", "set-url", "origin", "https://rewrite.invalid/hasna/accounts.git");
+    git(pair.path, "config", "url.https://github.com/.insteadOf", "https://rewrite.invalid/");
+    expect(git(pair.path, "remote", "get-url", "origin")).toBe("https://github.com/hasna/accounts.git");
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "REMOTE_MISMATCH");
+  });
+
+  it("does not let global url.insteadOf configuration rewrite the raw origin identity", () => {
+    const pair = seedPair();
+    const globalConfig = join(root, "adversarial-global-gitconfig");
+    writeFileSync(globalConfig, `[url "https://github.com/"]\n\tinsteadOf = https://rewrite.invalid/\n`);
+    git(pair.path, "remote", "set-url", "origin", "https://rewrite.invalid/hasna/accounts.git");
+    const previous = process.env["GIT_CONFIG_GLOBAL"];
+    process.env["GIT_CONFIG_GLOBAL"] = globalConfig;
+    try {
+      const rewritten = execFileSync("git", ["-C", pair.path, "remote", "get-url", "origin"], {
+        encoding: "utf8",
+        env: { ...process.env, GIT_CONFIG_GLOBAL: globalConfig },
+      }).trim();
+      expect(rewritten).toBe("https://github.com/hasna/accounts.git");
+      expectCode(() => relocatePrimaryRepo(requestFor(pair)), "REMOTE_MISMATCH");
+    } finally {
+      if (previous === undefined) delete process.env["GIT_CONFIG_GLOBAL"];
+      else process.env["GIT_CONFIG_GLOBAL"] = previous;
+    }
+  });
+
   it("rejects a third registered realpath alias", () => {
     const pair = seedPair();
     const alias = join(canonicalRoot, "third-alias");
@@ -249,15 +339,18 @@ describe("primary relocation v2 reconciliation", () => {
     expect(error.details?.tables).toEqual(["future_repo_state"]);
   });
 
-  it("rebinds optional leases, reconciles graph edges, and reparents prior audits", () => {
+  it("rebinds catalog and path-only leases, reconciles graph edges, and reparents prior audits", () => {
     const pair = seedPair();
     const db = getDb();
     db.exec(`CREATE TABLE worktree_leases (
       lease_id TEXT PRIMARY KEY, repo_path TEXT NOT NULL,
-      repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL
+      repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+      metadata TEXT NOT NULL DEFAULT '{}'
     )`);
-    db.query("INSERT INTO worktree_leases VALUES ('legacy-lease', ?, ?)").run(pair.sourcePath, pair.legacyId);
-    db.query("INSERT INTO worktree_leases VALUES ('target-lease', ?, ?)").run(pair.path, pair.targetId);
+    db.query("INSERT INTO worktree_leases (lease_id, repo_path, repo_catalog_id) VALUES ('legacy-lease', ?, ?)").run(pair.sourcePath, pair.legacyId);
+    db.query("INSERT INTO worktree_leases (lease_id, repo_path, repo_catalog_id) VALUES ('target-lease', ?, ?)").run(pair.path, pair.targetId);
+    db.query("INSERT INTO worktree_leases (lease_id, repo_path, repo_catalog_id, metadata) VALUES ('path-legacy', ?, NULL, 'legacy-path-only')").run(pair.sourcePath);
+    db.query("INSERT INTO worktree_leases (lease_id, repo_path, repo_catalog_id, metadata) VALUES ('path-target', ?, NULL, 'target-path-only')").run(pair.path);
     db.query("INSERT INTO edges (source_type, source_id, relation, target_type, target_id, metadata) VALUES ('repo', ?, 'depends_on', 'repo', '999', '{}')").run(String(pair.targetId));
 
     const seed = relocatePrimaryRepo(requestFor(pair));
@@ -272,12 +365,38 @@ describe("primary relocation v2 reconciliation", () => {
     );
     const { applied } = applyReviewed(pair);
     expect(applied.plan.counts.edges.move).toBe(1);
-    expect(db.query("SELECT repo_catalog_id, repo_path FROM worktree_leases ORDER BY lease_id").all()).toEqual([
-      { repo_catalog_id: pair.legacyId, repo_path: pair.path },
-      { repo_catalog_id: pair.legacyId, repo_path: pair.path },
+    expect(applied.plan.counts.worktree_leases).toEqual({ legacy: 2, target: 2, move: 4, dedupe: 0, block: 0 });
+    expect(db.query("SELECT repo_catalog_id, repo_path, metadata FROM worktree_leases ORDER BY lease_id").all()).toEqual([
+      { repo_catalog_id: pair.legacyId, repo_path: pair.path, metadata: "{}" },
+      { repo_catalog_id: pair.legacyId, repo_path: pair.path, metadata: "legacy-path-only" },
+      { repo_catalog_id: pair.legacyId, repo_path: pair.path, metadata: "target-path-only" },
+      { repo_catalog_id: pair.legacyId, repo_path: pair.path, metadata: "{}" },
     ]);
     expect(db.query("SELECT source_id FROM edges").get()).toEqual({ source_id: String(pair.legacyId) });
     expect(db.query("SELECT repo_id FROM repo_relocation_audit WHERE id = 'prior'").get()).toEqual({ repo_id: pair.legacyId });
+  });
+
+  it("fails closed when an exact relocation-path lease belongs to a third registered repo", () => {
+    const pair = seedPair();
+    const db = getDb();
+    const thirdPath = join(root, "third-registered-repo");
+    insertRepo(1700, thirdPath, "third", "https://github.com/hasna/third.git");
+    db.exec(`CREATE TABLE worktree_leases (
+      lease_id TEXT PRIMARY KEY, repo_path TEXT NOT NULL,
+      repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    )`);
+    db.query(`INSERT INTO worktree_leases
+      (lease_id, repo_path, repo_catalog_id, metadata)
+      VALUES ('conflicting-lease', ?, 1700, 'must-stay')`).run(pair.sourcePath);
+    const beforeRepos = db.query("SELECT * FROM repos ORDER BY id").all();
+    const beforeLeases = db.query("SELECT * FROM worktree_leases ORDER BY lease_id").all();
+
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "WORKTREE_LEASE_CONFLICT");
+
+    expect(db.query("SELECT * FROM repos ORDER BY id").all()).toEqual(beforeRepos);
+    expect(db.query("SELECT * FROM worktree_leases ORDER BY lease_id").all()).toEqual(beforeLeases);
+    expect(db.query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
   });
 
   it("dedupes exact mapped graph edges and blocks divergent mapped edges", () => {
@@ -294,6 +413,49 @@ describe("primary relocation v2 reconciliation", () => {
     db.query("INSERT INTO edges (source_type, source_id, relation, target_type, target_id, weight, metadata) VALUES ('repo', ?, 'depends_on', 'repo', '998', 2, '{}')").run(String(other.targetId));
     const blocked = relocatePrimaryRepo(requestFor(other));
     expect(blocked.plan.can_apply).toBe(false);
+  });
+
+  it("converges multiple target-bearing edges by their final post-map key", () => {
+    const pair = seedPair();
+    const db = getDb();
+    db.query("INSERT INTO edges (source_type, source_id, relation, target_type, target_id, weight, metadata) VALUES ('repo', ?, 'mirrors', 'repo', ?, 1, '{}')")
+      .run(String(pair.targetId), String(pair.legacyId));
+    db.query("INSERT INTO edges (source_type, source_id, relation, target_type, target_id, weight, metadata) VALUES ('repo', ?, 'mirrors', 'repo', ?, 1, '{}')")
+      .run(String(pair.legacyId), String(pair.targetId));
+    const { dry, applied } = applyReviewed(pair);
+    expect(dry.plan.counts.edges).toEqual({ legacy: 0, target: 2, move: 1, dedupe: 1, block: 0 });
+    expect(applied.applied).toBe(true);
+    expect(db.query("SELECT source_id, target_id, weight, metadata FROM edges").all()).toEqual([{
+      source_id: String(pair.legacyId),
+      target_id: String(pair.legacyId),
+      weight: 1,
+      metadata: "{}",
+    }]);
+  });
+
+  it("blocks target-bearing edges that converge with divergent payloads without mutating", () => {
+    const pair = seedPair();
+    const db = getDb();
+    db.query("INSERT INTO edges (source_type, source_id, relation, target_type, target_id, weight, metadata) VALUES ('repo', ?, 'mirrors', 'repo', ?, 1, '{\"origin\":\"left\"}')")
+      .run(String(pair.targetId), String(pair.legacyId));
+    db.query("INSERT INTO edges (source_type, source_id, relation, target_type, target_id, weight, metadata) VALUES ('repo', ?, 'mirrors', 'repo', ?, 2, '{\"origin\":\"right\"}')")
+      .run(String(pair.legacyId), String(pair.targetId));
+    const beforeRepos = db.query("SELECT * FROM repos ORDER BY id").all();
+    const beforeEdges = db.query("SELECT * FROM edges ORDER BY id").all();
+
+    const dry = relocatePrimaryRepo(requestFor(pair));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.counts.edges).toEqual({ legacy: 0, target: 2, move: 1, dedupe: 0, block: 1 });
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "edges", decision: "block" }));
+    expectCode(() => relocatePrimaryRepo({
+      ...requestFor(pair),
+      apply: true,
+      expectedPlanHash: dry.plan.plan_hash,
+    }), "DIVERGENT_COLLISION");
+
+    expect(db.query("SELECT * FROM repos ORDER BY id").all()).toEqual(beforeRepos);
+    expect(db.query("SELECT * FROM edges ORDER BY id").all()).toEqual(beforeEdges);
+    expect(db.query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
   });
 
   it("rolls back every mutation when receipt persistence fails", () => {
@@ -327,10 +489,10 @@ describe("primary relocation v2 reconciliation", () => {
 
   it("uses the correct live Infinity legacy-to-canonical ID mapping", () => {
     const fixtures = [
-      [661, 1508, "accounts"],
-      [662, 1509, "sandboxes"],
-      [663, 1511, "infinity"],
-      [664, 1510, "codewith"],
+      [661, 1510, "codewith"],
+      [662, 1511, "infinity"],
+      [663, 1509, "sandboxes"],
+      [664, 1508, "accounts"],
     ] as const;
     for (const [legacyId, targetId, name] of fixtures) {
       const pair = seedPair({ legacyId, targetId, name });
