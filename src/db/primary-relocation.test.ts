@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "./database.js";
@@ -294,6 +303,108 @@ describe("primary relocation v2 reconciliation", () => {
         else process.env[key] = value;
       }
     }
+  });
+
+  it("validates a clean checkout without executing repository-defined conversion callbacks", () => {
+    const pair = seedPair();
+    const marker = join(root, "conversion-callback-ran");
+    const filter = join(root, "conversion-filter.sh");
+    const filtered = join(pair.path, "callback.txt");
+    writeFileSync(filter, `#!/bin/sh\nprintf x >> "${marker}"\ncat\n`);
+    chmodSync(filter, 0o755);
+    writeFileSync(join(pair.path, ".gitattributes"), "callback.txt filter=relocation-sentinel\n");
+    writeFileSync(filtered, "callback-safe\n");
+    git(pair.path, "config", "filter.relocation-sentinel.clean", filter);
+    git(pair.path, "config", "filter.relocation-sentinel.smudge", "cat");
+    git(pair.path, "config", "filter.relocation-sentinel.required", "true");
+    git(pair.path, "add", ".gitattributes", "callback.txt");
+    git(pair.path, "commit", "-m", "add callback fixture");
+    pair.head = git(pair.path, "rev-parse", "HEAD");
+    rmSync(marker, { force: true });
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(filtered, future, future);
+
+    expect(relocatePrimaryRepo(requestFor(pair)).ok).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("detects tracked byte changes, staged changes, and tracked deletions without worktree diff", () => {
+    const modified = seedPair({ legacyId: 661, targetId: 1508, name: "modified" });
+    writeFileSync(join(modified.path, "README.md"), "modified\n");
+    expectCode(() => relocatePrimaryRepo(requestFor(modified)), "TARGET_DIRTY");
+
+    const staged = seedPair({ legacyId: 662, targetId: 1509, name: "staged" });
+    writeFileSync(join(staged.path, "README.md"), "staged\n");
+    git(staged.path, "add", "README.md");
+    expectCode(() => relocatePrimaryRepo(requestFor(staged)), "TARGET_DIRTY");
+
+    const deleted = seedPair({ legacyId: 663, targetId: 1510, name: "deleted" });
+    rmSync(join(deleted.path, "README.md"));
+    expectCode(() => relocatePrimaryRepo(requestFor(deleted)), "TARGET_DIRTY");
+  });
+
+  it("detects executable-mode and symlink-target changes from filesystem metadata and bytes", () => {
+    const executable = seedPair({ legacyId: 661, targetId: 1508, name: "executable" });
+    chmodSync(join(executable.path, "README.md"), 0o755);
+    expectCode(() => relocatePrimaryRepo(requestFor(executable)), "TARGET_DIRTY");
+
+    const symlink = seedPair({ legacyId: 662, targetId: 1509, name: "symlink" });
+    symlinkSync("README.md", join(symlink.path, "current"));
+    git(symlink.path, "add", "current");
+    git(symlink.path, "commit", "-m", "add symlink");
+    symlink.head = git(symlink.path, "rev-parse", "HEAD");
+    rmSync(join(symlink.path, "current"));
+    symlinkSync("missing.md", join(symlink.path, "current"));
+    expectCode(() => relocatePrimaryRepo(requestFor(symlink)), "TARGET_DIRTY");
+  });
+
+  it("detects non-ignored untracked files but allows ignored cache files", () => {
+    const untracked = seedPair({ legacyId: 661, targetId: 1508, name: "untracked" });
+    writeFileSync(join(untracked.path, "new.txt"), "new\n");
+    expectCode(() => relocatePrimaryRepo(requestFor(untracked)), "TARGET_DIRTY");
+
+    const ignored = seedPair({ legacyId: 662, targetId: 1509, name: "ignored" });
+    writeFileSync(join(ignored.path, ".gitignore"), "cache/\n");
+    git(ignored.path, "add", ".gitignore");
+    git(ignored.path, "commit", "-m", "ignore cache");
+    ignored.head = git(ignored.path, "rev-parse", "HEAD");
+    mkdirSync(join(ignored.path, "cache"));
+    writeFileSync(join(ignored.path, "cache", "state.bin"), "cache\n");
+    expect(relocatePrimaryRepo(requestFor(ignored)).ok).toBe(true);
+  });
+
+  it("fails closed on unresolved index conflicts and unsupported submodules", () => {
+    const conflicted = seedPair({ legacyId: 661, targetId: 1508, name: "conflicted" });
+    git(conflicted.path, "checkout", "-b", "other");
+    writeFileSync(join(conflicted.path, "README.md"), "other\n");
+    git(conflicted.path, "commit", "-am", "other");
+    git(conflicted.path, "checkout", "main");
+    writeFileSync(join(conflicted.path, "README.md"), "main\n");
+    git(conflicted.path, "commit", "-am", "main");
+    conflicted.head = git(conflicted.path, "rev-parse", "HEAD");
+    expect(() => git(conflicted.path, "merge", "other")).toThrow();
+    expectCode(() => relocatePrimaryRepo(requestFor(conflicted)), "TARGET_DIRTY");
+
+    const submodule = seedPair({ legacyId: 662, targetId: 1509, name: "submodule" });
+    git(submodule.path, "update-index", "--add", "--cacheinfo", `160000,${submodule.head},vendor/submodule`);
+    git(submodule.path, "commit", "-m", "add gitlink");
+    submodule.head = git(submodule.path, "rev-parse", "HEAD");
+    expectCode(() => relocatePrimaryRepo(requestFor(submodule)), "TARGET_DIRTY");
+  });
+
+  it("ignores repository-local replacement refs when comparing the exact HEAD tree", () => {
+    const pair = seedPair();
+    const originalHead = pair.head;
+    writeFileSync(join(pair.path, "README.md"), "replacement tree\n");
+    git(pair.path, "commit", "-am", "replacement tree");
+    const replacementHead = git(pair.path, "rev-parse", "HEAD");
+    git(pair.path, "replace", originalHead, replacementHead);
+    git(pair.path, "update-ref", "refs/heads/main", originalHead);
+    pair.head = originalHead;
+
+    expect(git(pair.path, "rev-parse", "HEAD")).toBe(originalHead);
+    expect(git(pair.path, "show", "HEAD:README.md")).toBe("replacement tree");
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "TARGET_DIRTY");
   });
 
   it("validates the raw local origin before url.insteadOf rewriting", () => {

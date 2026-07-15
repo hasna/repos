@@ -1,6 +1,18 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import type { Stats } from "node:fs";
 import { userInfo } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getDb } from "./database.js";
@@ -397,7 +409,7 @@ function safeRepo(repo: Repo): Repo {
   };
 }
 
-function runGit(path: string, args: string[]): string {
+function runGitRaw(path: string, args: string[]): Buffer {
   try {
     const env = Object.fromEntries(
       Object.entries(process.env).filter(([key, value]) => !/^GIT_/i.test(key) && value !== undefined),
@@ -406,25 +418,210 @@ function runGit(path: string, args: string[]): string {
     return execFileSync("git", [
       "-c", "core.fsmonitor=false",
       "-c", "core.untrackedCache=false",
+      "-c", `core.excludesFile=${nullDevice}`,
       "-c", `core.hooksPath=${nullDevice}`,
       "-C", path,
       ...args,
     ], {
-      encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
+      maxBuffer: 128 * 1024 * 1024,
       env: {
         ...env,
         GIT_ATTR_NOSYSTEM: "1",
         GIT_CONFIG_GLOBAL: nullDevice,
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_NO_LAZY_FETCH: "1",
+        GIT_NO_REPLACE_OBJECTS: "1",
         GIT_OPTIONAL_LOCKS: "0",
         GIT_TERMINAL_PROMPT: "0",
       },
-    }).trim();
+    });
   } catch (cause) {
     fail("TARGET_NOT_GIT_CHECKOUT", "target is not a readable Git checkout", undefined, cause);
+  }
+}
+
+function runGit(path: string, args: string[]): string {
+  return runGitRaw(path, args).toString("utf8").trim();
+}
+
+interface GitInventoryEntry {
+  mode: string;
+  oid: string;
+  path: Buffer;
+}
+
+function nulRecords(output: Buffer): Buffer[] {
+  if (output.length === 0) return [];
+  if (output[output.length - 1] !== 0) {
+    fail("TARGET_NOT_GIT_CHECKOUT", "target Git inventory is not NUL terminated");
+  }
+  const records: Buffer[] = [];
+  let start = 0;
+  for (let index = 0; index < output.length; index += 1) {
+    if (output[index] !== 0) continue;
+    if (index > start) records.push(output.subarray(start, index));
+    start = index + 1;
+  }
+  return records;
+}
+
+function parseHeadInventory(output: Buffer): Map<string, GitInventoryEntry> {
+  const entries = new Map<string, GitInventoryEntry>();
+  for (const record of nulRecords(output)) {
+    const tab = record.indexOf(0x09);
+    if (tab <= 0 || tab === record.length - 1) {
+      fail("TARGET_NOT_GIT_CHECKOUT", "target HEAD inventory is malformed");
+    }
+    const header = record.subarray(0, tab).toString("ascii");
+    const match = /^(\d{6}) (blob|commit) ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(header);
+    if (!match) fail("TARGET_NOT_GIT_CHECKOUT", "target HEAD inventory is malformed");
+    const path = Buffer.from(record.subarray(tab + 1));
+    const key = path.toString("hex");
+    if (entries.has(key)) fail("TARGET_NOT_GIT_CHECKOUT", "target HEAD has duplicate paths");
+    entries.set(key, { mode: match[1]!, oid: match[3]!, path });
+  }
+  return entries;
+}
+
+function parseIndexInventory(output: Buffer): Map<string, GitInventoryEntry> {
+  const entries = new Map<string, GitInventoryEntry>();
+  for (const record of nulRecords(output)) {
+    const tab = record.indexOf(0x09);
+    if (tab <= 0 || tab === record.length - 1) {
+      fail("TARGET_NOT_GIT_CHECKOUT", "target index inventory is malformed");
+    }
+    const header = record.subarray(0, tab).toString("ascii");
+    const match = /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-3])$/.exec(header);
+    if (!match) fail("TARGET_NOT_GIT_CHECKOUT", "target index inventory is malformed");
+    if (match[3] !== "0") fail("TARGET_DIRTY", "target index contains unresolved entries");
+    const path = Buffer.from(record.subarray(tab + 1));
+    const key = path.toString("hex");
+    if (entries.has(key)) fail("TARGET_DIRTY", "target index contains duplicate entries");
+    entries.set(key, { mode: match[1]!, oid: match[2]!, path });
+  }
+  return entries;
+}
+
+function validateGitPath(path: Buffer): void {
+  if (path.length === 0 || path[0] === 0x2f || path.includes(0) || path.includes(0x5c)) {
+    fail("TARGET_NOT_GIT_CHECKOUT", "target index contains an unsafe path");
+  }
+  for (const segment of path.toString("binary").split("/")) {
+    if (!segment || segment === "." || segment === ".." || segment.toLowerCase() === ".git") {
+      fail("TARGET_NOT_GIT_CHECKOUT", "target index contains an unsafe path");
+    }
+  }
+}
+
+function trackedPath(root: string, path: Buffer): Buffer {
+  validateGitPath(path);
+  return Buffer.concat([Buffer.from(root), Buffer.from("/"), path]);
+}
+
+function assertTrackedParents(root: string, path: Buffer): void {
+  const segments = path.toString("binary").split("/");
+  let current = Buffer.from(root);
+  for (const segment of segments.slice(0, -1)) {
+    current = Buffer.concat([current, Buffer.from("/"), Buffer.from(segment, "binary")]);
+    let parent;
+    try {
+      parent = lstatSync(current);
+    } catch (cause) {
+      fail("TARGET_DIRTY", "target checkout has a missing tracked parent", undefined, cause);
+    }
+    if (!parent.isDirectory() || parent.isSymbolicLink()) {
+      fail("TARGET_DIRTY", "target checkout has an unsafe tracked parent");
+    }
+  }
+}
+
+function readRegularFile(path: Buffer, expected: Stats): Buffer {
+  let descriptor: number | undefined;
+  try {
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    descriptor = openSync(path, fsConstants.O_RDONLY | noFollow);
+    const before = fstatSync(descriptor);
+    if (!before.isFile() || before.dev !== expected.dev || before.ino !== expected.ino) {
+      fail("TARGET_DIRTY", "target tracked file changed during validation");
+    }
+    const content = readFileSync(descriptor);
+    const after = fstatSync(descriptor);
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+      || before.mode !== after.mode
+    ) fail("TARGET_DIRTY", "target tracked file changed during validation");
+    return content;
+  } catch (error) {
+    if (error instanceof PrimaryRelocationError) throw error;
+    fail("TARGET_DIRTY", "target tracked file cannot be read safely", undefined, error);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+  throw new Error("unreachable");
+}
+
+function blobOid(content: Buffer, objectFormat: "sha1" | "sha256"): string {
+  return createHash(objectFormat)
+    .update(`blob ${content.length}\0`, "utf8")
+    .update(content)
+    .digest("hex");
+}
+
+function validateCleanCheckout(path: string): void {
+  const objectFormat = runGit(path, ["rev-parse", "--show-object-format"]);
+  if (objectFormat !== "sha1" && objectFormat !== "sha256") {
+    fail("TARGET_NOT_GIT_CHECKOUT", "target uses an unsupported Git object format");
+  }
+  const headEntries = parseHeadInventory(runGitRaw(path, ["ls-tree", "--full-tree", "-r", "-z", "HEAD"]));
+  const indexEntries = parseIndexInventory(runGitRaw(path, ["ls-files", "--stage", "-z"]));
+  const supportedModes = new Set(["100644", "100755", "120000"]);
+
+  if (headEntries.size !== indexEntries.size) fail("TARGET_DIRTY", "target index differs from HEAD");
+  for (const [key, headEntry] of headEntries) {
+    const indexEntry = indexEntries.get(key);
+    if (
+      !indexEntry
+      || !supportedModes.has(headEntry.mode)
+      || !supportedModes.has(indexEntry.mode)
+      || headEntry.mode !== indexEntry.mode
+      || headEntry.oid !== indexEntry.oid
+    ) fail("TARGET_DIRTY", "target index differs from HEAD or contains an unsupported entry");
+  }
+
+  for (const entry of indexEntries.values()) {
+    assertTrackedParents(path, entry.path);
+    const worktreePath = trackedPath(path, entry.path);
+    let worktreeStat;
+    try {
+      worktreeStat = lstatSync(worktreePath);
+    } catch (cause) {
+      fail("TARGET_DIRTY", "target checkout is missing a tracked entry", undefined, cause);
+    }
+
+    let content: Buffer;
+    let worktreeMode: string;
+    if (worktreeStat.isSymbolicLink()) {
+      worktreeMode = "120000";
+      content = readlinkSync(worktreePath, { encoding: "buffer" });
+    } else if (worktreeStat.isFile()) {
+      worktreeMode = (worktreeStat.mode & 0o111) === 0 ? "100644" : "100755";
+      content = readRegularFile(worktreePath, worktreeStat);
+    } else {
+      fail("TARGET_DIRTY", "target checkout contains an unsupported tracked entry type");
+    }
+    if (worktreeMode !== entry.mode || blobOid(content, objectFormat) !== entry.oid) {
+      fail("TARGET_DIRTY", "target tracked bytes or mode differ from the index");
+    }
+  }
+
+  if (nulRecords(runGitRaw(path, ["ls-files", "--others", "--exclude-standard", "-z"])).length > 0) {
+    fail("TARGET_DIRTY", "target checkout contains non-ignored untracked entries");
   }
 }
 
@@ -462,12 +659,7 @@ function validateTarget(targetPath: string, root: string, remote: string, head: 
     if (runGit(realTarget, ["rev-parse", "--verify", "HEAD^{commit}"]) !== head) {
       fail("HEAD_MISMATCH", "target HEAD does not match the exact expected object ID");
     }
-    if (runGit(realTarget, [
-      "status",
-      "--porcelain=v1",
-      "--untracked-files=all",
-      "--ignore-submodules=none",
-    ])) fail("TARGET_DIRTY", "target checkout is dirty");
+    validateCleanCheckout(realTarget);
   } catch (error) {
     if (error instanceof PrimaryRelocationError) throw error;
     fail("TARGET_NOT_GIT_CHECKOUT", "target cannot be inspected safely", undefined, error);

@@ -130,7 +130,11 @@ The source checkout is never read: it may be missing, dirty, or divergent becaus
 the operation changes registry authority, not source files. Its database ID,
 path, revision, and sanitized remote remain mandatory guards. The registered
 target must be canonical, clean, exact-HEAD, remote-matched, and free of path
-aliases. Dry run emits a request hash, plan hash, per-table counts, and hashed
+aliases. Cleanliness is verified without `git status`, worktree diff, hooks,
+fsmonitor, or repository-defined conversion callbacks: the command compares the
+HEAD tree, stage-0 index, raw regular-file or symlink bytes, executable modes,
+and non-ignored untracked inventory, and rejects conflicts or unsupported
+entries. Dry run emits a request hash, plan hash, per-table counts, and hashed
 collision decisions. Exact duplicate children may be deduplicated; divergent
 commit, branch, tag, remote, PR, edge, or unknown foreign-key state blocks apply
 without choosing a winner. Apply revalidates the plan under one immediate SQLite
