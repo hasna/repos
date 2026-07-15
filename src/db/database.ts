@@ -39,6 +39,37 @@ export function getDbPath(): string {
 
 let _db: Database | null = null;
 let _dbPath: string | null = null;
+const WAL_NEGOTIATION_TIMEOUT_MS = 5_000;
+const WAL_NEGOTIATION_WAIT_MS = 10;
+const walNegotiationWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+
+function isSqliteLockContention(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const sqlite = error as { code?: unknown; errno?: unknown };
+  return sqlite.code === "SQLITE_BUSY"
+    || sqlite.code === "SQLITE_LOCKED"
+    || sqlite.errno === 5
+    || sqlite.errno === 6;
+}
+
+function enableWalWithBoundedRetry(db: Database): void {
+  const deadline = performance.now() + WAL_NEGOTIATION_TIMEOUT_MS;
+  while (true) {
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+      return;
+    } catch (error) {
+      const remaining = deadline - performance.now();
+      if (!isSqliteLockContention(error) || remaining <= 0) throw error;
+      Atomics.wait(
+        walNegotiationWait,
+        0,
+        0,
+        Math.min(WAL_NEGOTIATION_WAIT_MS, remaining),
+      );
+    }
+  }
+}
 
 export function getDb(customPath?: string): Database {
   const path = customPath || getDbPath();
@@ -50,17 +81,27 @@ export function getDb(customPath?: string): Database {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 
-  _db = new Database(path);
+  const db = new Database(path);
+  try {
+    // Install the bounded lock wait before journal-mode negotiation: a group
+    // of processes may all be opening and migrating the same new database.
+    db.exec("PRAGMA busy_timeout = 5000");
+    // SQLite's journal-mode PRAGMA can still return SQLITE_BUSY immediately
+    // while another first opener is negotiating WAL, without invoking the
+    // connection busy handler. Retry only that bounded first-open boundary.
+    enableWalWithBoundedRetry(db);
+    db.exec("PRAGMA synchronous = NORMAL");
+    db.exec("PRAGMA foreign_keys = ON");
+
+    runMigrations(db);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+
+  _db = db;
   _dbPath = path;
-
-  _db.exec("PRAGMA journal_mode = WAL");
-  _db.exec("PRAGMA busy_timeout = 5000");
-  _db.exec("PRAGMA synchronous = NORMAL");
-  _db.exec("PRAGMA foreign_keys = ON");
-
-  runMigrations(_db);
-
-  return _db;
+  return db;
 }
 
 export function closeDb(): void {
@@ -78,14 +119,20 @@ function runMigrations(db: Database): void {
     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
 
-  const applied = new Set(
-    db.query("SELECT version FROM migrations").all().map((r: any) => r.version)
-  );
-
   for (const migration of MIGRATIONS) {
-    if (!applied.has(migration.version)) {
-      db.exec(migration.sql);
-      db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      // Another process may have completed this migration while this process
+      // waited for the write lock, so the marker must be read under that lock.
+      const applied = db.query("SELECT 1 FROM migrations WHERE version = ?").get(migration.version);
+      if (!applied) {
+        db.exec(migration.sql);
+        db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve the migration failure */ }
+      throw error;
     }
   }
 }
@@ -287,6 +334,90 @@ const MIGRATIONS = [
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+    `,
+  },
+  {
+    // Version 5 is already used by the live worktree lease schema. Keep the
+    // relocation audit on its own version so upgrades never skip it.
+    version: 6,
+    sql: `
+      CREATE TABLE IF NOT EXISTS repo_relocation_audit (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE RESTRICT,
+        target_repo_id INTEGER NOT NULL,
+        operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
+        actor TEXT NOT NULL,
+        expected_current_path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        expected_remote TEXT NOT NULL,
+        expected_head TEXT NOT NULL,
+        source_revision TEXT NOT NULL,
+        target_revision TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL,
+        counts_json TEXT NOT NULL,
+        collisions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_repo_relocation_audit_repo
+        ON repo_relocation_audit(repo_id, created_at);
+    `,
+  },
+  {
+    // Relocation receipts are immutable historical facts. A receipt's repo_id
+    // identifies the survivor at the time of that exact operation; it must not
+    // be rewritten merely because that survivor is absorbed later. Rebuild the
+    // live v6 table without a current-state repos FK so chained relocations can
+    // delete a later target row without changing any prior receipt bytes.
+    version: 7,
+    sql: `
+      DROP INDEX IF EXISTS idx_repo_relocation_audit_repo;
+
+      CREATE TABLE repo_relocation_audit_v7 (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        repo_id INTEGER NOT NULL,
+        target_repo_id INTEGER NOT NULL,
+        operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
+        actor TEXT NOT NULL,
+        expected_current_path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        expected_remote TEXT NOT NULL,
+        expected_head TEXT NOT NULL,
+        source_revision TEXT NOT NULL,
+        target_revision TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL,
+        counts_json TEXT NOT NULL,
+        collisions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      INSERT INTO repo_relocation_audit_v7 (
+        id, idempotency_key, request_hash, plan_hash, repo_id, target_repo_id,
+        operation, actor, expected_current_path, target_path, expected_remote,
+        expected_head, source_revision, target_revision, source_json,
+        target_json, after_json, counts_json, collisions_json, created_at
+      ) SELECT
+        id, idempotency_key, request_hash, plan_hash, repo_id, target_repo_id,
+        operation, actor, expected_current_path, target_path, expected_remote,
+        expected_head, source_revision, target_revision, source_json,
+        target_json, after_json, counts_json, collisions_json, created_at
+      FROM repo_relocation_audit;
+
+      DROP TABLE repo_relocation_audit;
+      ALTER TABLE repo_relocation_audit_v7 RENAME TO repo_relocation_audit;
+
+      CREATE INDEX idx_repo_relocation_audit_repo
+        ON repo_relocation_audit(repo_id, created_at);
     `,
   },
 ];
