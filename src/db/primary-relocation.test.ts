@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  renameSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -44,6 +46,19 @@ function checkout(name: string, remote = `https://github.com/hasna/${name}.git`)
   return { path, head: git(path, "rev-parse", "HEAD") };
 }
 
+function linkedCheckout(authorityPath: string, path: string, name: string) {
+  mkdirSync(authorityPath, { recursive: true });
+  git(authorityPath, "init", "-b", "main");
+  git(authorityPath, "config", "user.email", "repos-test@invalid.example");
+  git(authorityPath, "config", "user.name", "Repos Test");
+  git(authorityPath, "remote", "add", "origin", `https://github.com/hasna/${name}.git`);
+  writeFileSync(join(authorityPath, "README.md"), `# ${name}\n`);
+  git(authorityPath, "add", "README.md");
+  git(authorityPath, "commit", "-m", "initial");
+  git(authorityPath, "worktree", "add", "-b", `canonical-${name}`, path, "HEAD");
+  return { path, head: git(path, "rev-parse", "HEAD") };
+}
+
 function insertRepo(id: number, path: string, name: string, remote = `https://github.com/hasna/${name}.git`) {
   getDb().query(`INSERT INTO repos (
     id, path, name, org, remote_url, default_branch, description,
@@ -52,11 +67,17 @@ function insertRepo(id: number, path: string, name: string, remote = `https://gi
     .run(id, path, name, remote, `revision-${id}`);
 }
 
-function seedPair(options: { legacyId?: number; targetId?: number; name?: string; sourcePath?: string } = {}) {
+function seedPair(options: {
+  legacyId?: number;
+  targetId?: number;
+  name?: string;
+  sourcePath?: string;
+  target?: { path: string; head: string };
+} = {}) {
   const legacyId = options.legacyId ?? 661;
   const targetId = options.targetId ?? 1508;
   const name = options.name ?? "accounts";
-  const target = checkout(`${name}-canonical`, `https://github.com/hasna/${name}.git`);
+  const target = options.target ?? checkout(`${name}-canonical`, `https://github.com/hasna/${name}.git`);
   const sourcePath = options.sourcePath ?? join(root, "source-state-is-never-read", name);
   insertRepo(legacyId, sourcePath, name, `https://legacy-token@github.com/hasna/${name}.git`);
   insertRepo(targetId, target.path, name, `git@github.com:hasna/${name}.git`);
@@ -278,6 +299,164 @@ describe("primary relocation v2 reconciliation", () => {
     git(escaped, "commit", "-m", "escaped");
     getDb().query("UPDATE repos SET path = ? WHERE id = ?").run(escaped, pair.targetId);
     expectCode(() => relocatePrimaryRepo(requestFor({ ...pair, path: escaped, head: git(escaped, "rev-parse", "HEAD") })), "TARGET_OUTSIDE_ROOT");
+  });
+
+  it("rejects a canonical-path linked worktree whose Git common directory is outside the trusted root", () => {
+    const name = "external-common";
+    const target = linkedCheckout(
+      join(root, "external-authorities", name),
+      join(canonicalRoot, `${name}-canonical`),
+      name,
+    );
+    const pair = seedPair({ name, target });
+
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "TARGET_OUTSIDE_ROOT");
+  });
+
+  it("rejects a gitfile that escapes to an external Git directory", () => {
+    const pair = seedPair({ name: "gitfile-escape" });
+    const externalGitDir = join(root, "external-gitdirs", "gitfile-escape.git");
+    mkdirSync(join(root, "external-gitdirs"), { recursive: true });
+    renameSync(join(pair.path, ".git"), externalGitDir);
+    writeFileSync(join(pair.path, ".git"), `gitdir: ${externalGitDir}\n`);
+
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "TARGET_OUTSIDE_ROOT");
+  });
+
+  it("rejects symlink escapes in the Git common and object directories", () => {
+    const commonName = "common-symlink";
+    const commonAuthority = join(root, "external-authorities", commonName);
+    const commonTarget = linkedCheckout(
+      commonAuthority,
+      join(canonicalRoot, `${commonName}-canonical`),
+      commonName,
+    );
+    const externalGitDir = git(commonTarget.path, "rev-parse", "--absolute-git-dir");
+    const internalGitDir = join(canonicalRoot, "gitdirs", commonName);
+    mkdirSync(join(canonicalRoot, "gitdirs"), { recursive: true });
+    cpSync(externalGitDir, internalGitDir, { recursive: true });
+    const commonLink = join(canonicalRoot, "common-links", commonName);
+    mkdirSync(join(canonicalRoot, "common-links"), { recursive: true });
+    symlinkSync(join(commonAuthority, ".git"), commonLink, "dir");
+    writeFileSync(join(commonTarget.path, ".git"), `gitdir: ${internalGitDir}\n`);
+    writeFileSync(join(internalGitDir, "commondir"), `${commonLink}\n`);
+    expect(git(commonTarget.path, "rev-parse", "HEAD")).toBe(commonTarget.head);
+    const commonPair = seedPair({ name: commonName, target: commonTarget });
+    expectCode(() => relocatePrimaryRepo(requestFor(commonPair)), "TARGET_OUTSIDE_ROOT");
+
+    const objectPair = seedPair({ legacyId: 662, targetId: 1509, name: "object-symlink" });
+    const externalObjects = join(root, "external-objects", "object-symlink");
+    mkdirSync(join(root, "external-objects"), { recursive: true });
+    renameSync(join(objectPair.path, ".git", "objects"), externalObjects);
+    symlinkSync(externalObjects, join(objectPair.path, ".git", "objects"), "dir");
+    expectCode(() => relocatePrimaryRepo(requestFor(objectPair)), "TARGET_OUTSIDE_ROOT");
+  });
+
+  it("rejects nested pack and loose-object fanout symlink escapes", () => {
+    const packed = seedPair({ name: "pack-symlink" });
+    const externalPack = join(root, "external-objects", "pack-symlink");
+    mkdirSync(join(root, "external-objects"), { recursive: true });
+    renameSync(join(packed.path, ".git", "objects", "pack"), externalPack);
+    symlinkSync(externalPack, join(packed.path, ".git", "objects", "pack"), "dir");
+    expectCode(() => relocatePrimaryRepo(requestFor(packed)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+
+    const loose = seedPair({ legacyId: 662, targetId: 1509, name: "loose-symlink" });
+    const fanout = loose.head.slice(0, 2);
+    const externalFanout = join(root, "external-objects", `loose-${fanout}`);
+    renameSync(join(loose.path, ".git", "objects", fanout), externalFanout);
+    symlinkSync(externalFanout, join(loose.path, ".git", "objects", fanout), "dir");
+    expectCode(() => relocatePrimaryRepo(requestFor(loose)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
+  it("rejects external common and per-worktree config-file authority", () => {
+    const common = seedPair({ name: "config-symlink" });
+    const externalConfig = join(root, "external-configs", "common.config");
+    mkdirSync(join(root, "external-configs"), { recursive: true });
+    renameSync(join(common.path, ".git", "config"), externalConfig);
+    symlinkSync(externalConfig, join(common.path, ".git", "config"));
+    expectCode(() => relocatePrimaryRepo(requestFor(common)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+
+    const name = "worktree-config-symlink";
+    const target = linkedCheckout(
+      join(canonicalRoot, "anchors", name),
+      join(canonicalRoot, `${name}-canonical`),
+      name,
+    );
+    git(target.path, "config", "extensions.worktreeConfig", "true");
+    git(target.path, "config", "--worktree", "relocation.fixture", "safe");
+    const gitDir = git(target.path, "rev-parse", "--absolute-git-dir");
+    const externalWorktreeConfig = join(root, "external-configs", "worktree.config");
+    renameSync(join(gitDir, "config.worktree"), externalWorktreeConfig);
+    symlinkSync(externalWorktreeConfig, join(gitDir, "config.worktree"));
+    const worktree = seedPair({ legacyId: 662, targetId: 1509, name, target });
+    expectCode(() => relocatePrimaryRepo(requestFor(worktree)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
+  it("rejects an external info directory that hides untracked files through exclude metadata", () => {
+    const pair = seedPair({ name: "external-info" });
+    const externalInfo = join(root, "external-info");
+    renameSync(join(pair.path, ".git", "info"), externalInfo);
+    writeFileSync(join(externalInfo, "exclude"), "*\n");
+    symlinkSync(externalInfo, join(pair.path, ".git", "info"), "dir");
+    writeFileSync(join(pair.path, "hidden-untracked.txt"), "must remain visible to validation\n");
+    expect(git(pair.path, "ls-files", "--others", "--exclude-standard")).toBe("");
+
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
+  it("rejects nonempty object alternates and HTTP alternates", () => {
+    const alternate = seedPair({ name: "alternate" });
+    const alternateObjects = join(root, "alternate-objects");
+    mkdirSync(alternateObjects, { recursive: true });
+    mkdirSync(join(alternate.path, ".git", "objects", "info"), { recursive: true });
+    writeFileSync(join(alternate.path, ".git", "objects", "info", "alternates"), `${alternateObjects}\n`);
+    expectCode(() => relocatePrimaryRepo(requestFor(alternate)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+
+    const http = seedPair({ legacyId: 662, targetId: 1509, name: "http-alternate" });
+    mkdirSync(join(http.path, ".git", "objects", "info"), { recursive: true });
+    writeFileSync(
+      join(http.path, ".git", "objects", "info", "http-alternates"),
+      "https://objects.invalid/repository/objects\n",
+    );
+    expectCode(() => relocatePrimaryRepo(requestFor(http)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
+  it("rejects repository-local promisor and partial-clone configuration", () => {
+    const promisor = seedPair({ name: "promisor" });
+    git(promisor.path, "config", "remote.origin.promisor", "true");
+    expectCode(() => relocatePrimaryRepo(requestFor(promisor)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+
+    const partial = seedPair({ legacyId: 662, targetId: 1509, name: "partial" });
+    git(partial.path, "config", "core.repositoryFormatVersion", "1");
+    git(partial.path, "config", "extensions.partialClone", "origin");
+    git(partial.path, "config", "remote.origin.partialCloneFilter", "blob:none");
+    expectCode(() => relocatePrimaryRepo(requestFor(partial)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+
+    const included = seedPair({ legacyId: 663, targetId: 1510, name: "included-promisor" });
+    const includePath = join(root, "external-promisor.config");
+    writeFileSync(includePath, "[remote \"origin\"]\n\tpromisor = true\n");
+    git(included.path, "config", "include.path", includePath);
+    expectCode(() => relocatePrimaryRepo(requestFor(included)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
+  it("fails closed when object authority metadata is unreadable", () => {
+    const pair = seedPair({ name: "unreadable-authority" });
+    const metadata = join(pair.path, ".git", "objects", "info", "alternates");
+    writeFileSync(metadata, "");
+    chmodSync(metadata, 0o000);
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "TARGET_NOT_GIT_CHECKOUT");
+  });
+
+  it("accepts a linked worktree whose common directory and objects remain inside the trusted root", () => {
+    const name = "internal-anchor";
+    const target = linkedCheckout(
+      join(canonicalRoot, "anchors", name),
+      join(canonicalRoot, `${name}-canonical`),
+      name,
+    );
+    const pair = seedPair({ name, target });
+
+    expect(relocatePrimaryRepo(requestFor(pair)).ok).toBe(true);
   });
 
   it("ignores inherited Git controls and cannot be tricked into hiding untracked target files", () => {

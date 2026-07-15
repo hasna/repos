@@ -130,7 +130,13 @@ The source checkout is never read: it may be missing, dirty, or divergent becaus
 the operation changes registry authority, not source files. Its database ID,
 path, revision, and sanitized remote remain mandatory guards. The registered
 target must be canonical, clean, exact-HEAD, remote-matched, and free of path
-aliases. Cleanliness is verified without `git status`, worktree diff, hooks,
+aliases. Its checkout, Git directory, common directory, and primary object
+directory must all resolve inside the trusted worktree root. Nonempty object
+alternates, HTTP alternates, partial-clone/promisor settings, and repository
+config includes are rejected before refs or objects are read. This still allows
+bundle-derived anchors and linked worktrees when their full Git authority stays
+inside the trusted root. Cleanliness is verified without `git status`, worktree
+diff, hooks,
 fsmonitor, or repository-defined conversion callbacks: the command compares the
 HEAD tree, stage-0 index, raw regular-file or symlink bytes, executable modes,
 and non-ignored untracked inventory, and rejects conflicts or unsupported

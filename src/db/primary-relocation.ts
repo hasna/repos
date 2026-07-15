@@ -7,6 +7,7 @@ import {
   fstatSync,
   lstatSync,
   openSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -49,6 +50,7 @@ export type PrimaryRelocationErrorCode =
   | "TARGET_MISSING"
   | "TARGET_NOT_CANONICAL"
   | "TARGET_OUTSIDE_ROOT"
+  | "TARGET_UNTRUSTED_GIT_AUTHORITY"
   | "TRUSTED_HOME_UNAVAILABLE"
   | "TARGET_NOT_GIT_CHECKOUT"
   | "TARGET_DIRTY"
@@ -446,6 +448,230 @@ function runGit(path: string, args: string[]): string {
   return runGitRaw(path, args).toString("utf8").trim();
 }
 
+function errnoCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+
+function reportedGitPath(path: string, args: string[], label: string): string {
+  const reported = runGit(path, args);
+  if (reported.includes("\n") || reported.includes("\r")) {
+    fail("TARGET_NOT_GIT_CHECKOUT", `${label} is not a single absolute path`);
+  }
+  return normalizeAbsolutePath(reported, label);
+}
+
+function containedGitAuthorityPath(reported: string, root: string, label: string): string {
+  if (!isWithin(root, reported)) {
+    fail("TARGET_OUTSIDE_ROOT", `${label} is outside the trusted canonical root`);
+  }
+  try {
+    const resolved = realpathSync(reported);
+    if (!isWithin(root, resolved)) {
+      fail("TARGET_OUTSIDE_ROOT", `${label} resolves outside the trusted canonical root`);
+    }
+    if (!statSync(resolved).isDirectory()) {
+      fail("TARGET_NOT_GIT_CHECKOUT", `${label} is not a directory`);
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof PrimaryRelocationError) throw error;
+    fail("TARGET_NOT_GIT_CHECKOUT", `${label} cannot be resolved safely`, undefined, error);
+  }
+}
+
+function readAuthorityMetadata(path: string, label: string): Buffer | null {
+  let expected: Stats;
+  try {
+    expected = lstatSync(path);
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") return null;
+    fail("TARGET_NOT_GIT_CHECKOUT", `${label} cannot be inspected safely`, undefined, error);
+  }
+  if (expected.isSymbolicLink()) {
+    fail("TARGET_UNTRUSTED_GIT_AUTHORITY", `${label} cannot be a symbolic link`);
+  }
+  if (!expected.isFile() || (expected.mode & 0o444) === 0) {
+    fail("TARGET_NOT_GIT_CHECKOUT", `${label} is not a readable regular file`);
+  }
+
+  let descriptor: number | undefined;
+  try {
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    descriptor = openSync(path, fsConstants.O_RDONLY | noFollow);
+    const before = fstatSync(descriptor);
+    if (!before.isFile() || before.dev !== expected.dev || before.ino !== expected.ino) {
+      fail("TARGET_NOT_GIT_CHECKOUT", `${label} changed during validation`);
+    }
+    const content = readFileSync(descriptor);
+    const after = fstatSync(descriptor);
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+      || before.mode !== after.mode
+    ) fail("TARGET_NOT_GIT_CHECKOUT", `${label} changed during validation`);
+    return content;
+  } catch (error) {
+    if (error instanceof PrimaryRelocationError) throw error;
+    fail("TARGET_NOT_GIT_CHECKOUT", `${label} cannot be read safely`, undefined, error);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+  throw new Error("unreachable");
+}
+
+function assertContainedAuthorityTree(path: string, root: string, label: string, required: boolean): void {
+  const pending = [path];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    let currentStat: Stats;
+    try {
+      currentStat = lstatSync(current);
+    } catch (error) {
+      if (!required && current === path && errnoCode(error) === "ENOENT") return;
+      fail("TARGET_NOT_GIT_CHECKOUT", `${label} cannot be inspected safely`, undefined, error);
+    }
+    if (currentStat.isSymbolicLink()) {
+      fail("TARGET_UNTRUSTED_GIT_AUTHORITY", `${label} cannot contain symbolic links`);
+    }
+    if (!isWithin(root, realpathSync(current))) {
+      fail("TARGET_OUTSIDE_ROOT", `${label} resolves outside the trusted canonical root`);
+    }
+    if (currentStat.isDirectory()) {
+      let entries;
+      try {
+        entries = readdirSync(current, { withFileTypes: true });
+      } catch (error) {
+        fail("TARGET_NOT_GIT_CHECKOUT", `${label} cannot be read safely`, undefined, error);
+      }
+      for (const entry of entries) pending.push(join(current, entry.name));
+      continue;
+    }
+    if (!currentStat.isFile() || (currentStat.mode & 0o444) === 0) {
+      fail("TARGET_NOT_GIT_CHECKOUT", `${label} contains an unreadable or unsupported entry`);
+    }
+  }
+}
+
+function assertSafeGitMetadataFiles(gitDir: string, common: string, root: string): void {
+  if (!readAuthorityMetadata(join(common, "config"), "target common Git config")) {
+    fail("TARGET_NOT_GIT_CHECKOUT", "target common Git config is missing");
+  }
+  assertContainedAuthorityTree(join(common, "info"), root, "target common Git info", false);
+  for (const [path, label] of [
+    [join(gitDir, "HEAD"), "target Git HEAD"],
+    [join(gitDir, "index"), "target Git index"],
+    [join(gitDir, "commondir"), "target Git common-directory pointer"],
+    [join(gitDir, "gitdir"), "target Git worktree pointer"],
+    [join(gitDir, "config.worktree"), "target worktree Git config"],
+    [join(common, "packed-refs"), "target packed refs"],
+    [join(common, "info", "exclude"), "target Git exclude metadata"],
+  ] as const) readAuthorityMetadata(path, label);
+  assertContainedAuthorityTree(join(common, "refs"), root, "target Git refs", false);
+}
+
+function assertNoObjectAlternates(objects: string, root: string): void {
+  const info = join(objects, "info");
+  try {
+    const infoStat = lstatSync(info);
+    if (infoStat.isSymbolicLink() || !infoStat.isDirectory()) {
+      fail("TARGET_NOT_GIT_CHECKOUT", "target object authority metadata directory is unsafe");
+    }
+    if (!isWithin(root, realpathSync(info))) {
+      fail("TARGET_OUTSIDE_ROOT", "target object authority metadata resolves outside the trusted canonical root");
+    }
+  } catch (error) {
+    if (error instanceof PrimaryRelocationError) throw error;
+    if (errnoCode(error) === "ENOENT") return;
+    fail("TARGET_NOT_GIT_CHECKOUT", "target object authority metadata cannot be inspected safely", undefined, error);
+  }
+
+  for (const name of ["alternates", "http-alternates"]) {
+    const content = readAuthorityMetadata(join(info, name), `target object ${name} metadata`);
+    if (content && content.length > 0) {
+      fail("TARGET_UNTRUSTED_GIT_AUTHORITY", "target uses external Git object authority");
+    }
+  }
+}
+
+interface LocalConfigEntry {
+  key: string;
+  value: string;
+}
+
+function localConfigEntries(path: string, scope: "--local" | "--worktree"): LocalConfigEntry[] {
+  return nulRecords(runGitRaw(path, ["config", scope, "--no-includes", "--null", "--list"]))
+    .map((record) => {
+      const separator = record.indexOf(0x0a);
+      if (separator <= 0) fail("TARGET_NOT_GIT_CHECKOUT", "target local Git config is malformed");
+      return {
+        key: record.subarray(0, separator).toString("utf8").toLowerCase(),
+        value: record.subarray(separator + 1).toString("utf8"),
+      };
+    });
+}
+
+function assertNoPromisorConfig(path: string): void {
+  const local = localConfigEntries(path, "--local");
+  const worktreeConfig = local.some(({ key, value }) => (
+    key === "extensions.worktreeconfig"
+    && ["", "1", "true", "yes", "on"].includes(value.trim().toLowerCase())
+  ));
+  const entries = worktreeConfig ? [...local, ...localConfigEntries(path, "--worktree")] : local;
+  for (const { key } of entries) {
+    if (
+      key === "extensions.partialclone"
+      || /^remote\..+\.promisor$/.test(key)
+      || /^remote\..+\.partialclonefilter$/.test(key)
+    ) fail("TARGET_UNTRUSTED_GIT_AUTHORITY", "target has repository-local partial-clone authority");
+    if (key === "include.path" || /^includeif\..+\.path$/.test(key)) {
+      fail("TARGET_UNTRUSTED_GIT_AUTHORITY", "target local Git config delegates to an external config authority");
+    }
+  }
+}
+
+function validateGitAuthority(path: string, root: string): void {
+  const topLevel = containedGitAuthorityPath(
+    reportedGitPath(path, ["rev-parse", "--path-format=absolute", "--show-toplevel"], "target top-level"),
+    root,
+    "target top-level",
+  );
+  if (topLevel !== path) fail("TARGET_NOT_GIT_CHECKOUT", "target must be the checkout top-level");
+
+  const gitDir = containedGitAuthorityPath(
+    reportedGitPath(path, ["rev-parse", "--absolute-git-dir"], "target Git directory"),
+    root,
+    "target Git directory",
+  );
+  const common = containedGitAuthorityPath(
+    reportedGitPath(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"], "target Git common directory"),
+    root,
+    "target Git common directory",
+  );
+  const objects = containedGitAuthorityPath(
+    reportedGitPath(path, ["rev-parse", "--path-format=absolute", "--git-path", "objects"], "target object directory"),
+    root,
+    "target object directory",
+  );
+  let expectedObjects: string;
+  try {
+    expectedObjects = realpathSync(join(common, "objects"));
+  } catch (error) {
+    fail("TARGET_NOT_GIT_CHECKOUT", "target common object directory cannot be resolved safely", undefined, error);
+  }
+  if (objects !== expectedObjects) {
+    fail("TARGET_UNTRUSTED_GIT_AUTHORITY", "target object authority differs from its Git common directory");
+  }
+  assertContainedAuthorityTree(objects, root, "target object authority", true);
+  assertNoObjectAlternates(objects, root);
+  assertSafeGitMetadataFiles(gitDir, common, root);
+  assertNoPromisorConfig(path);
+}
+
 interface GitInventoryEntry {
   mode: string;
   oid: string;
@@ -648,9 +874,10 @@ function validateTarget(targetPath: string, root: string, remote: string, head: 
     const realTarget = realpathSync(targetPath);
     if (realTarget !== targetPath) fail("TARGET_NOT_CANONICAL", "target path cannot be a symlink alias");
     if (!isWithin(realRoot, realTarget)) fail("TARGET_OUTSIDE_ROOT", "target is outside the trusted canonical root");
-    if (realpathSync(runGit(realTarget, ["rev-parse", "--show-toplevel"])) !== realTarget) {
-      fail("TARGET_NOT_GIT_CHECKOUT", "target must be the checkout top-level");
-    }
+    // Establish filesystem and object ownership before reading refs, objects, or
+    // repository-controlled attributes. These plumbing calls cannot invoke
+    // conversion filters, hooks, credential helpers, or lazy object fetches.
+    validateGitAuthority(realTarget, realRoot);
     // Read the local config value directly: `remote get-url` applies url.*.insteadOf
     // rewrites and can make a different raw origin impersonate the expected one.
     if (sanitizeCheckoutRemoteUrl(rawOriginUrl(realTarget)) !== remote) {
