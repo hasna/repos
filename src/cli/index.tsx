@@ -22,7 +22,6 @@ import {
   relocatePrimaryRepo,
 } from "../db/primary-relocation.js";
 import {
-  cleanupRemoteIdentities,
   ensureWorkspaceBootstrap,
   startAutoIndexWorker,
 } from "../lib/auto-index.js";
@@ -473,50 +472,6 @@ registry
         console.log(JSON.stringify({ schema: "open-repos.primary-relocation.v2", ok: false, error: { code, message, details } }, null, 2));
       } else {
         console.error(chalk.red(`${code}: ${message}`));
-      }
-      process.exitCode = 1;
-    }
-  });
-
-registry
-  .command("cleanup-remote-identities")
-  .description("Plan or apply the audited PostgreSQL remote-identity cleanup")
-  .requiredOption("--actor <actor>", "Auditable operator or workflow identity")
-  .requiredOption("--idempotency-key <key>", "Stable unique key for this cleanup attempt")
-  .option("--expected-plan-hash <sha256>", "Exact hash emitted by dry-run; required with --apply")
-  .option("--database-schema <schema>", "Explicit app-owned PostgreSQL schema")
-  .option("--dry-run", "Plan and audit without rewriting catalog data (default)")
-  .option("--apply", "Apply the exact reviewed cleanup plan atomically")
-  .option("--json", "Output the versioned JSON result")
-  .action(async (opts) => {
-    try {
-      if (opts.apply && opts.dryRun) {
-        throw new Error("--apply and --dry-run are mutually exclusive");
-      }
-      const result = await cleanupRemoteIdentities({
-        actor: opts.actor,
-        idempotencyKey: opts.idempotencyKey,
-        apply: Boolean(opts.apply),
-        expectedPlanHash: opts.expectedPlanHash,
-        databaseSchema: opts.databaseSchema,
-      });
-      if (opts.json) {
-        console.log(JSON.stringify(result, null, 2));
-      } else {
-        const mode = result.applied ? "Applied" : "Dry run";
-        console.log(`${mode}: repos=${result.counts.repos_update} remotes=${result.counts.remotes_update} delete=${result.counts.remotes_delete}`);
-        console.log(chalk.dim(`  Plan: ${result.plan_hash}`));
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "remote identity cleanup failed";
-      if (opts.json) {
-        console.log(JSON.stringify({
-          schema: "open-repos.remote-identity-cleanup.v1",
-          ok: false,
-          error: { code: "REMOTE_IDENTITY_CLEANUP_FAILED", message },
-        }, null, 2));
-      } else {
-        console.error(chalk.red(`REMOTE_IDENTITY_CLEANUP_FAILED: ${message}`));
       }
       process.exitCode = 1;
     }

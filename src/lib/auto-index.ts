@@ -321,6 +321,18 @@ type RemoteCleanupChange =
       delete: false;
     };
 
+interface RemoteCleanupSearchVectorChange {
+  id: number;
+  before: unknown;
+  target: string;
+}
+
+class RemoteIdentityCleanupFailure extends Error {}
+
+function cleanupFailure(message: string): RemoteIdentityCleanupFailure {
+  return new RemoteIdentityCleanupFailure(message);
+}
+
 function cleanupPlanHash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -355,13 +367,16 @@ export async function cleanupRemoteIdentities(
   options: RemoteIdentityCleanupOptions,
 ): Promise<RemoteIdentityCleanupSummary> {
   const version = options.version ?? 1;
-  const actor = options.actor.trim();
-  const idempotencyKey = options.idempotencyKey.trim();
+  const actor = typeof options.actor === "string" ? options.actor.trim() : "";
+  const idempotencyKey = typeof options.idempotencyKey === "string" ? options.idempotencyKey.trim() : "";
   if (version !== 1 || !actor || !idempotencyKey) {
-    throw new Error("remote identity cleanup request is invalid");
+    throw cleanupFailure("remote identity cleanup request is invalid");
   }
   if (options.apply && !options.expectedPlanHash) {
-    throw new Error("remote identity cleanup apply requires an expected plan hash");
+    throw cleanupFailure("remote identity cleanup apply requires an expected plan hash");
+  }
+  if (options.apply && !/^[0-9a-f]{64}$/.test(options.expectedPlanHash!)) {
+    throw cleanupFailure("remote identity cleanup expected plan hash is invalid");
   }
 
   const databaseUrl = options.databaseUrl
@@ -369,15 +384,25 @@ export async function cleanupRemoteIdentities(
     ?? process.env["REPOS_DATABASE_URL"]
     ?? null;
   if (!databaseUrl && !options.remoteClient) {
-    throw new Error("remote identity cleanup requires an explicit remote database");
+    throw cleanupFailure("remote identity cleanup requires an explicit remote database");
   }
-  const remote = options.remoteClient ?? createRemoteSyncClient(databaseUrl!);
+  let remote: ReposRemoteSyncClient;
+  try {
+    remote = options.remoteClient ?? createRemoteSyncClient(databaseUrl!);
+  } catch {
+    throw new Error("remote identity cleanup failed");
+  }
   const ownsRemote = !options.remoteClient;
   let transactionOpen = false;
+  let schemaLockHeld = false;
   try {
     if (ownsRemote) await remote.connect?.();
-    await prepareRemoteSearchPath(remote, options.databaseSchema ?? null);
-    await remote.query("BEGIN");
+    await remote.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
+      "open-repos.remote-identity-cleanup.schema.v1",
+    ]);
+    schemaLockHeld = true;
+    await prepareRemoteSearchPath(remote, getReposDatabaseSchema(options));
+    await remote.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
     transactionOpen = true;
     await remote.query(`
       CREATE TABLE IF NOT EXISTS repos_remote_identity_cleanup_audit (
@@ -395,6 +420,7 @@ export async function cleanupRemoteIdentities(
       CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_remote_identity_cleanup_idempotency
       ON repos_remote_identity_cleanup_audit(idempotency_key)
     `);
+    await remote.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [idempotencyKey]);
     const existing = await remote.query(`
       SELECT version, mode, actor, plan_hash, counts_json
       FROM repos_remote_identity_cleanup_audit
@@ -409,7 +435,7 @@ export async function cleanupRemoteIdentities(
         || applied !== Boolean(options.apply)
         || (options.expectedPlanHash && String(row["plan_hash"]) !== options.expectedPlanHash)
       ) {
-        throw new Error("remote identity cleanup idempotency conflict");
+        throw cleanupFailure("remote identity cleanup idempotency conflict");
       }
       await remote.query("COMMIT");
       transactionOpen = false;
@@ -443,11 +469,15 @@ export async function cleanupRemoteIdentities(
       ["remotes", ["id", "url", "fetch_url"]],
     ] as const;
     if (required.some(([table, names]) => names.some((name) => !columns.get(table)?.has(name)))) {
-      throw new Error("remote identity cleanup schema mismatch");
+      throw cleanupFailure("remote identity cleanup schema mismatch");
     }
 
+    if (options.apply) {
+      await remote.query("LOCK TABLE repos, remotes IN SHARE ROW EXCLUSIVE MODE");
+    }
     const lockClause = options.apply ? " FOR UPDATE" : "";
-    const repos = await remote.query(`SELECT id, remote_url FROM repos ORDER BY id${lockClause}`);
+    const repos = await remote.query(`SELECT id, name, org, description, remote_url,
+      search_vector::text AS search_vector FROM repos ORDER BY id${lockClause}`);
     const remotes = await remote.query(`SELECT id, url, fetch_url FROM remotes ORDER BY id${lockClause}`);
     const repoChanges = repos.rows.flatMap((row) => {
       const target = sanitizeRemoteIdentity(row["remote_url"]);
@@ -455,24 +485,52 @@ export async function cleanupRemoteIdentities(
     });
     const remoteChanges: RemoteCleanupChange[] = [];
     for (const row of remotes.rows) {
+      const id = Number(row["id"]);
+      if (!Number.isSafeInteger(id) || id < 1) {
+        throw cleanupFailure("remote identity cleanup found an invalid remote identity");
+      }
       const url = sanitizeRemoteIdentity(row["url"]);
       const fetchUrl = sanitizeRemoteIdentity(row["fetch_url"]);
       if (!url) {
         remoteChanges.push({
-          id: Number(row["id"]),
+          id,
           beforeUrl: row["url"],
           beforeFetchUrl: row["fetch_url"],
           delete: true,
         });
       } else if (url !== row["url"] || fetchUrl !== row["fetch_url"]) {
         remoteChanges.push({
-          id: Number(row["id"]),
+          id,
           beforeUrl: row["url"],
           beforeFetchUrl: row["fetch_url"],
           url,
           fetchUrl,
           delete: false,
         });
+      }
+    }
+    const searchVectorChanges: RemoteCleanupSearchVectorChange[] = [];
+    for (const row of repos.rows) {
+      const id = Number(row["id"]);
+      if (!Number.isSafeInteger(id) || id < 1) {
+        throw cleanupFailure("remote identity cleanup found an invalid repository identity");
+      }
+      const targetRemote = sanitizeRemoteIdentity(row["remote_url"]);
+      const targetSearch = await remote.query(`SELECT to_tsvector('english',
+        coalesce($1::text, '') || ' ' || coalesce($2::text, '') || ' ' ||
+        coalesce($3::text, '') || ' ' || coalesce($4::text, ''))::text AS target_search_vector`, [
+        row["name"],
+        row["org"],
+        row["description"],
+        targetRemote,
+      ]);
+      const rawTarget = targetSearch.rows[0]?.["target_search_vector"];
+      if (typeof rawTarget !== "string") {
+        throw cleanupFailure("remote identity cleanup search planning failed");
+      }
+      const target = rawTarget;
+      if (row["search_vector"] !== target) {
+        searchVectorChanges.push({ id, before: row["search_vector"], target });
       }
     }
     const planHash = cleanupPlanHash({
@@ -496,9 +554,14 @@ export async function cleanupRemoteIdentities(
             url: change.url,
             fetch_url: change.fetchUrl,
           }),
+      search_vectors: searchVectorChanges.map((change) => ({
+        id: change.id,
+        before_digest: cleanupValueDigest(change.before),
+        target_digest: cleanupValueDigest(change.target),
+      })),
     });
     if (options.apply && options.expectedPlanHash !== planHash) {
-      throw new Error("remote identity cleanup plan mismatch");
+      throw cleanupFailure("remote identity cleanup plan mismatch");
     }
 
     const counts: RemoteIdentityCleanupCounts = {
@@ -507,7 +570,7 @@ export async function cleanupRemoteIdentities(
       remotes_scanned: remotes.rows.length,
       remotes_update: remoteChanges.filter((change) => !change.delete).length,
       remotes_delete: remoteChanges.filter((change) => change.delete).length,
-      search_vectors_repaired: 0,
+      search_vectors_repaired: searchVectorChanges.length,
     };
     if (options.apply) {
       for (const change of repoChanges) {
@@ -516,7 +579,7 @@ export async function cleanupRemoteIdentities(
           [change.target, change.id, change.before],
         );
         if ((result.rowCount ?? 0) !== 1) {
-          throw new Error("remote identity cleanup concurrent change detected");
+          throw cleanupFailure("remote identity cleanup concurrent change detected");
         }
       }
       for (const change of remoteChanges) {
@@ -526,7 +589,7 @@ export async function cleanupRemoteIdentities(
             [change.id, change.beforeUrl, change.beforeFetchUrl],
           );
           if ((result.rowCount ?? 0) !== 1) {
-            throw new Error("remote identity cleanup concurrent change detected");
+            throw cleanupFailure("remote identity cleanup concurrent change detected");
           }
         } else {
           const result = await remote.query(
@@ -534,20 +597,20 @@ export async function cleanupRemoteIdentities(
             [change.url, change.fetchUrl, change.id, change.beforeUrl, change.beforeFetchUrl],
           );
           if ((result.rowCount ?? 0) !== 1) {
-            throw new Error("remote identity cleanup concurrent change detected");
+            throw cleanupFailure("remote identity cleanup concurrent change detected");
           }
         }
       }
-      const repaired = await remote.query(`
-        UPDATE repos
-        SET search_vector = to_tsvector('english',
-          coalesce(name, '') || ' ' || coalesce(org, '') || ' ' ||
-          coalesce(description, '') || ' ' || coalesce(remote_url, ''))
-        WHERE search_vector IS DISTINCT FROM to_tsvector('english',
-          coalesce(name, '') || ' ' || coalesce(org, '') || ' ' ||
-          coalesce(description, '') || ' ' || coalesce(remote_url, ''))
-      `);
-      counts.search_vectors_repaired = repaired.rowCount ?? 0;
+      for (const change of searchVectorChanges) {
+        const repaired = await remote.query(
+          `UPDATE repos SET search_vector = $1::tsvector
+           WHERE id = $2 AND search_vector::text IS NOT DISTINCT FROM $3`,
+          [change.target, change.id, change.before],
+        );
+        if ((repaired.rowCount ?? 0) !== 1) {
+          throw cleanupFailure("remote identity cleanup concurrent change detected");
+        }
+      }
       const invalid = await remote.query(`
         SELECT COUNT(*)::int AS count
         FROM repos
@@ -556,7 +619,7 @@ export async function cleanupRemoteIdentities(
           coalesce(description, '') || ' ' || coalesce(remote_url, ''))
       `);
       if (Number(invalid.rows[0]?.["count"] ?? -1) !== 0) {
-        throw new Error("remote identity cleanup search verification failed");
+        throw cleanupFailure("remote identity cleanup search verification failed");
       }
       const verifiedRepos = await remote.query("SELECT id, remote_url FROM repos ORDER BY id");
       const verifiedRemotes = await remote.query("SELECT id, url, fetch_url FROM remotes ORDER BY id");
@@ -570,7 +633,7 @@ export async function cleanupRemoteIdentities(
           && row["fetch_url"] === sanitizeRemoteIdentity(row["fetch_url"]);
       });
       if (!reposVerified || !remotesVerified) {
-        throw new Error("remote identity cleanup verification failed");
+        throw cleanupFailure("remote identity cleanup verification failed");
       }
     }
     const mode = options.apply ? "apply" : "dry_run";
@@ -594,12 +657,23 @@ export async function cleanupRemoteIdentities(
     if (transactionOpen) {
       try { await remote.query("ROLLBACK"); } catch { /* retain the safe cleanup failure */ }
     }
-    if (error instanceof Error && error.message.startsWith("remote identity cleanup ")) {
+    if (error instanceof RemoteIdentityCleanupFailure) {
       throw error;
     }
     throw new Error("remote identity cleanup failed");
   } finally {
-    if (ownsRemote) await remote.end?.();
+    if (schemaLockHeld) {
+      try {
+        await remote.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+          "open-repos.remote-identity-cleanup.schema.v1",
+        ]);
+      } catch {
+        // Never replace a closed cleanup result with raw driver output.
+      }
+    }
+    if (ownsRemote) {
+      try { await remote.end?.(); } catch { /* connection close cannot change the closed result */ }
+    }
   }
 }
 
@@ -752,7 +826,7 @@ export async function syncRepoCatalog(
   }
 
   const sqlitePath = getDbPath();
-  if (sqlitePath === ":memory:" || sqlitePath.startsWith("file::memory:")) {
+  if (sqlitePath === ":memory:") {
     return {
       direction,
       enabled: false,

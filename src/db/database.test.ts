@@ -24,6 +24,15 @@ describe("database", () => {
     expect(["wal", "memory"]).toContain(result.journal_mode);
   });
 
+  it("rejects SQLite memory URI aliases before opening or creating an artifact", () => {
+    closeDb();
+    const uri = `file::memory:?cache=shared&repos_test=${process.pid}`;
+    expect(() => getDb(uri)).toThrow("SQLite memory URI paths are unsupported; use exact :memory:");
+    expect(existsSync(uri)).toBe(false);
+    process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+    getDb(":memory:");
+  });
+
   it("keeps parameterless SDK reads inside the active explicit database context", () => {
     closeDb();
     const previousPrimary = process.env["HASNA_REPOS_DB_PATH"];
@@ -510,6 +519,44 @@ describe("database", () => {
         }
         raw.close();
       }
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back v9 when a trigger recontaminates a sanitized value before the marker", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-trigger-guard-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT
+      );
+      INSERT INTO repos (id, path, name, remote_url)
+        VALUES (1, '/tmp/trigger-guard', 'trigger-guard', '${unsafe}');
+      CREATE TRIGGER repos_remote_recontaminate AFTER UPDATE OF remote_url ON repos
+      BEGIN
+        UPDATE repos SET remote_url = '${unsafe}' WHERE id = NEW.id;
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed canonical verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({ remote_url: unsafe });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
     } finally {
       closeDb();
       rmSync(dir, { recursive: true, force: true });

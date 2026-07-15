@@ -15,12 +15,19 @@ function findNearestReposDb(startDir: string): string | null {
   return null;
 }
 
+function rejectSqliteMemoryUri(path: string): string {
+  if (path.startsWith("file::memory:")) {
+    throw new Error("SQLite memory URI paths are unsupported; use exact :memory:");
+  }
+  return path;
+}
+
 export function getDbPath(): string {
   if (process.env["HASNA_REPOS_DB_PATH"]) {
-    return process.env["HASNA_REPOS_DB_PATH"];
+    return rejectSqliteMemoryUri(process.env["HASNA_REPOS_DB_PATH"]);
   }
   if (process.env["REPOS_DB_PATH"]) {
-    return process.env["REPOS_DB_PATH"];
+    return rejectSqliteMemoryUri(process.env["REPOS_DB_PATH"]);
   }
 
   if (process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] === "1") {
@@ -82,6 +89,7 @@ export interface DatabaseOpenOptions {
 }
 
 function normalizeDbPath(path: string): string {
+  rejectSqliteMemoryUri(path);
   if (path === ":memory:" || path.startsWith("file:")) return path;
   return resolve(path);
 }
@@ -94,7 +102,7 @@ function getExplicitNonDefaultDbPath(customPath?: string): string {
     throw new Error("migrate:false requires an explicit non-default Repos database path");
   }
   const path = normalizeDbPath(configured);
-  if (path === ":memory:" || path.startsWith("file::memory:")) return path;
+  if (path === ":memory:") return path;
 
   const home = process.env["HOME"] || process.env["USERPROFILE"] || "~";
   const defaults = [
@@ -123,7 +131,7 @@ export function getDb(customPath?: string, options: DatabaseOpenOptions = {}): D
     ? getExplicitNonDefaultDbPath(customPath)
     : normalizeDbPath(customPath ?? getDbPath());
 
-  if (path !== ":memory:" && !path.startsWith("file::memory:")) {
+  if (path !== ":memory:") {
     const dir = dirname(path);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
@@ -615,6 +623,31 @@ const MIGRATIONS: Migration[] = [
 
       if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'fts_repos'").get()) {
         db.exec("INSERT INTO fts_repos(fts_repos) VALUES ('rebuild')");
+      }
+      const reposCanonical = (db.query("SELECT remote_url FROM repos").all() as Array<{ remote_url: unknown }>).every(
+        (row) => row.remote_url === sanitizeRemoteIdentity(row.remote_url),
+      );
+      const remotesCanonical = (db.query("SELECT url, fetch_url FROM remotes").all() as Array<{
+        url: unknown;
+        fetch_url: unknown;
+      }>).every((row) => {
+        const url = sanitizeRemoteIdentity(row.url);
+        return url !== null
+          && row.url === url
+          && row.fetch_url === sanitizeRemoteIdentity(row.fetch_url);
+      });
+      const auditsCanonical = (db.query(`SELECT expected_remote, source_json, target_json, after_json
+        FROM repo_relocation_audit`).all() as Array<{
+        expected_remote: string;
+        source_json: string;
+        target_json: string;
+        after_json: string;
+      }>).every((row) => row.expected_remote === (sanitizeRemoteIdentity(row.expected_remote) ?? "")
+        && row.source_json === sanitizeRelocationSnapshot(row.source_json)
+        && row.target_json === sanitizeRelocationSnapshot(row.target_json)
+        && row.after_json === sanitizeRelocationSnapshot(row.after_json));
+      if (!reposCanonical || !remotesCanonical || !auditsCanonical) {
+        throw new Error("remote identity successor migration failed canonical verification");
       }
       if (db.query("PRAGMA foreign_key_check").all().length > 0) {
         throw new Error("remote identity successor migration failed foreign-key verification");

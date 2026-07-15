@@ -132,8 +132,12 @@ describe("github catalog SDK", () => {
       if (endpoint === "rate_limit") {
         return { resources: { core: { limit: 5000, remaining: 100, used: 10, reset: 1782288000 } } };
       }
-      if (endpoint === "user") return { login: "hasna", type: "User" };
-      if (endpoint === "/user/orgs?per_page=100&page=1") return [];
+      if (endpoint === "user") {
+        return { login: "hasna", type: "User", html_url: "https://viewer:phrase@github.com/hasna?token=marker#user" };
+      }
+      if (endpoint === "/user/orgs?per_page=100&page=1") {
+        return [{ login: "hasna-labs", html_url: "https://viewer:phrase@github.com/hasna-labs?token=marker#org" }];
+      }
       if (isPage(endpoint, 1)) {
         return [repoPayload({
           html_url: "https://viewer:phrase@github.com/hasna/repos?token=marker#section",
@@ -153,6 +157,10 @@ describe("github catalog SDK", () => {
     expect(cache.repositories[0]!.html_url).toBe("https://github.com/hasna/repos");
     expect(cache.repositories[0]!.clone_urls.https).toBe("https://github.com/hasna/repos.git");
     expect(cache.repositories[0]!.clone_urls.ssh).toBe("ssh://github.com/hasna/repos.git");
+    expect(cache.accounts).toEqual([
+      { login: "hasna", type: "User", url: "https://github.com/hasna" },
+      { login: "hasna-labs", type: "Organization", url: "https://github.com/hasna-labs" },
+    ]);
 
     const cli = spawnSync(process.execPath, [
       "run",

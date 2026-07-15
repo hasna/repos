@@ -496,7 +496,7 @@ function discoverAccounts(requestJson: (endpoint: string) => unknown, warnings: 
       byLogin.set(login.toLowerCase(), {
         login,
         type: stringOrNull(user?.["type"]) ?? "User",
-        url: stringOrNull(user?.["html_url"]),
+        url: sanitizePublicWebUrl(stringOrNull(user?.["html_url"])),
       });
     }
   } catch {
@@ -515,7 +515,7 @@ function discoverAccounts(requestJson: (endpoint: string) => unknown, warnings: 
         byLogin.set(login.toLowerCase(), {
           login,
           type: "Organization",
-          url: stringOrNull(row["html_url"]),
+          url: sanitizePublicWebUrl(stringOrNull(row["html_url"])),
         });
       }
       if (orgs.length < 100) break;
@@ -904,6 +904,21 @@ function sanitizeCloneUrl(value: string | null): string | null {
     return value.includes(":") && !value.includes("://")
       ? `ssh://${identity}.git`
       : identity;
+  }
+}
+
+function sanitizePublicWebUrl(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
   }
 }
 

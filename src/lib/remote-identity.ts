@@ -103,13 +103,14 @@ export function sanitizeRemoteOutput(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sanitizeRemoteOutput);
   if (!value || typeof value !== "object") return value;
   const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) return value;
+  if (value instanceof Date && prototype === Date.prototype) return value;
+  if (value instanceof Uint8Array
+    && (prototype === Uint8Array.prototype || prototype === Buffer.prototype)) return value;
   const input = value as Record<string, unknown>;
-  const output = Object.fromEntries(
-    Object.entries(input)
-      .filter(([key]) => key !== "toJSON")
-      .map(([key, entry]) => [key, sanitizeRemoteOutput(entry)]),
-  );
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  const output = Object.fromEntries(Object.entries(descriptors)
+    .filter(([key, descriptor]) => key !== "toJSON" && descriptor.enumerable && "value" in descriptor)
+    .map(([key, descriptor]) => [key, sanitizeRemoteOutput(descriptor.value)]));
   if (Object.prototype.hasOwnProperty.call(input, "remote_url")) {
     output["remote_url"] = sanitizeRemoteIdentity(input["remote_url"]);
   }
@@ -123,5 +124,8 @@ export function sanitizeRemoteOutput(value: unknown): unknown {
       output["fetch_url"] = sanitizeRemoteIdentity(input["fetch_url"]);
     }
   }
+  // Never return an unknown custom-prototype object: inherited/own toJSON
+  // hooks can otherwise replace the sanitized projection during JSON output.
+  if (prototype !== Object.prototype && prototype !== null) return output;
   return output;
 }

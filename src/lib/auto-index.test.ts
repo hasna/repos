@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
 import { execSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
 import { listRepos } from "../db/repos";
@@ -12,7 +13,7 @@ import {
 } from "./auto-index";
 import { HOOK_MARKER_START } from "./repo-hooks";
 
-const TEST_DIR = join(import.meta.dir, "../../.test-auto-index");
+const TEST_DIR = join(tmpdir(), `repos-auto-index-${process.pid}`);
 const legacyRdsEnvNames = ["HOST", "PORT", "USERNAME", "USER", "PASSWORD", "DATABASE", "DB"].map((name) =>
   ["HASNA", "RDS", name].join("_"),
 );
@@ -135,9 +136,15 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
     const normalized = sql.replace(/\s+/g, " ").trim();
     this.queries.push(normalized);
     if (
-      normalized === "BEGIN"
+      normalized.startsWith("BEGIN")
       || normalized === "COMMIT"
       || normalized === "ROLLBACK"
+      || normalized.startsWith("SELECT pg_advisory_lock")
+      || normalized.startsWith("SELECT pg_advisory_unlock")
+      || normalized.startsWith("SELECT pg_advisory_xact_lock")
+      || normalized === "LOCK TABLE repos, remotes IN SHARE ROW EXCLUSIVE MODE"
+      || normalized.startsWith("CREATE SCHEMA IF NOT EXISTS")
+      || normalized.startsWith("SET search_path TO")
       || normalized.startsWith("CREATE TABLE IF NOT EXISTS repos_remote_identity_cleanup_audit")
       || normalized.startsWith("CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_remote_identity_cleanup_idempotency")
     ) {
@@ -155,6 +162,12 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
         ],
         rowCount: 9,
       };
+    }
+    if (normalized.startsWith("SELECT id, name, org, description, remote_url,")) {
+      return { rows: [...this.repos.values()].sort((a, b) => Number(a.id) - Number(b.id)), rowCount: this.repos.size };
+    }
+    if (normalized.startsWith("SELECT to_tsvector('english',")) {
+      return { rows: [{ target_search_vector: `canonical:${String(params[3] ?? "")}` }], rowCount: 1 };
     }
     if (normalized.startsWith("SELECT id, remote_url FROM repos ORDER BY id")) {
       return { rows: [...this.repos.values()].sort((a, b) => Number(a.id) - Number(b.id)), rowCount: this.repos.size };
@@ -180,10 +193,14 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
       const changed = this.remotes.delete(Number(params[0]));
       return { rows: [], rowCount: changed ? 1 : 0 };
     }
-    if (normalized.startsWith("UPDATE repos SET search_vector = to_tsvector")) {
-      const changed = this.searchVectorsValid ? 0 : this.repos.size;
-      this.searchVectorsValid = true;
-      return { rows: [], rowCount: changed };
+    if (normalized.startsWith("UPDATE repos SET search_vector = $1::tsvector")) {
+      const row = this.repos.get(Number(params[1]));
+      const changed = Boolean(row && (row.search_vector ?? null) === (params[2] ?? null));
+      if (changed) {
+        row!.search_vector = params[0];
+        this.searchVectorsValid = true;
+      }
+      return { rows: [], rowCount: changed ? 1 : 0 };
     }
     if (normalized.startsWith("SELECT COUNT(*)::int AS count FROM repos WHERE search_vector IS DISTINCT FROM")) {
       return { rows: [{ count: this.searchVectorsValid ? 0 : this.repos.size }], rowCount: 1 };
@@ -224,9 +241,11 @@ beforeEach(() => {
   process.env["HASNA_REPOS_HOOK_QUEUE_PATH"] = join(TEST_DIR, "hook-events.tsv");
   delete process.env["HASNA_REPOS_STORAGE_MODE"];
   delete process.env["HASNA_REPOS_DATABASE_URL"];
+  delete process.env["HASNA_REPOS_DATABASE_SCHEMA"];
   for (const name of legacyRdsEnvNames) delete process.env[name];
   delete process.env["REPOS_STORAGE_MODE"];
   delete process.env["REPOS_DATABASE_URL"];
+  delete process.env["REPOS_DATABASE_SCHEMA"];
   getDb(":memory:");
   rmSync(TEST_DIR, { recursive: true, force: true });
   mkdirSync(TEST_DIR, { recursive: true });
@@ -239,9 +258,11 @@ afterAll(() => {
   delete process.env["HASNA_REPOS_HOOK_QUEUE_PATH"];
   delete process.env["HASNA_REPOS_STORAGE_MODE"];
   delete process.env["HASNA_REPOS_DATABASE_URL"];
+  delete process.env["HASNA_REPOS_DATABASE_SCHEMA"];
   for (const name of legacyRdsEnvNames) delete process.env[name];
   delete process.env["REPOS_STORAGE_MODE"];
   delete process.env["REPOS_DATABASE_URL"];
+  delete process.env["REPOS_DATABASE_SCHEMA"];
 });
 
 describe("auto-index", () => {
@@ -400,7 +421,7 @@ describe("auto-index", () => {
       version: 1,
       applied: false,
       replayed: false,
-      counts: { repos_update: 1, remotes_update: 1, remotes_delete: 1 },
+      counts: { repos_update: 1, remotes_update: 1, remotes_delete: 1, search_vectors_repaired: 1 },
     });
     expect(remote.repos.get(1)?.remote_url).toBe(unsafe);
     expect(remote.remotes.size).toBe(2);
@@ -415,6 +436,7 @@ describe("auto-index", () => {
     })).rejects.toThrow("remote identity cleanup plan mismatch");
     remote.repos.get(1)!.remote_url = unsafe;
 
+    const applyQueryStart = remote.queries.length;
     const applied = await cleanupRemoteIdentities({
       actor: "review-remediator",
       idempotencyKey: "apply-1",
@@ -423,6 +445,7 @@ describe("auto-index", () => {
       remoteClient: remote,
     });
     expect(applied.applied).toBe(true);
+    expect(applied.counts).toEqual(dryRun.counts);
     expect(remote.repos.get(1)?.remote_url).toBe("git.example.test/team/tool");
     expect(remote.remotes.get(1)).toMatchObject({
       url: "git.example.test/team/tool",
@@ -430,6 +453,18 @@ describe("auto-index", () => {
     });
     expect(remote.remotes.has(2)).toBe(false);
     expect(remote.searchVectorsValid).toBe(true);
+    const applyQueries = remote.queries.slice(applyQueryStart);
+    const indexOf = (prefix: string) => applyQueries.findIndex((query) => query.startsWith(prefix));
+    expect(indexOf("SELECT pg_advisory_lock")).toBe(0);
+    expect(indexOf("BEGIN ISOLATION LEVEL SERIALIZABLE")).toBeGreaterThan(indexOf("SELECT pg_advisory_lock"));
+    expect(indexOf("BEGIN ISOLATION LEVEL SERIALIZABLE")).toBeLessThan(indexOf("CREATE TABLE IF NOT EXISTS"));
+    expect(indexOf("CREATE TABLE IF NOT EXISTS")).toBeLessThan(indexOf("SELECT version, mode, actor"));
+    expect(indexOf("SELECT pg_advisory_xact_lock")).toBeLessThan(indexOf("SELECT version, mode, actor"));
+    expect(indexOf("LOCK TABLE repos, remotes")).toBeLessThan(indexOf("SELECT id, name, org, description"));
+    expect(indexOf("SELECT id, name, org, description")).toBeLessThan(indexOf("UPDATE repos SET remote_url"));
+    expect(indexOf("SELECT COUNT(*)::int AS count")).toBeLessThan(indexOf("INSERT INTO repos_remote_identity_cleanup_audit"));
+    expect(applyQueries.at(-2)).toBe("COMMIT");
+    expect(applyQueries.at(-1)).toStartWith("SELECT pg_advisory_unlock");
 
     const replay = await cleanupRemoteIdentities({
       actor: "review-remediator",
@@ -442,6 +477,25 @@ describe("auto-index", () => {
     expect(remote.audits.size).toBe(2);
   });
 
+  it("uses the configured schema fallback and replays same-key dry runs deterministically", async () => {
+    process.env["HASNA_REPOS_DATABASE_SCHEMA"] = "repos_review";
+    const remote = new FakeRemoteCleanupClient();
+    const first = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "same-dry-key",
+      remoteClient: remote,
+    });
+    const replay = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "same-dry-key",
+      remoteClient: remote,
+    });
+    expect(replay).toEqual({ ...first, replayed: true });
+    expect(remote.queries).toContain('CREATE SCHEMA IF NOT EXISTS "repos_review"');
+    expect(remote.queries).toContain('SET search_path TO "repos_review"');
+    expect(remote.queries.filter((query) => query.startsWith("INSERT INTO repos_remote_identity_cleanup_audit"))).toHaveLength(1);
+  });
+
   it("returns generic synchronization and cleanup errors without raw remote material", async () => {
     process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "repos.db");
     closeDb();
@@ -449,7 +503,7 @@ describe("auto-index", () => {
     const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
     const failing: ReposRemoteSyncClient = {
       async query() {
-        throw new Error(`remote failure for ${unsafe}`);
+        throw new Error(`remote identity cleanup server failure for ${unsafe}`);
       },
     };
     const sync = await syncRepoCatalog("pull", undefined, {
@@ -464,6 +518,58 @@ describe("auto-index", () => {
       idempotencyKey: "cleanup-failure",
       remoteClient: failing,
     })).rejects.toThrow("remote identity cleanup failed");
+  });
+
+  it("rolls back and unlocks when the apply fence fails without exposing driver output", async () => {
+    const queries: string[] = [];
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const remote: ReposRemoteSyncClient = {
+      async query(sql: string, params: unknown[] = []) {
+        const normalized = sql.replace(/\s+/g, " ").trim();
+        queries.push(normalized);
+        if (
+          normalized.startsWith("SELECT pg_advisory_lock")
+          || normalized.startsWith("SELECT pg_advisory_unlock")
+          || normalized.startsWith("SELECT pg_advisory_xact_lock")
+          || normalized.startsWith("BEGIN")
+          || normalized === "ROLLBACK"
+          || normalized.startsWith("CREATE TABLE")
+          || normalized.startsWith("CREATE UNIQUE INDEX")
+        ) return { rows: [], rowCount: 0 };
+        if (normalized.startsWith("SELECT version, mode, actor")) return { rows: [], rowCount: 0 };
+        if (normalized.startsWith("SELECT table_name, column_name")) {
+          return {
+            rows: [
+              ...["id", "name", "org", "description", "remote_url", "search_vector"].map((column_name) => ({ table_name: "repos", column_name })),
+              ...["id", "url", "fetch_url"].map((column_name) => ({ table_name: "remotes", column_name })),
+            ],
+            rowCount: 9,
+          };
+        }
+        if (normalized.startsWith("LOCK TABLE")) throw new Error(`remote identity cleanup server failure ${unsafe}`);
+        throw new Error(`unexpected test query ${String(params.length)}`);
+      },
+    };
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "fence-failure",
+      apply: true,
+      expectedPlanHash: "a".repeat(64),
+      remoteClient: remote,
+    })).rejects.toThrow("remote identity cleanup failed");
+    expect(queries).toContain("ROLLBACK");
+    expect(queries.at(-1)).toStartWith("SELECT pg_advisory_unlock");
+    expect(JSON.stringify(queries)).not.toContain("phrase");
+  });
+
+  it("rejects SQLite memory URI aliases before remote synchronization", async () => {
+    closeDb();
+    process.env["HASNA_REPOS_DB_PATH"] = "file::memory:?cache=shared";
+    await expect(syncRepoCatalog("pull", undefined, {
+      storageMode: "hybrid",
+      databaseUrl: "postgres://repos@example.invalid/repos",
+      remoteClient: new FakeRemoteSyncClient(),
+    })).rejects.toThrow("SQLite memory URI paths are unsupported; use exact :memory:");
   });
 
   it("stays local for legacy shared RDS envs without repo-owned database config", async () => {

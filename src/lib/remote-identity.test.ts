@@ -100,4 +100,45 @@ describe("sanitizeRemoteOutput", () => {
     });
     expect(JSON.stringify(output["hostile"])).not.toContain("phrase");
   });
+
+  it("projects custom prototypes without invoking inherited serializers or accessors", () => {
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const prototype = {
+      toJSON() {
+        return { url: unsafe };
+      },
+    };
+    const custom = Object.assign(Object.create(prototype), {
+      repo_id: 1,
+      name: "origin",
+      url: unsafe,
+      fetch_url: unsafe,
+    });
+    class HostileBytes extends Uint8Array {
+      toJSON() {
+        return { url: unsafe };
+      }
+    }
+    Object.defineProperty(custom, "computed", {
+      enumerable: true,
+      get() {
+        throw new Error("accessor must not execute");
+      },
+    });
+
+    const output = sanitizeRemoteOutput({
+      custom,
+      hostileBytes: new HostileBytes([1, 2]),
+      urlObject: new URL(unsafe),
+    }) as Record<string, unknown>;
+    expect(output["custom"]).toEqual({
+      repo_id: 1,
+      name: "origin",
+      url: "git.example.test/team/tool",
+      fetch_url: "git.example.test/team/tool",
+    });
+    expect(output["urlObject"]).toEqual({});
+    expect(output["hostileBytes"]).toEqual({ 0: 1, 1: 2 });
+    expect(JSON.stringify(output)).not.toContain("phrase");
+  });
 });
