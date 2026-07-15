@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { spawn } from "node:child_process";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -215,6 +216,59 @@ describe("database", () => {
       db.query("DELETE FROM repos WHERE id = 2").run();
       expect(db.query("SELECT * FROM repo_relocation_audit").get()).toEqual(before);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("serializes concurrent first-open migrations across processes", async () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-concurrent-first-open-"));
+    const path = join(dir, "repos.db");
+    const databaseModule = join(import.meta.dir, "database.ts");
+    const script = `
+      import { readFileSync } from "node:fs";
+      readFileSync(0);
+      const { getDb, closeDb } = await import(${JSON.stringify(databaseModule)});
+      try {
+        const db = getDb();
+        const versions = db.query("SELECT version FROM migrations ORDER BY version").all();
+        process.stdout.write(JSON.stringify(versions));
+        closeDb();
+      } catch (error) {
+        process.stderr.write(error instanceof Error
+          ? (error.stack || error.message) + "\\ncode=" + String(error.code)
+          : String(error));
+        process.exitCode = 1;
+      }
+    `;
+    try {
+      const children = Array.from({ length: 8 }, () => {
+        const child = spawn(process.execPath, ["-e", script], {
+          env: { ...process.env, HASNA_REPOS_DB_PATH: path },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+        child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+        const completed = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+          child.on("close", (code) => resolve({ code, stdout, stderr }));
+        });
+        return { child, completed };
+      });
+
+      // All workers block on stdin until every process has been spawned.
+      for (const { child } of children) child.stdin.end("start\n");
+      const results = await Promise.all(children.map(({ completed }) => completed));
+      expect(results).toEqual(Array.from({ length: 8 }, () => ({
+        code: 0,
+        stdout: JSON.stringify([1, 2, 3, 4, 6, 7].map((version) => ({ version }))),
+        stderr: "",
+      })));
     } finally {
       closeDb();
       rmSync(dir, { recursive: true, force: true });

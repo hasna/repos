@@ -626,6 +626,25 @@ describe("primary relocation v2 reconciliation", () => {
     expect(relocatePrimaryRepo(requestFor(ignored)).ok).toBe(true);
   });
 
+  it("rejects case-distinct untracked collisions even when local core.ignoreCase is true", () => {
+    const dryRun = seedPair({ legacyId: 661, targetId: 1508, name: "case-dry-run" });
+    git(dryRun.path, "config", "core.ignoreCase", "true");
+    writeFileSync(join(dryRun.path, "readme.md"), "untracked collision\n");
+    expect(git(dryRun.path, "ls-files", "--others", "--exclude-standard")).toBe("");
+    expectCode(() => relocatePrimaryRepo(requestFor(dryRun)), "TARGET_DIRTY");
+
+    const apply = seedPair({ legacyId: 662, targetId: 1509, name: "case-apply" });
+    git(apply.path, "config", "core.ignoreCase", "true");
+    const request = requestFor(apply);
+    const reviewed = relocatePrimaryRepo(request);
+    writeFileSync(join(apply.path, "readme.md"), "untracked after review\n");
+    expectCode(() => relocatePrimaryRepo({
+      ...request,
+      apply: true,
+      expectedPlanHash: reviewed.plan.plan_hash,
+    }), "TARGET_DIRTY");
+  });
+
   it("fails closed on unresolved index conflicts and unsupported submodules", () => {
     const conflicted = seedPair({ legacyId: 661, targetId: 1508, name: "conflicted" });
     git(conflicted.path, "checkout", "-b", "other");

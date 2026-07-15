@@ -419,6 +419,12 @@ function runGitRaw(path: string, args: string[]): Buffer {
     const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
     return execFileSync("git", [
       "-c", "core.fsmonitor=false",
+      // Repository-local core.ignoreCase must not fold distinct filesystem
+      // entries while inventorying a target. On case-insensitive filesystems
+      // the colliding entry cannot exist independently; on case-sensitive
+      // filesystems this forces Git to report it instead of hiding it behind a
+      // tracked path with different casing.
+      "-c", "core.ignoreCase=false",
       "-c", "core.untrackedCache=false",
       "-c", `core.excludesFile=${nullDevice}`,
       "-c", `core.hooksPath=${nullDevice}`,

@@ -39,6 +39,37 @@ export function getDbPath(): string {
 
 let _db: Database | null = null;
 let _dbPath: string | null = null;
+const WAL_NEGOTIATION_TIMEOUT_MS = 5_000;
+const WAL_NEGOTIATION_WAIT_MS = 10;
+const walNegotiationWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+
+function isSqliteLockContention(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const sqlite = error as { code?: unknown; errno?: unknown };
+  return sqlite.code === "SQLITE_BUSY"
+    || sqlite.code === "SQLITE_LOCKED"
+    || sqlite.errno === 5
+    || sqlite.errno === 6;
+}
+
+function enableWalWithBoundedRetry(db: Database): void {
+  const deadline = performance.now() + WAL_NEGOTIATION_TIMEOUT_MS;
+  while (true) {
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+      return;
+    } catch (error) {
+      const remaining = deadline - performance.now();
+      if (!isSqliteLockContention(error) || remaining <= 0) throw error;
+      Atomics.wait(
+        walNegotiationWait,
+        0,
+        0,
+        Math.min(WAL_NEGOTIATION_WAIT_MS, remaining),
+      );
+    }
+  }
+}
 
 export function getDb(customPath?: string): Database {
   const path = customPath || getDbPath();
@@ -50,17 +81,27 @@ export function getDb(customPath?: string): Database {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 
-  _db = new Database(path);
+  const db = new Database(path);
+  try {
+    // Install the bounded lock wait before journal-mode negotiation: a group
+    // of processes may all be opening and migrating the same new database.
+    db.exec("PRAGMA busy_timeout = 5000");
+    // SQLite's journal-mode PRAGMA can still return SQLITE_BUSY immediately
+    // while another first opener is negotiating WAL, without invoking the
+    // connection busy handler. Retry only that bounded first-open boundary.
+    enableWalWithBoundedRetry(db);
+    db.exec("PRAGMA synchronous = NORMAL");
+    db.exec("PRAGMA foreign_keys = ON");
+
+    runMigrations(db);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+
+  _db = db;
   _dbPath = path;
-
-  _db.exec("PRAGMA journal_mode = WAL");
-  _db.exec("PRAGMA busy_timeout = 5000");
-  _db.exec("PRAGMA synchronous = NORMAL");
-  _db.exec("PRAGMA foreign_keys = ON");
-
-  runMigrations(_db);
-
-  return _db;
+  return db;
 }
 
 export function closeDb(): void {
@@ -78,21 +119,20 @@ function runMigrations(db: Database): void {
     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
 
-  const applied = new Set(
-    db.query("SELECT version FROM migrations").all().map((r: any) => r.version)
-  );
-
   for (const migration of MIGRATIONS) {
-    if (!applied.has(migration.version)) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      // Another process may have completed this migration while this process
+      // waited for the write lock, so the marker must be read under that lock.
+      const applied = db.query("SELECT 1 FROM migrations WHERE version = ?").get(migration.version);
+      if (!applied) {
         db.exec(migration.sql);
         db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
-        db.exec("COMMIT");
-      } catch (error) {
-        try { db.exec("ROLLBACK"); } catch { /* preserve the migration failure */ }
-        throw error;
       }
+      db.exec("COMMIT");
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve the migration failure */ }
+      throw error;
     }
   }
 }
