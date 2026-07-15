@@ -6,10 +6,13 @@ export {
   sanitizeGitRemoteUrl,
 } from "./db/primary-relocation.js";
 export type {
+  CollisionDecision,
   PrimaryRelocationErrorCode,
   PrimaryRelocationReceipt,
   PrimaryRelocationRequest,
   PrimaryRelocationResult,
+  SafeErrorDetails,
+  TableReconcileCounts,
 } from "./db/primary-relocation.js";
 export { ensureWorkspaceBootstrap, startAutoIndexWorker, syncRepoCatalog } from "./lib/auto-index.js";
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";

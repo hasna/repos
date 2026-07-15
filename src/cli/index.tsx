@@ -410,15 +410,20 @@ const registry = program
 
 registry
   .command("relocate-primary")
-  .description("Validate and relocate one existing repo row to a canonical task worktree")
-  .requiredOption("--repo-id <id>", "Existing numeric repo row ID")
-  .requiredOption("--expected-current-path <path>", "Expected path currently stored on the repo row")
-  .requiredOption("--target-path <path>", "Canonical target Git checkout/worktree path")
+  .description("Losslessly absorb a registered canonical target into a preserved legacy repo ID")
+  .requiredOption("--repo-id <id>", "Legacy numeric repo row ID that must survive")
+  .requiredOption("--expected-current-path <path>", "Expected path stored on the legacy row")
+  .requiredOption("--expected-source-revision <revision>", "Exact legacy row updated_at revision")
+  .requiredOption("--target-repo-id <id>", "Registered canonical target repo row ID to absorb")
+  .requiredOption("--target-path <path>", "Expected canonical target Git checkout/worktree path")
+  .requiredOption("--expected-target-revision <revision>", "Exact target row updated_at revision")
   .requiredOption("--expected-remote <host/owner/name>", "Credential-free expected remote identity")
   .requiredOption("--expected-head <sha>", "Exact lowercase target HEAD object ID")
   .requiredOption("--actor <actor>", "Auditable operator or workflow identity")
-  .option("--dry-run", "Validate and print the proposed receipt without writing (default)")
-  .option("--apply", "Atomically update the existing row and append an audit receipt")
+  .requiredOption("--idempotency-key <key>", "Stable unique key for this logical relocation")
+  .option("--expected-plan-hash <sha256>", "Exact plan hash emitted by the dry run; required with --apply")
+  .option("--dry-run", "Plan reconciliation without writing (default)")
+  .option("--apply", "Atomically reconcile both rows using the supplied dry-run plan hash")
   .option("--json", "Output the versioned JSON result")
   .action((opts) => {
     const json = Boolean(opts.json);
@@ -432,28 +437,36 @@ registry
       const result = relocatePrimaryRepo({
         repoId: parseIntOption(opts.repoId, "--repo-id", 1),
         expectedCurrentPath: opts.expectedCurrentPath,
+        expectedSourceRevision: opts.expectedSourceRevision,
+        targetRepoId: parseIntOption(opts.targetRepoId, "--target-repo-id", 1),
         targetPath: opts.targetPath,
+        expectedTargetRevision: opts.expectedTargetRevision,
         expectedRemote: opts.expectedRemote,
         expectedHead: opts.expectedHead,
         actor: opts.actor,
+        idempotencyKey: opts.idempotencyKey,
+        expectedPlanHash: opts.expectedPlanHash,
         apply: Boolean(opts.apply),
       });
       if (json) {
         console.log(JSON.stringify(result, null, 2));
       } else if (result.applied) {
-        console.log(chalk.green(`✓ Relocated repo ${result.repo_id}`));
+        console.log(chalk.green(`✓ Absorbed repo ${result.target_repo_id} into preserved repo ${result.repo_id}`));
         console.log(`  ${result.before.path} → ${result.after.path}`);
         console.log(chalk.dim(`  Receipt: ${result.receipt!.id}`));
       } else {
-        console.log(chalk.yellow(`Dry run: repo ${result.repo_id} is safe to relocate`));
+        const disposition = result.plan.can_apply ? "is safe to apply" : "has blocking collisions";
+        console.log(chalk.yellow(`Dry run: repo ${result.repo_id} ${disposition}`));
         console.log(`  ${result.before.path} → ${result.after.path}`);
-        console.log(chalk.dim("  Re-run with --apply to write the path and audit receipt."));
+        console.log(chalk.dim(`  Plan: ${result.plan.plan_hash}`));
+        console.log(chalk.dim("  Re-run with --apply --expected-plan-hash <plan> to reconcile atomically."));
       }
     } catch (error) {
       const code = error instanceof PrimaryRelocationError ? error.code : "UNEXPECTED_ERROR";
       const message = error instanceof Error ? error.message : "unknown relocation error";
       if (json) {
-        console.log(JSON.stringify({ schema: "open-repos.primary-relocation.v1", ok: false, error: { code, message } }, null, 2));
+        const details = error instanceof PrimaryRelocationError ? error.details : undefined;
+        console.log(JSON.stringify({ schema: "open-repos.primary-relocation.v2", ok: false, error: { code, message, details } }, null, 2));
       } else {
         console.error(chalk.red(`${code}: ${message}`));
       }

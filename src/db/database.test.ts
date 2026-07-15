@@ -1,4 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getDb, closeDb } from "./database";
 
 describe("database", () => {
@@ -86,11 +90,61 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations[0]!.version).toBe(1);
-    expect(migrations[1]!.version).toBe(2);
-    expect(migrations[2]!.version).toBe(3);
-    expect(migrations[3]!.version).toBe(4);
-    expect(migrations[4]!.version).toBe(5);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6]);
+  });
+
+  it("upgrades the live migration-5 worktree schema without skipping relocation audit", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-live-v5-upgrade-"));
+    const path = join(dir, "repos.db");
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (5);
+      CREATE TABLE worktree_leases (
+        lease_id TEXT PRIMARY KEY,
+        repo_id TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+        machine_id TEXT NOT NULL,
+        worktree_path TEXT NOT NULL UNIQUE,
+        branch TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        owner_metadata TEXT NOT NULL DEFAULT '{}',
+        cleanup_policy TEXT NOT NULL,
+        status TEXT NOT NULL,
+        git_common_dir TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        verified_at TEXT,
+        released_at TEXT,
+        last_error TEXT,
+        UNIQUE(repo_id, machine_id, task_id, run_id, base_ref)
+      );
+    `);
+    seed.close();
+    try {
+      const db = getDb(path);
+      expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
+      expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
+      expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
   });
 
   it("should have foreign keys enabled", () => {

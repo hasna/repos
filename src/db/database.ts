@@ -290,20 +290,30 @@ const MIGRATIONS = [
     `,
   },
   {
-    version: 5,
+    // Version 5 is already used by the live worktree lease schema. Keep the
+    // relocation audit on its own version so upgrades never skip it.
+    version: 6,
     sql: `
       CREATE TABLE IF NOT EXISTS repo_relocation_audit (
         id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
         repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE RESTRICT,
+        target_repo_id INTEGER NOT NULL,
         operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
         actor TEXT NOT NULL,
         expected_current_path TEXT NOT NULL,
         target_path TEXT NOT NULL,
         expected_remote TEXT NOT NULL,
         expected_head TEXT NOT NULL,
-        source_state TEXT NOT NULL CHECK (source_state IN ('matched', 'missing')),
-        before_json TEXT NOT NULL,
+        source_revision TEXT NOT NULL,
+        target_revision TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
         after_json TEXT NOT NULL,
+        counts_json TEXT NOT NULL,
+        collisions_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
 

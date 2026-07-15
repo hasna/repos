@@ -34,7 +34,7 @@ repos-serve  # http://localhost:19450
 | `repos scan` | Discover and index all git repos |
 | `repos repos` | List repositories |
 | `repos repo <name>` | Get repo details |
-| `repos registry relocate-primary` | Safely repoint one existing repo row to a verified canonical worktree |
+| `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
 | `repos tags` | List tags |
@@ -73,48 +73,58 @@ Legacy list/search/status commands support `--json` for machine-readable output.
 
 ### Primary registry relocation
 
-`repos registry relocate-primary` repairs a stale primary path without deleting,
-merging, or rescanning registry rows. It is a dry run unless `--apply` is given.
-Both modes require the existing numeric row ID, its expected current path, a
-canonical checkout below `~/.hasna/repos/worktrees`, a credential-free remote
-identity in `host/owner/name` form, and the target's exact HEAD object ID.
+`repos registry relocate-primary` repairs a stale primary route when the canonical
+checkout is already registered as another row. The legacy ID survives and the
+explicit target ID is absorbed only after its metadata is reconciled. The command
+is a dry run unless `--apply` is given. Both modes require optimistic revisions
+for both rows, a canonical target below the trusted user worktree root, a
+credential-free `host/owner/name` remote, the target's exact HEAD, and a stable
+idempotency key.
 
 ```bash
 # Validation only (default)
 repos registry relocate-primary \
   --repo-id 663 \
-  --expected-current-path /dev/shm/infinity-local-build-20260710/repos/infinity \
-  --target-path ~/.hasna/repos/worktrees/infinity-machine/infinity/task-663 \
-  --expected-remote github.com/hasna/infinity \
+  --expected-current-path /dev/shm/infinity-local-build-20260710/repos/sandboxes \
+  --expected-source-revision '<legacy-updated-at>' \
+  --target-repo-id 1509 \
+  --target-path ~/.hasna/repos/worktrees/infinity-machine/sandboxes/aa2d66d2/primary-main-382840bccf52 \
+  --expected-target-revision '<target-updated-at>' \
+  --expected-remote github.com/hasna/sandboxes \
   --expected-head <exact-lowercase-sha> \
   --actor operator:<identity> \
+  --idempotency-key sandboxes-primary-cutover-v1 \
   --json
 
 # Apply only after reviewing the dry-run envelope
 repos registry relocate-primary \
   --repo-id 663 \
-  --expected-current-path /dev/shm/infinity-local-build-20260710/repos/infinity \
-  --target-path ~/.hasna/repos/worktrees/infinity-machine/infinity/task-663 \
-  --expected-remote github.com/hasna/infinity \
+  --expected-current-path /dev/shm/infinity-local-build-20260710/repos/sandboxes \
+  --expected-source-revision '<legacy-updated-at>' \
+  --target-repo-id 1509 \
+  --target-path ~/.hasna/repos/worktrees/infinity-machine/sandboxes/aa2d66d2/primary-main-382840bccf52 \
+  --expected-target-revision '<target-updated-at>' \
+  --expected-remote github.com/hasna/sandboxes \
   --expected-head <exact-lowercase-sha> \
   --actor operator:<identity> \
+  --idempotency-key sandboxes-primary-cutover-v1 \
+  --expected-plan-hash <sha256-from-dry-run> \
   --apply \
   --json
 ```
 
-The operation fails closed if the source path is stale, the exact repo name is
-ambiguous, the target is missing/non-canonical/already registered/dirty, or the row,
-source checkout, target origin, and exact HEAD do not agree. If the stored source
-path exists, it must itself be the canonical Git top-level with the same origin
-and HEAD as the target and must have no dirty or untracked state; a genuinely
-absent stale source is allowed but is
-explicitly recorded as `source_state: missing`. Source state and target identity
-are checked again inside the transaction. Apply changes only the existing row's
-`path` while preserving its ID and child commit/branch/tag/remote/PR records. The
-same transaction appends a before/after receipt to `repo_relocation_audit`; a
-receipt failure rolls back the path change. Raw credential-bearing or local-path
-remote URLs are neither accepted as expected identities nor written to
-relocation receipts.
+The source checkout is never read: it may be missing, dirty, or divergent because
+the operation changes registry authority, not source files. Its database ID,
+path, revision, and sanitized remote remain mandatory guards. The registered
+target must be canonical, clean, exact-HEAD, remote-matched, and free of path
+aliases. Dry run emits a request hash, plan hash, per-table counts, and hashed
+collision decisions. Exact duplicate children may be deduplicated; divergent
+commit, branch, tag, remote, PR, edge, or unknown foreign-key state blocks apply
+without choosing a winner. Apply revalidates the plan under one immediate SQLite
+transaction, reparents supported children and worktree leases, deletes only the
+absorbed target row, updates the legacy path, verifies foreign keys, and writes a
+sanitized receipt. Any failure rolls back everything, and an exact idempotent
+retry reads back the original receipt.
 
 Agent-loop ops commands emit compact JSON by default and bound returned lists with
 `--limit`. Each supports `--pretty` for readable JSON, `--todo <id>` for a dry-run
