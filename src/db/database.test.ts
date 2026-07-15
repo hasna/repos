@@ -90,7 +90,7 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7]);
   });
 
   it("upgrades the live migration-5 worktree schema without skipping relocation audit", () => {
@@ -137,7 +137,83 @@ describe("database", () => {
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6]);
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("upgrades v6 receipts byte-for-byte and removes their current-state repo foreign key", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v6-receipt-upgrade-"));
+    const path = join(dir, "repos.db");
+    const seed = new Database(path);
+    seed.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY);
+      INSERT INTO repos (id) VALUES (2), (3);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE RESTRICT,
+        target_repo_id INTEGER NOT NULL,
+        operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
+        actor TEXT NOT NULL,
+        expected_current_path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        expected_remote TEXT NOT NULL,
+        expected_head TEXT NOT NULL,
+        source_revision TEXT NOT NULL,
+        target_revision TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL,
+        counts_json TEXT NOT NULL,
+        collisions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_repo_relocation_audit_repo
+        ON repo_relocation_audit(repo_id, created_at);
+      INSERT INTO repo_relocation_audit VALUES (
+        'receipt-1', 'key-1', 'request-hash', 'plan-hash', 2, 3,
+        'primary_relocation', 'test:actor', '/legacy', '/canonical',
+        'github.com/hasna/accounts', '${"a".repeat(40)}', 'source-revision',
+        'target-revision', '{"id":2}', '{"id":3}', '{"id":2}', '{}', '[]',
+        '2026-07-15T00:00:00.000Z'
+      );
+      CREATE TABLE repo_relocation_audit_v7 (sentinel TEXT);
+    `);
+    const before = seed.query("SELECT * FROM repo_relocation_audit").get();
+    seed.close();
+    try {
+      expect(() => getDb(path)).toThrow();
+      closeDb();
+      const recovery = new Database(path);
+      expect(recovery.query("SELECT * FROM repo_relocation_audit").get()).toEqual(before);
+      expect(recovery.query(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_repo_relocation_audit_repo'",
+      ).get()).toEqual({ name: "idx_repo_relocation_audit_repo" });
+      expect(recovery.query("SELECT version FROM migrations WHERE version = 7").get()).toBeNull();
+      recovery.exec("DROP TABLE repo_relocation_audit_v7");
+      recovery.close();
+
+      const db = getDb(path);
+      expect(db.query("SELECT * FROM repo_relocation_audit").get()).toEqual(before);
+      expect(db.query("PRAGMA foreign_key_list(repo_relocation_audit)").all()).toEqual([]);
+      db.query("DELETE FROM repos WHERE id = 2").run();
+      expect(db.query("SELECT * FROM repo_relocation_audit").get()).toEqual(before);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       closeDb();

@@ -20,6 +20,8 @@ import { getDb } from "./database.js";
 import type { Repo } from "../types/index.js";
 
 const SCHEMA = "open-repos.primary-relocation.v2" as const;
+// The receipt payload remains v6. Migration 7 changes only the storage FK so
+// exact replays of already-issued receipts are not silently re-labelled.
 const AUDIT_SCHEMA = "open-repos.primary-relocation-receipt.v6" as const;
 const OPERATION = "primary_relocation" as const;
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -36,7 +38,6 @@ const CHILD_TABLES = [
 
 const KNOWN_REPO_FK_TABLES = new Set([
   ...CHILD_TABLES.map(({ table }) => table),
-  "repo_relocation_audit",
   "worktree_leases",
 ]);
 
@@ -188,7 +189,6 @@ interface ReconcilePlan {
   decisions: InternalDecision[];
   tableDigests: Record<string, string>;
   leaseCount: number;
-  auditReparentCount: number;
   canApply: boolean;
   planHash: string;
 }
@@ -598,6 +598,34 @@ function assertNoObjectAlternates(objects: string, root: string): void {
   }
 }
 
+function assertCompleteLocalObjectGraph(path: string, common: string, objects: string): void {
+  if (readAuthorityMetadata(join(common, "shallow"), "target shallow repository metadata") !== null) {
+    fail("TARGET_UNTRUSTED_GIT_AUTHORITY", "target uses shallow Git history");
+  }
+
+  let packEntries: string[];
+  try {
+    packEntries = readdirSync(join(objects, "pack"));
+  } catch (error) {
+    fail("TARGET_NOT_GIT_CHECKOUT", "target Git pack authority cannot be read safely", undefined, error);
+  }
+  if (packEntries.some((name) => name.endsWith(".promisor"))) {
+    fail("TARGET_UNTRUSTED_GIT_AUTHORITY", "target uses promisor Git object authority");
+  }
+
+  // `fsck --full` inflates and hashes local loose and packed objects and walks
+  // every ref-reachable commit/tree/blob edge. The sanitized Git environment
+  // disables lazy fetches, inherited config, hooks, replacements and prompts;
+  // object verification cannot run worktree conversion filters.
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+  runGit(path, [
+    "-c", `fsck.skipList=${nullDevice}`,
+    "-c", `fetch.fsck.skipList=${nullDevice}`,
+    "-c", `receive.fsck.skipList=${nullDevice}`,
+    "fsck", "--full", "--strict", "--no-reflogs", "--no-dangling", "--no-progress",
+  ]);
+}
+
 interface LocalConfigEntry {
   key: string;
   value: string;
@@ -623,6 +651,9 @@ function assertNoPromisorConfig(path: string): void {
   ));
   const entries = worktreeConfig ? [...local, ...localConfigEntries(path, "--worktree")] : local;
   for (const { key } of entries) {
+    if (/^(?:fsck\.|fetch\.fsck\.|receive\.fsck\.)/.test(key)) {
+      fail("TARGET_UNTRUSTED_GIT_AUTHORITY", "target local Git config overrides object verification policy");
+    }
     if (
       key === "extensions.partialclone"
       || /^remote\..+\.promisor$/.test(key)
@@ -670,6 +701,7 @@ function validateGitAuthority(path: string, root: string): void {
   assertNoObjectAlternates(objects, root);
   assertSafeGitMetadataFiles(gitDir, common, root);
   assertNoPromisorConfig(path);
+  assertCompleteLocalObjectGraph(path, common, objects);
 }
 
 interface GitInventoryEntry {
@@ -1134,7 +1166,7 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
   counts.repo_relocation_audit = {
     legacy: audits.length - targetAuditCount,
     target: targetAuditCount,
-    move: targetAuditCount,
+    move: 0,
     dedupe: 0,
     block: 0,
   };
@@ -1166,7 +1198,6 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
     collisions,
     table_digests: { ...child.digests, edges: edge.digest, worktree_leases: leaseDigest, repo_relocation_audit: hash(audits) },
     lease_count: leaseCount,
-    audit_reparent_count: targetAuditCount,
   };
   return {
     sourceRow,
@@ -1177,7 +1208,6 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
     decisions,
     tableDigests: planEnvelope.table_digests,
     leaseCount,
-    auditReparentCount: planEnvelope.audit_reparent_count,
     canApply: blocked.length === 0,
     planHash: hash(planEnvelope),
   };
@@ -1349,10 +1379,6 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
     }
 
     applyDecisions(validated, currentPlan);
-    db.query("UPDATE repo_relocation_audit SET repo_id = ? WHERE repo_id = ?").run(
-      validated.legacyRepoId,
-      validated.targetRepoId,
-    );
     if (tableExists("worktree_leases")) {
       db.query(`UPDATE worktree_leases SET repo_catalog_id = ?, repo_path = ?
         WHERE repo_catalog_id IN (?, ?)

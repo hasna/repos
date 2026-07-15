@@ -84,8 +84,15 @@ function runMigrations(db: Database): void {
 
   for (const migration of MIGRATIONS) {
     if (!applied.has(migration.version)) {
-      db.exec(migration.sql);
-      db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec(migration.sql);
+        db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
+        db.exec("COMMIT");
+      } catch (error) {
+        try { db.exec("ROLLBACK"); } catch { /* preserve the migration failure */ }
+        throw error;
+      }
     }
   }
 }
@@ -318,6 +325,58 @@ const MIGRATIONS = [
       );
 
       CREATE INDEX IF NOT EXISTS idx_repo_relocation_audit_repo
+        ON repo_relocation_audit(repo_id, created_at);
+    `,
+  },
+  {
+    // Relocation receipts are immutable historical facts. A receipt's repo_id
+    // identifies the survivor at the time of that exact operation; it must not
+    // be rewritten merely because that survivor is absorbed later. Rebuild the
+    // live v6 table without a current-state repos FK so chained relocations can
+    // delete a later target row without changing any prior receipt bytes.
+    version: 7,
+    sql: `
+      DROP INDEX IF EXISTS idx_repo_relocation_audit_repo;
+
+      CREATE TABLE repo_relocation_audit_v7 (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        repo_id INTEGER NOT NULL,
+        target_repo_id INTEGER NOT NULL,
+        operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
+        actor TEXT NOT NULL,
+        expected_current_path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        expected_remote TEXT NOT NULL,
+        expected_head TEXT NOT NULL,
+        source_revision TEXT NOT NULL,
+        target_revision TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL,
+        counts_json TEXT NOT NULL,
+        collisions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      INSERT INTO repo_relocation_audit_v7 (
+        id, idempotency_key, request_hash, plan_hash, repo_id, target_repo_id,
+        operation, actor, expected_current_path, target_path, expected_remote,
+        expected_head, source_revision, target_revision, source_json,
+        target_json, after_json, counts_json, collisions_json, created_at
+      ) SELECT
+        id, idempotency_key, request_hash, plan_hash, repo_id, target_repo_id,
+        operation, actor, expected_current_path, target_path, expected_remote,
+        expected_head, source_revision, target_revision, source_json,
+        target_json, after_json, counts_json, collisions_json, created_at
+      FROM repo_relocation_audit;
+
+      DROP TABLE repo_relocation_audit;
+      ALTER TABLE repo_relocation_audit_v7 RENAME TO repo_relocation_audit;
+
+      CREATE INDEX idx_repo_relocation_audit_repo
         ON repo_relocation_audit(repo_id, created_at);
     `,
   },

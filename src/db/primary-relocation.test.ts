@@ -6,6 +6,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -439,6 +441,78 @@ describe("primary relocation v2 reconciliation", () => {
     expectCode(() => relocatePrimaryRepo(requestFor(included)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
   });
 
+  it("rejects shallow metadata and promisor pack markers without relying on config", () => {
+    const shallow = seedPair({ name: "shallow-marker" });
+    writeFileSync(join(shallow.path, ".git", "shallow"), `${shallow.head}\n`);
+    expectCode(() => relocatePrimaryRepo(requestFor(shallow)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+
+    const promisor = seedPair({ legacyId: 662, targetId: 1509, name: "promisor-marker" });
+    writeFileSync(join(promisor.path, ".git", "objects", "pack", "fixture.promisor"), "");
+    expectCode(() => relocatePrimaryRepo(requestFor(promisor)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
+  it("rejects missing tracked blobs and missing reachable commit and tree history", () => {
+    const missingBlob = seedPair({ name: "missing-blob" });
+    const blob = git(missingBlob.path, "rev-parse", "HEAD:README.md");
+    rmSync(join(missingBlob.path, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+    expectCode(() => relocatePrimaryRepo(requestFor(missingBlob)), "TARGET_NOT_GIT_CHECKOUT");
+
+    const missingCommit = seedPair({ legacyId: 662, targetId: 1509, name: "missing-parent" });
+    writeFileSync(join(missingCommit.path, "second.txt"), "second\n");
+    git(missingCommit.path, "add", "second.txt");
+    git(missingCommit.path, "commit", "-m", "second");
+    missingCommit.head = git(missingCommit.path, "rev-parse", "HEAD");
+    const parent = git(missingCommit.path, "rev-parse", "HEAD^");
+    rmSync(join(missingCommit.path, ".git", "objects", parent.slice(0, 2), parent.slice(2)));
+    expectCode(() => relocatePrimaryRepo(requestFor(missingCommit)), "TARGET_NOT_GIT_CHECKOUT");
+
+    const missingTree = seedPair({ legacyId: 663, targetId: 1510, name: "missing-tree" });
+    writeFileSync(join(missingTree.path, "second.txt"), "second\n");
+    git(missingTree.path, "add", "second.txt");
+    git(missingTree.path, "commit", "-m", "second");
+    missingTree.head = git(missingTree.path, "rev-parse", "HEAD");
+    const parentTree = git(missingTree.path, "rev-parse", "HEAD^{tree}");
+    rmSync(join(missingTree.path, ".git", "objects", parentTree.slice(0, 2), parentTree.slice(2)));
+    expectCode(() => relocatePrimaryRepo(requestFor(missingTree)), "TARGET_NOT_GIT_CHECKOUT");
+  });
+
+  it("rejects corrupt loose and packed objects", () => {
+    const loose = seedPair({ name: "corrupt-loose" });
+    const blob = git(loose.path, "rev-parse", "HEAD:README.md");
+    const loosePath = join(loose.path, ".git", "objects", blob.slice(0, 2), blob.slice(2));
+    chmodSync(loosePath, 0o644);
+    writeFileSync(loosePath, "corrupt");
+    expectCode(() => relocatePrimaryRepo(requestFor(loose)), "TARGET_NOT_GIT_CHECKOUT");
+
+    const packed = seedPair({ legacyId: 662, targetId: 1509, name: "corrupt-pack" });
+    git(packed.path, "gc", "--prune=now");
+    const packDir = join(packed.path, ".git", "objects", "pack");
+    const pack = join(packDir, readdirSync(packDir).find((name) => name.endsWith(".pack"))!);
+    const bytes = readFileSync(pack);
+    bytes[Math.min(64, bytes.length - 1)]! ^= 0xff;
+    chmodSync(pack, 0o644);
+    writeFileSync(pack, bytes);
+    expectCode(() => relocatePrimaryRepo(requestFor(packed)), "TARGET_NOT_GIT_CHECKOUT");
+  });
+
+  it("rejects repository-local fsck severity overrides that suppress malformed reachable objects", () => {
+    const pair = seedPair({ name: "fsck-policy" });
+    const tree = git(pair.path, "rev-parse", "HEAD^{tree}");
+    const malformedCommit = execFileSync(
+      "git",
+      ["-C", pair.path, "hash-object", "--literally", "-t", "commit", "-w", "--stdin"],
+      {
+        encoding: "utf8",
+        input: `tree ${tree}\nauthor Missing Email 1700000000 +0000\ncommitter Missing Email 1700000000 +0000\n\nmalformed\n`,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    ).trim();
+    git(pair.path, "update-ref", "refs/heads/malformed", malformedCommit);
+    git(pair.path, "config", "fsck.missingEmail", "ignore");
+
+    expectCode(() => relocatePrimaryRepo(requestFor(pair)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
   it("fails closed when object authority metadata is unreadable", () => {
     const pair = seedPair({ name: "unreadable-authority" });
     const metadata = join(pair.path, ".git", "objects", "info", "alternates");
@@ -629,7 +703,7 @@ describe("primary relocation v2 reconciliation", () => {
     expect(error.details?.tables).toEqual(["future_repo_state"]);
   });
 
-  it("rebinds catalog and path-only leases, reconciles graph edges, and reparents prior audits", () => {
+  it("rebinds catalog and path-only leases, reconciles graph edges, and preserves prior audits", () => {
     const pair = seedPair();
     const db = getDb();
     db.exec(`CREATE TABLE worktree_leases (
@@ -663,7 +737,8 @@ describe("primary relocation v2 reconciliation", () => {
       { repo_catalog_id: pair.legacyId, repo_path: pair.path, metadata: "{}" },
     ]);
     expect(db.query("SELECT source_id FROM edges").get()).toEqual({ source_id: String(pair.legacyId) });
-    expect(db.query("SELECT repo_id FROM repo_relocation_audit WHERE id = 'prior'").get()).toEqual({ repo_id: pair.legacyId });
+    expect(applied.plan.counts.repo_relocation_audit).toEqual({ legacy: 0, target: 1, move: 0, dedupe: 0, block: 0 });
+    expect(db.query("SELECT repo_id FROM repo_relocation_audit WHERE id = 'prior'").get()).toEqual({ repo_id: pair.targetId });
   });
 
   it("fails closed when an exact relocation-path lease belongs to a third registered repo", () => {
@@ -775,6 +850,49 @@ describe("primary relocation v2 reconciliation", () => {
       apply: true,
       expectedPlanHash: dry.plan.plan_hash,
     }), "IDEMPOTENCY_CONFLICT");
+  });
+
+  it("keeps historical receipts immutable across chained absorptions and exact replay", () => {
+    const firstPair = seedPair({ legacyId: 2, targetId: 3, name: "chain" });
+    const firstRequest = requestFor(firstPair, { idempotencyKey: "chain-3-into-2" });
+    const firstDry = relocatePrimaryRepo(firstRequest);
+    const first = relocatePrimaryRepo({
+      ...firstRequest,
+      apply: true,
+      expectedPlanHash: firstDry.plan.plan_hash,
+    });
+    const persistedBefore = getDb().query(
+      "SELECT * FROM repo_relocation_audit WHERE id = ?",
+    ).get(first.receipt!.id);
+
+    insertRepo(1, join(root, "source-state-is-never-read", "chain-root"), "chain");
+    const secondPair = {
+      legacyId: 1,
+      targetId: 2,
+      name: "chain",
+      sourcePath: join(root, "source-state-is-never-read", "chain-root"),
+      path: firstPair.path,
+      head: firstPair.head,
+    };
+    const secondTargetRevision = String((getDb().query("SELECT updated_at FROM repos WHERE id = 2").get() as { updated_at: string }).updated_at);
+    const secondRequest = requestFor(secondPair, {
+      expectedTargetRevision: secondTargetRevision,
+      idempotencyKey: "chain-2-into-1",
+    });
+    const secondDry = relocatePrimaryRepo(secondRequest);
+    relocatePrimaryRepo({ ...secondRequest, apply: true, expectedPlanHash: secondDry.plan.plan_hash });
+
+    const replay = relocatePrimaryRepo({
+      ...firstRequest,
+      apply: true,
+      expectedPlanHash: firstDry.plan.plan_hash,
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.receipt).toEqual(first.receipt);
+    expect(replay.repo_id).toBe(2);
+    expect(replay.before.id).toBe(2);
+    expect(getDb().query("SELECT * FROM repo_relocation_audit WHERE id = ?").get(first.receipt!.id))
+      .toEqual(persistedBefore);
   });
 
   it("uses the correct live Infinity legacy-to-canonical ID mapping", () => {
