@@ -548,6 +548,51 @@ describe("primary relocation v2 reconciliation", () => {
     });
   });
 
+  for (const fixture of [
+    { name: "missing", localCommit: null },
+    { name: "different", localCommit: "target" },
+  ] as const) {
+    it(`requires preserved origin namespace evidence at the local head when it is ${fixture.name}`, () => {
+      const pair = seedPair({ name: `preserved-origin-${fixture.name}` });
+      const evidence = seedDivergentBranchCollision(pair, "origin");
+      git(pair.path, "update-ref", "-d", "refs/heads/origin/main");
+      if (fixture.localCommit === "target") {
+        git(pair.path, "update-ref", "refs/heads/origin/main", evidence.targetSha);
+      }
+      git(pair.path, "update-ref", "refs/remotes/origin/main", evidence.legacySha);
+
+      const dry = relocatePrimaryRepo(requestFor(pair, {
+        preserveDivergentBranchesUnder: evidence.namespace,
+      }));
+
+      expect(dry.plan.can_apply).toBe(false);
+      expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+        table: "branches",
+        decision: "block",
+        preserved_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }));
+    });
+  }
+
+  it("fails closed when configured-remote target evidence conflicts with a same-name local head", () => {
+    const pair = seedPair({ name: "remote-target-ambiguous" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.legacySha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
   it("fails closed when a remote target branch ref is missing", () => {
     const pair = seedPair({ name: "remote-branch-missing" });
     const branchName = "origin/build/accounts-v1";

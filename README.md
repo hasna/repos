@@ -163,9 +163,15 @@ commit, tag, remote, PR, edge, or unknown foreign-key state blocks apply without
 choosing a winner. Divergent branch rows still block by default. With an explicit
 `--preserve-divergent-branches-under <namespace>` review option, only divergent
 legacy branch rows may be preserved as deterministic `<namespace>/<branch>` rows;
-the target checkout must already contain exact `refs/heads/<namespace>/<branch>`
-and `refs/heads/<branch>` evidence at the reviewed SHAs, and apply never creates
-Git refs. Apply revalidates the plan under one immediate SQLite
+the target checkout must already contain exact
+`refs/heads/<namespace>/<source-branch>` evidence at the reviewed SHA. Preserved
+refs are always local heads, even when the namespace matches a configured remote
+name. Target branch evidence is also read from `refs/heads/<branch>` unless the
+branch begins with a configured remote name such as `origin/`; in that case the
+exact `refs/remotes/<branch>` ref is required. A same-name local head may coexist
+only when it resolves to the same commit; conflicting local and remote-tracking
+commits are ambiguous and block relocation. Apply never creates Git refs. Apply
+revalidates the plan under one immediate SQLite
 transaction, reparents supported children and catalog- or path-bound worktree
 leases, converges graph edges by their final mapped identity, deletes only the
 absorbed target row, absorbs the target's operational metadata while retaining

@@ -211,6 +211,16 @@ interface StoredBranchCommitResolution {
   candidate_count: number;
 }
 
+interface BranchRefResolution {
+  ref: string | null;
+  commit: string | null;
+  status: "ok" | "invalid" | "missing" | "ambiguous";
+  local_ref: string | null;
+  local_commit: string | null;
+  remote_ref: string | null;
+  remote_commit: string | null;
+}
+
 interface ReconcilePlan {
   sourceRow: Repo;
   targetRow: Repo;
@@ -1042,23 +1052,81 @@ function keyFor(row: Record<string, unknown>, columns: readonly string[]): Recor
   return Object.fromEntries(columns.map((column) => [column, row[column]]));
 }
 
-function branchRefName(path: string, branchName: string): string | null {
-  if (!isValidHeadRefName(branchName)) return null;
+function exactRefCommit(path: string, ref: string): string | null {
+  const commit = tryRunGit(path, ["rev-parse", "--verify", `${ref}^{commit}`]);
+  return commit && SHA_PATTERN.test(commit) ? commit : null;
+}
+
+function resolvePreservedBranchRef(path: string, branchName: string): BranchRefResolution {
+  if (!isValidHeadRefName(branchName)) {
+    return {
+      ref: null,
+      commit: null,
+      status: "invalid",
+      local_ref: null,
+      local_commit: null,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+  const ref = `refs/heads/${branchName}`;
+  const commit = exactRefCommit(path, ref);
+  return {
+    ref,
+    commit,
+    status: commit ? "ok" : "missing",
+    local_ref: ref,
+    local_commit: commit,
+    remote_ref: null,
+    remote_commit: null,
+  };
+}
+
+function resolveTargetBranchRef(path: string, branchName: string): BranchRefResolution {
+  if (!isValidHeadRefName(branchName)) return resolvePreservedBranchRef(path, branchName);
+  const localRef = `refs/heads/${branchName}`;
+  const localCommit = exactRefCommit(path, localRef);
   const remoteOutput = tryRunGit(path, ["remote"]);
-  if (remoteOutput === null) return null;
-  const isRemote = remoteOutput
+  if (remoteOutput === null) {
+    return {
+      ref: null,
+      commit: null,
+      status: "invalid",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+  const configuredRemote = remoteOutput
     .split(/\r?\n/)
     .map((name) => name.trim())
     .filter(Boolean)
-    .some((name) => branchName.startsWith(`${name}/`));
-  return `${isRemote ? "refs/remotes" : "refs/heads"}/${branchName}`;
-}
+    .find((name) => branchName.startsWith(`${name}/`));
+  if (!configuredRemote) {
+    return {
+      ref: localRef,
+      commit: localCommit,
+      status: localCommit ? "ok" : "missing",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
 
-function resolveBranchRef(path: string, branchName: string): { ref: string | null; commit: string | null } {
-  const ref = branchRefName(path, branchName);
-  if (!ref) return { ref: null, commit: null };
-  const commit = tryRunGit(path, ["rev-parse", "--verify", `${ref}^{commit}`]);
-  return { ref, commit: commit && SHA_PATTERN.test(commit) ? commit : null };
+  const remoteRef = `refs/remotes/${branchName}`;
+  const remoteCommit = exactRefCommit(path, remoteRef);
+  const ambiguous = Boolean(localCommit && remoteCommit && localCommit !== remoteCommit);
+  return {
+    ref: remoteRef,
+    commit: ambiguous ? null : remoteCommit,
+    status: ambiguous ? "ambiguous" : remoteCommit ? "ok" : "missing",
+    local_ref: localRef,
+    local_commit: localCommit,
+    remote_ref: remoteRef,
+    remote_commit: remoteCommit,
+  };
 }
 
 function resolveStoredBranchCommit(path: string, value: unknown): StoredBranchCommitResolution {
@@ -1107,18 +1175,22 @@ function resolveStoredBranchCommit(path: string, value: unknown): StoredBranchCo
 
 function targetRefEvidence(
   branch: string,
-  ref: string | null,
   stored: StoredBranchCommitResolution,
-  actualCommit: string | null,
+  resolution: BranchRefResolution,
 ): Record<string, unknown> {
   return {
     branch,
-    ref,
+    ref: resolution.ref,
+    ref_resolution: resolution.status,
+    local_ref: resolution.local_ref,
+    local_commit: resolution.local_commit,
+    remote_ref: resolution.remote_ref,
+    remote_commit: resolution.remote_commit,
     stored_commit: stored.raw,
     resolved_commit: stored.resolved,
     resolution: stored.status,
     candidate_count: stored.candidate_count,
-    actual_commit: actualCommit,
+    actual_commit: resolution.commit,
   };
 }
 
@@ -1148,8 +1220,8 @@ function branchPreservationCollision(
   const preservedName = `${namespace}/${sourceName}`;
   const sourceCommit = resolveStoredBranchCommit(request.targetPath, source.last_commit_sha);
   const targetCommit = resolveStoredBranchCommit(request.targetPath, target.last_commit_sha);
-  const preservedRef = resolveBranchRef(request.targetPath, preservedName);
-  const targetRef = resolveBranchRef(request.targetPath, targetName);
+  const preservedRef = resolvePreservedBranchRef(request.targetPath, preservedName);
+  const targetRef = resolveTargetBranchRef(request.targetPath, targetName);
   const preservedNameCollision = rows.some((row) => (
     Number(row.id) !== Number(source.id) && String(row.name ?? "") === preservedName
   ));
@@ -1159,12 +1231,15 @@ function branchPreservationCollision(
     resolved_preserved_commit: sourceCommit.resolved,
     preserved_commit_resolution: sourceCommit.status,
     preserved_commit_candidate_count: sourceCommit.candidate_count,
+    preserved_ref: preservedRef.ref,
+    preserved_ref_resolution: preservedRef.status,
     actual_preserved_commit: preservedRef.commit,
     stored_target_commit: targetCommit.raw,
     resolved_target_commit: targetCommit.resolved,
     target_commit_resolution: targetCommit.status,
     target_commit_candidate_count: targetCommit.candidate_count,
     target_ref: targetRef.ref,
+    target_ref_resolution: targetRef.status,
     actual_target_commit: targetRef.commit,
     preserved_name_collision: preservedNameCollision,
   };
@@ -1172,9 +1247,11 @@ function branchPreservationCollision(
     && isValidHeadRefName(preservedName)
     && sourceCommit.status === "ok"
     && targetCommit.status === "ok"
+    && preservedRef.status === "ok"
+    && targetRef.status === "ok"
     && preservedRef.commit === sourceCommit.resolved
     && targetRef.commit === targetCommit.resolved;
-  const targetEvidence = targetRefEvidence(targetName, targetRef.ref, targetCommit, targetRef.commit);
+  const targetEvidence = targetRefEvidence(targetName, targetCommit, targetRef);
 
   if (!evidenceOk) {
     const blocked: CollisionDecision = {
