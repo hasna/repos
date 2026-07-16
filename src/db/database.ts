@@ -758,4 +758,25 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 11,
+    sql: `
+      CREATE TABLE IF NOT EXISTS branch_adjudication_audit (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        row_count INTEGER NOT NULL,
+        before_json TEXT NOT NULL,
+        after_json TEXT NOT NULL,
+        rows_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_branch_adjudication_audit_created
+        ON branch_adjudication_audit(created_at);
+    `,
+  },
 ];
