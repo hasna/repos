@@ -520,6 +520,27 @@ describe("primary relocation v2 reconciliation", () => {
     }));
   });
 
+  it("validates a local origin slash row against its local head", () => {
+    const pair = seedPair({ name: "local-origin-slash" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    getDb().query("UPDATE branches SET is_remote = 0 WHERE name = ? AND repo_id IN (?, ?)")
+      .run(branchName, pair.legacyId, pair.targetId);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.legacySha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
   it("fails closed for a stale remote-marked row named after a configured remote", () => {
     const pair = seedPair({ name: "stale-symbolic-remote-head" });
     const branchName = "origin";

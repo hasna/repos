@@ -244,6 +244,33 @@ export function bulkInsertBranches(branches: Array<Omit<Branch, "id">>): number 
   return count;
 }
 
+export function replaceBranches(
+  repoId: number,
+  branches: Array<Omit<Branch, "id" | "repo_id">>,
+): number {
+  const db = getDb();
+  const remove = db.query("DELETE FROM branches WHERE repo_id = ?");
+  const insert = db.query(`INSERT INTO branches
+    (repo_id, name, is_remote, last_commit_sha, last_commit_date, ahead, behind)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const tx = db.transaction(() => {
+    remove.run(repoId);
+    for (const branch of branches) {
+      insert.run(
+        repoId,
+        branch.name,
+        branch.is_remote ? 1 : 0,
+        branch.last_commit_sha,
+        branch.last_commit_date,
+        branch.ahead,
+        branch.behind,
+      );
+    }
+  });
+  tx();
+  return branches.length;
+}
+
 // ── Tags ──
 
 export function listTags(opts: ListOptions & { repo_id?: number } = {}): Tag[] {

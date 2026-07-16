@@ -52,7 +52,7 @@ export const PG_MIGRATIONS = [
         last_commit_date TIMESTAMPTZ,
         ahead INTEGER NOT NULL DEFAULT 0,
         behind INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(repo_id, name)
+        UNIQUE(repo_id, name, is_remote)
       );
 
       CREATE INDEX IF NOT EXISTS idx_branches_repo ON branches(repo_id);
@@ -192,6 +192,31 @@ export const PG_MIGRATIONS = [
       DROP TRIGGER IF EXISTS prs_search_trigger ON pull_requests;
       DROP FUNCTION IF EXISTS prs_search_update;
       ALTER TABLE pull_requests DROP COLUMN IF EXISTS search_vector;
+    `,
+  },
+  {
+    version: 3,
+    description: "Include remote classification in branch identity",
+    up: `
+      ALTER TABLE branches DROP CONSTRAINT IF EXISTS branches_repo_id_name_key;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'branches'::regclass
+            AND conname = 'branches_repo_id_name_is_remote_key'
+        ) THEN
+          ALTER TABLE branches
+            ADD CONSTRAINT branches_repo_id_name_is_remote_key
+            UNIQUE (repo_id, name, is_remote);
+        END IF;
+      END;
+      $$;
+    `,
+    down: `
+      ALTER TABLE branches DROP CONSTRAINT IF EXISTS branches_repo_id_name_is_remote_key;
+      ALTER TABLE branches
+        ADD CONSTRAINT branches_repo_id_name_key UNIQUE (repo_id, name);
     `,
   },
 ];

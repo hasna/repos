@@ -95,6 +95,49 @@ describe("scanner", () => {
     }));
   });
 
+  it("persists local and remote refs with the same display name", async () => {
+    const repoPath = createTestRepo("repo-with-same-name-local-and-remote-branches", 1);
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/heads/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const matching = listBranches({ repo_id: repo!.id }).filter(({ name }) => name === "origin/main");
+
+    expect(matching).toHaveLength(2);
+    expect(matching.map(({ is_remote }) => is_remote).sort()).toEqual([0, 1]);
+  });
+
+  it("removes stale origin remote branch rows on rescan", async () => {
+    const repoPath = createTestRepo("repo-with-pruned-origin-branch", 1);
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    expect(listBranches({ repo_id: repo!.id })).toContainEqual(expect.objectContaining({
+      name: "origin/main",
+      is_remote: 1,
+    }));
+
+    execFileSync("git", ["update-ref", "-d", "refs/remotes/origin/main"], { cwd: repoPath, stdio: "pipe" });
+    await scanRepos([TEST_DIR]);
+
+    expect(listBranches({ repo_id: repo!.id })).not.toContainEqual(expect.objectContaining({
+      name: "origin/main",
+      is_remote: 1,
+    }));
+  });
+
   it("skips symbolic remote HEAD refs", async () => {
     const repoPath = createTestRepo("repo-with-symbolic-remote-head", 1);
     execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {

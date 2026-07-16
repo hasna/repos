@@ -112,7 +112,7 @@ describe("database", () => {
       const migrated = getDb(path);
       expect(migrated).toBe(raw);
       expect(migrated.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual([1, 2, 3, 4, 6, 7, 8, 9].map((version) => ({ version })));
+        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10].map((version) => ({ version })));
       expect(getDb(path)).toBe(migrated);
       expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get())
         .toEqual({ count: 1 });
@@ -193,7 +193,64 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10]);
+  });
+
+  it("migrates existing branch uniqueness to include remote classification", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-branch-identity-upgrade-"));
+    const path = join(dir, "repos.db");
+    const seed = new Database(path);
+    seed.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8), (9);
+      CREATE TABLE repos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL
+      );
+      INSERT INTO repos (id, path, name) VALUES (1, '/tmp/existing', 'existing');
+      CREATE TABLE branches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        is_remote INTEGER NOT NULL DEFAULT 0,
+        last_commit_sha TEXT,
+        last_commit_date TEXT,
+        ahead INTEGER NOT NULL DEFAULT 0,
+        behind INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(repo_id, name)
+      );
+      CREATE INDEX idx_branches_repo ON branches(repo_id);
+      INSERT INTO branches (repo_id, name, is_remote, last_commit_sha)
+        VALUES (1, 'origin/main', 0, 'local');
+    `);
+    seed.close();
+
+    try {
+      const migrated = getDb(path);
+      migrated.query(`INSERT INTO branches (repo_id, name, is_remote, last_commit_sha)
+        VALUES (1, 'origin/main', 1, 'remote')`).run();
+      expect(migrated.query(`SELECT name, is_remote, last_commit_sha FROM branches
+        WHERE repo_id = 1 ORDER BY is_remote`).all()).toEqual([
+        { name: "origin/main", is_remote: 0, last_commit_sha: "local" },
+        { name: "origin/main", is_remote: 1, last_commit_sha: "remote" },
+      ]);
+      expect(() => migrated.query(`INSERT INTO branches (repo_id, name, is_remote, last_commit_sha)
+        VALUES (1, 'origin/main', 1, 'duplicate-remote')`).run()).toThrow("UNIQUE constraint failed");
+      expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(migrated.query("SELECT version FROM migrations WHERE version = 10").get()).toEqual({ version: 10 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
   });
 
   it("upgrades the live migration-5 worktree schema without skipping relocation audit", () => {
@@ -240,7 +297,7 @@ describe("database", () => {
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       closeDb();
@@ -757,7 +814,7 @@ describe("database", () => {
       const results = await Promise.all(children.map(({ completed }) => completed));
       expect(results).toEqual(Array.from({ length: 8 }, () => ({
         code: 0,
-        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9].map((version) => ({ version }))),
+        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10].map((version) => ({ version }))),
         stderr: "",
       })));
     } finally {

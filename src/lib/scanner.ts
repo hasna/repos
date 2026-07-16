@@ -8,7 +8,7 @@ import { sanitizeRemoteIdentity } from "./remote-identity.js";
 import {
   upsertRepo,
   bulkInsertCommits,
-  bulkInsertBranches,
+  replaceBranches,
   bulkInsertTags,
   bulkInsertRemotes,
 } from "../db/repos.js";
@@ -212,9 +212,7 @@ function indexRepo(repoPath: string, full = false): {
     }
   }
 
-  const branchesInserted = bulkInsertBranches(
-    branchEntries.map((b) => ({ ...b, repo_id: repo.id }))
-  );
+  const branchesInserted = replaceBranches(repo.id, branchEntries);
 
   // Index tags
   const tagOutput = git(repoPath, [

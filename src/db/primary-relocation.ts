@@ -39,7 +39,7 @@ export const FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS = 120_000;
 
 const CHILD_TABLES = [
   { table: "commits", key: ["sha"] },
-  { table: "branches", key: ["name"] },
+  { table: "branches", key: ["name", "is_remote"] },
   { table: "tags", key: ["name"] },
   { table: "remotes", key: ["name"] },
   { table: "pull_requests", key: ["number"] },
@@ -1086,6 +1086,17 @@ function resolveTargetBranchRef(path: string, branchName: string, isRemoteRow: b
   if (!isValidHeadRefName(branchName)) return resolvePreservedBranchRef(path, branchName);
   const localRef = `refs/heads/${branchName}`;
   const localCommit = exactRefCommit(path, localRef);
+  if (!isRemoteRow) {
+    return {
+      ref: localRef,
+      commit: localCommit,
+      status: localCommit ? "ok" : "missing",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
   const remoteOutput = tryRunGit(path, ["remote"]);
   if (remoteOutput === null) {
     return {
@@ -1238,7 +1249,9 @@ function branchPreservationCollision(
     Number(target.is_remote) === 1,
   );
   const preservedNameCollision = rows.some((row) => (
-    Number(row.id) !== Number(source.id) && String(row.name ?? "") === preservedName
+    Number(row.id) !== Number(source.id)
+    && String(row.name ?? "") === preservedName
+    && Number(row.is_remote) === 0
   ));
   const evidence = {
     preserved_name: preservedName,
