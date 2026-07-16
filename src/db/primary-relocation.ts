@@ -39,7 +39,7 @@ export const FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS = 120_000;
 
 const CHILD_TABLES = [
   { table: "commits", key: ["sha"] },
-  { table: "branches", key: ["name"] },
+  { table: "branches", key: ["name", "is_remote"] },
   { table: "tags", key: ["name"] },
   { table: "remotes", key: ["name"] },
   { table: "pull_requests", key: ["number"] },
@@ -209,6 +209,16 @@ interface StoredBranchCommitResolution {
   resolved: string | null;
   status: "ok" | "invalid" | "missing" | "ambiguous" | "non_commit";
   candidate_count: number;
+}
+
+interface BranchRefResolution {
+  ref: string | null;
+  commit: string | null;
+  status: "ok" | "invalid" | "missing" | "ambiguous";
+  local_ref: string | null;
+  local_commit: string | null;
+  remote_ref: string | null;
+  remote_commit: string | null;
 }
 
 interface ReconcilePlan {
@@ -1042,10 +1052,103 @@ function keyFor(row: Record<string, unknown>, columns: readonly string[]): Recor
   return Object.fromEntries(columns.map((column) => [column, row[column]]));
 }
 
-function branchRefCommit(path: string, branchName: string): string | null {
-  if (!isValidHeadRefName(branchName)) return null;
-  const commit = tryRunGit(path, ["rev-parse", "--verify", `refs/heads/${branchName}^{commit}`]);
+function exactRefCommit(path: string, ref: string): string | null {
+  const commit = tryRunGit(path, ["rev-parse", "--verify", `${ref}^{commit}`]);
   return commit && SHA_PATTERN.test(commit) ? commit : null;
+}
+
+function resolvePreservedBranchRef(path: string, branchName: string): BranchRefResolution {
+  if (!isValidHeadRefName(branchName)) {
+    return {
+      ref: null,
+      commit: null,
+      status: "invalid",
+      local_ref: null,
+      local_commit: null,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+  const ref = `refs/heads/${branchName}`;
+  const commit = exactRefCommit(path, ref);
+  return {
+    ref,
+    commit,
+    status: commit ? "ok" : "missing",
+    local_ref: ref,
+    local_commit: commit,
+    remote_ref: null,
+    remote_commit: null,
+  };
+}
+
+function resolveTargetBranchRef(path: string, branchName: string, isRemoteRow: boolean): BranchRefResolution {
+  if (!isValidHeadRefName(branchName)) return resolvePreservedBranchRef(path, branchName);
+  const localRef = `refs/heads/${branchName}`;
+  const localCommit = exactRefCommit(path, localRef);
+  if (!isRemoteRow) {
+    return {
+      ref: localRef,
+      commit: localCommit,
+      status: localCommit ? "ok" : "missing",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+  const remoteOutput = tryRunGit(path, ["remote"]);
+  if (remoteOutput === null) {
+    return {
+      ref: null,
+      commit: null,
+      status: "invalid",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+  const configuredRemotes = remoteOutput
+    .split(/\r?\n/)
+    .map((name) => name.trim())
+    .filter(Boolean);
+  if (isRemoteRow && configuredRemotes.includes(branchName)) {
+    return {
+      ref: null,
+      commit: null,
+      status: "invalid",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+  const configuredRemote = configuredRemotes.find((name) => branchName.startsWith(`${name}/`));
+  if (!configuredRemote) {
+    return {
+      ref: null,
+      commit: null,
+      status: "invalid",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+
+  const remoteRef = `refs/remotes/${branchName}`;
+  const remoteCommit = exactRefCommit(path, remoteRef);
+  const ambiguous = Boolean(localCommit && remoteCommit && localCommit !== remoteCommit);
+  return {
+    ref: remoteRef,
+    commit: ambiguous ? null : remoteCommit,
+    status: ambiguous ? "ambiguous" : remoteCommit ? "ok" : "missing",
+    local_ref: localRef,
+    local_commit: localCommit,
+    remote_ref: remoteRef,
+    remote_commit: remoteCommit,
+  };
 }
 
 function resolveStoredBranchCommit(path: string, value: unknown): StoredBranchCommitResolution {
@@ -1095,15 +1198,21 @@ function resolveStoredBranchCommit(path: string, value: unknown): StoredBranchCo
 function targetRefEvidence(
   branch: string,
   stored: StoredBranchCommitResolution,
-  actualCommit: string | null,
+  resolution: BranchRefResolution,
 ): Record<string, unknown> {
   return {
     branch,
+    ref: resolution.ref,
+    ref_resolution: resolution.status,
+    local_ref: resolution.local_ref,
+    local_commit: resolution.local_commit,
+    remote_ref: resolution.remote_ref,
+    remote_commit: resolution.remote_commit,
     stored_commit: stored.raw,
     resolved_commit: stored.resolved,
     resolution: stored.status,
     candidate_count: stored.candidate_count,
-    actual_commit: actualCommit,
+    actual_commit: resolution.commit,
   };
 }
 
@@ -1112,10 +1221,11 @@ function branchPreservationCollision(
   source: Record<string, unknown>,
   target: Record<string, unknown>,
   rows: Array<Record<string, unknown>>,
+  plannedPreservedBranchKeys: ReadonlySet<string>,
   logicalKey: Record<string, unknown>,
   sourcePayload: Record<string, unknown>,
   targetPayload: Record<string, unknown>,
-): { collisions: CollisionDecision[]; decisions: InternalDecision[]; blocked: boolean } {
+): { collisions: CollisionDecision[]; decisions: InternalDecision[]; blocked: boolean; preservedKey?: string } {
   const namespace = request.preserveDivergentBranchesUnder;
   if (!namespace) {
     const blocked: CollisionDecision = {
@@ -1131,34 +1241,51 @@ function branchPreservationCollision(
   const sourceName = String(source.name ?? "");
   const targetName = String(target.name ?? "");
   const preservedName = `${namespace}/${sourceName}`;
+  const preservedKey = stable({
+    repo_id: request.legacyRepoId,
+    name: preservedName,
+    is_remote: 0,
+  });
   const sourceCommit = resolveStoredBranchCommit(request.targetPath, source.last_commit_sha);
   const targetCommit = resolveStoredBranchCommit(request.targetPath, target.last_commit_sha);
-  const preservedCommit = branchRefCommit(request.targetPath, preservedName);
-  const targetBranchCommit = branchRefCommit(request.targetPath, targetName);
+  const preservedRef = resolvePreservedBranchRef(request.targetPath, preservedName);
+  const targetRef = resolveTargetBranchRef(
+    request.targetPath,
+    targetName,
+    Number(target.is_remote) === 1,
+  );
   const preservedNameCollision = rows.some((row) => (
-    Number(row.id) !== Number(source.id) && String(row.name ?? "") === preservedName
-  ));
+    Number(row.id) !== Number(source.id)
+    && String(row.name ?? "") === preservedName
+    && Number(row.is_remote) === 0
+  )) || plannedPreservedBranchKeys.has(preservedKey);
   const evidence = {
     preserved_name: preservedName,
     stored_preserved_commit: sourceCommit.raw,
     resolved_preserved_commit: sourceCommit.resolved,
     preserved_commit_resolution: sourceCommit.status,
     preserved_commit_candidate_count: sourceCommit.candidate_count,
-    actual_preserved_commit: preservedCommit,
+    preserved_ref: preservedRef.ref,
+    preserved_ref_resolution: preservedRef.status,
+    actual_preserved_commit: preservedRef.commit,
     stored_target_commit: targetCommit.raw,
     resolved_target_commit: targetCommit.resolved,
     target_commit_resolution: targetCommit.status,
     target_commit_candidate_count: targetCommit.candidate_count,
-    actual_target_commit: targetBranchCommit,
+    target_ref: targetRef.ref,
+    target_ref_resolution: targetRef.status,
+    actual_target_commit: targetRef.commit,
     preserved_name_collision: preservedNameCollision,
   };
   const evidenceOk = !preservedNameCollision
     && isValidHeadRefName(preservedName)
     && sourceCommit.status === "ok"
     && targetCommit.status === "ok"
-    && preservedCommit === sourceCommit.resolved
-    && targetBranchCommit === targetCommit.resolved;
-  const targetEvidence = targetRefEvidence(targetName, targetCommit, targetBranchCommit);
+    && preservedRef.status === "ok"
+    && targetRef.status === "ok"
+    && preservedRef.commit === sourceCommit.resolved
+    && targetRef.commit === targetCommit.resolved;
+  const targetEvidence = targetRefEvidence(targetName, targetCommit, targetRef);
 
   if (!evidenceOk) {
     const blocked: CollisionDecision = {
@@ -1201,6 +1328,7 @@ function branchPreservationCollision(
       { ...move, row_id: Number(target.id), resolved_last_commit_sha: targetCommit.resolved! },
     ],
     blocked: false,
+    preservedKey,
   };
 }
 
@@ -1215,6 +1343,7 @@ function buildChildPlan(request: ValidatedRequest): {
   const decisions: InternalDecision[] = [];
   const digests: Record<string, string> = {};
   let preservedDivergentBranchCount = 0;
+  const plannedPreservedBranchKeys = new Set<string>();
   for (const spec of CHILD_TABLES) {
     const rawRows = relocationDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
       request.legacyRepoId,
@@ -1275,6 +1404,7 @@ function buildChildPlan(request: ValidatedRequest): {
           source,
           target,
           rows,
+          plannedPreservedBranchKeys,
           logicalKey,
           sourcePayload,
           targetPayload,
@@ -1296,6 +1426,7 @@ function buildChildPlan(request: ValidatedRequest): {
             decisions.push({ ...blocked, row_id: Number(target.id) });
             continue;
           }
+          plannedPreservedBranchKeys.add(preservation.preservedKey!);
           tableCounts.move++;
         }
         collisions.push(...preservation.collisions);
@@ -1610,7 +1741,9 @@ function applyDecisions(request: ValidatedRequest, plan: ReconcilePlan): void {
       if (decision.table !== "branches" || !decision.preserved_name || !decision.resolved_last_commit_sha) {
         fail("TRANSACTION_CONFLICT", "invalid branch preservation decision");
       }
-      const updated = db.query("UPDATE branches SET name = ?, last_commit_sha = ? WHERE id = ? AND repo_id = ?").run(
+      const updated = db.query(`UPDATE branches SET
+        name = ?, is_remote = 0, last_commit_sha = ?, ahead = 0, behind = 0
+        WHERE id = ? AND repo_id = ?`).run(
         decision.preserved_name,
         decision.resolved_last_commit_sha,
         decision.row_id,
@@ -1760,7 +1893,14 @@ function expectedRelocationExactState(
         projected = projected.filter((row) => Number(row.id) !== decision.row_id);
       } else if (decision.decision === "preserve") {
         projected = projected.map((row) => Number(row.id) === decision.row_id
-          ? { ...row, name: decision.preserved_name, last_commit_sha: decision.resolved_last_commit_sha ?? row.last_commit_sha }
+          ? {
+              ...row,
+              name: decision.preserved_name,
+              is_remote: 0,
+              last_commit_sha: decision.resolved_last_commit_sha ?? row.last_commit_sha,
+              ahead: 0,
+              behind: 0,
+            }
           : row);
       } else if (decision.decision === "move") {
         projected = projected.map((row) => Number(row.id) === decision.row_id

@@ -8,23 +8,28 @@ import { sanitizeRemoteIdentity } from "./remote-identity.js";
 import {
   upsertRepo,
   bulkInsertCommits,
-  bulkInsertBranches,
+  replaceBranches,
   bulkInsertTags,
   bulkInsertRemotes,
 } from "../db/repos.js";
 import type { ScanResult } from "../types/index.js";
 
-function git(repoPath: string, args: string[]): string {
+function gitWithStatus(repoPath: string, args: string[]): { ok: boolean; output: string } {
   try {
-    return execFileSync("git", ["-C", repoPath, ...args], {
+    const output = execFileSync("git", ["-C", repoPath, ...args], {
       encoding: "utf-8",
       timeout: 30_000,
       maxBuffer: 50 * 1024 * 1024,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
+    return { ok: true, output };
   } catch {
-    return "";
+    return { ok: false, output: "" };
   }
+}
+
+function git(repoPath: string, args: string[]): string {
+  return gitWithStatus(repoPath, args).output;
 }
 
 function isGitRepo(dir: string): boolean {
@@ -159,26 +164,31 @@ function indexRepo(repoPath: string, full = false): {
   );
 
   // Index branches
-  const branchOutput = git(repoPath, [
-    "branch",
-    "-a",
-    "--format=%(refname:short)|%(objectname:short)|%(committerdate:iso8601)",
+  const branchResult = gitWithStatus(repoPath, [
+    "for-each-ref",
+    "--format=%(refname)%00%(symref)%00%(objectname:short)%00%(committerdate:iso8601)",
+    "refs/heads",
+    "refs/remotes",
   ]);
+  const branchOutput = branchResult.output;
   const branchEntries: Array<{
     name: string; is_remote: boolean; last_commit_sha: string | null;
     last_commit_date: string | null; ahead: number; behind: number;
   }> = [];
 
   if (branchOutput) {
-    for (const line of branchOutput.split("\n")) {
-      const parts = line.replace(/'/g, "").split("|");
-      if (!parts[0]) continue;
-      const branchName = parts[0];
-      const isRemote = branchName.startsWith("origin/") || branchName.includes("/");
+    for (const line of branchOutput.split(/\r?\n/)) {
+      const [refName, symref, commitSha, commitDate] = line.split("\0");
+      if (!refName || symref) continue;
+      const isRemote = refName.startsWith("refs/remotes/");
+      const prefix = isRemote ? "refs/remotes/" : "refs/heads/";
+      if (!refName.startsWith(prefix)) continue;
+      const branchName = refName.slice(prefix.length);
+      if (!branchName) continue;
       let ahead = 0;
       let behind = 0;
 
-      if (!isRemote && !branchName.startsWith("HEAD")) {
+      if (!isRemote) {
         const trackingBranch = branchName === defaultBranch
           ? `origin/${defaultBranch}`
           : null;
@@ -200,17 +210,17 @@ function indexRepo(repoPath: string, full = false): {
       branchEntries.push({
         name: branchName,
         is_remote: isRemote,
-        last_commit_sha: parts[1] || null,
-        last_commit_date: parts[2] || null,
+        last_commit_sha: commitSha || null,
+        last_commit_date: commitDate || null,
         ahead,
         behind,
       });
     }
   }
 
-  const branchesInserted = bulkInsertBranches(
-    branchEntries.map((b) => ({ ...b, repo_id: repo.id }))
-  );
+  const branchesInserted = branchResult.ok
+    ? replaceBranches(repo.id, branchEntries)
+    : 0;
 
   // Index tags
   const tagOutput = git(repoPath, [

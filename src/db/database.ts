@@ -362,7 +362,7 @@ const MIGRATIONS: Migration[] = [
         last_commit_date TEXT,
         ahead INTEGER NOT NULL DEFAULT 0,
         behind INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(repo_id, name)
+        UNIQUE(repo_id, name, is_remote)
       );
 
       CREATE INDEX idx_branches_repo ON branches(repo_id);
@@ -726,5 +726,36 @@ const MIGRATIONS: Migration[] = [
       return expected;
     },
     verifyAfterMarker: verifyV9RemoteIdentityState,
+  },
+  {
+    version: 10,
+    run(db) {
+      if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'branches'").get()) return;
+      db.exec(`
+        DROP INDEX IF EXISTS idx_branches_repo;
+
+        CREATE TABLE branches_v10 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          is_remote INTEGER NOT NULL DEFAULT 0,
+          last_commit_sha TEXT,
+          last_commit_date TEXT,
+          ahead INTEGER NOT NULL DEFAULT 0,
+          behind INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(repo_id, name, is_remote)
+        );
+
+        INSERT INTO branches_v10 (
+          id, repo_id, name, is_remote, last_commit_sha, last_commit_date, ahead, behind
+        ) SELECT
+          id, repo_id, name, is_remote, last_commit_sha, last_commit_date, ahead, behind
+        FROM branches;
+
+        DROP TABLE branches;
+        ALTER TABLE branches_v10 RENAME TO branches;
+        CREATE INDEX idx_branches_repo ON branches(repo_id);
+      `);
+    },
   },
 ];

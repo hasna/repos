@@ -152,6 +152,29 @@ function seedDivergentBranchCollision(
   return { namespace, legacySha, preservedName, targetSha: pair.head };
 }
 
+function seedDivergentRemoteBranchCollisions(
+  pair: ReturnType<typeof seedPair>,
+  branchNames: string[],
+  namespace = "legacy-preserved",
+) {
+  const db = getDb();
+  git(pair.path, "checkout", "-b", "legacy-remote-source");
+  writeFileSync(join(pair.path, "legacy-remote-branch.txt"), "legacy remote branch\n");
+  git(pair.path, "add", "legacy-remote-branch.txt");
+  git(pair.path, "commit", "-m", "legacy remote branch");
+  const legacySha = git(pair.path, "rev-parse", "HEAD");
+  git(pair.path, "checkout", "main");
+
+  for (const branchName of branchNames) {
+    git(pair.path, "update-ref", `refs/heads/${namespace}/${branchName}`, legacySha);
+    db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, 1, ?)")
+      .run(pair.legacyId, branchName, legacySha.slice(0, 7));
+    db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, 1, ?)")
+      .run(pair.targetId, branchName, pair.head.slice(0, 7));
+  }
+  return { namespace, legacySha, targetSha: pair.head };
+}
+
 function missingObjectPrefix(path: string): string {
   for (const prefix of ["0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999"]) {
     if (!git(path, "rev-parse", `--disambiguate=${prefix}`)) return prefix;
@@ -419,6 +442,46 @@ describe("primary relocation v2 reconciliation", () => {
     expect(getDb().query("SELECT id FROM repos WHERE id = ?").get(pair.targetId)).toBeNull();
   });
 
+  it("blocks local and remote preservation decisions that plan the same local branch key", () => {
+    const pair = seedPair({ name: "branch-preserve-planned-collision" });
+    const db = getDb();
+    const branchName = "origin/main";
+    const namespace = "legacy-preserved";
+
+    git(pair.path, "checkout", "-b", "legacy-planned-collision");
+    writeFileSync(join(pair.path, "legacy-planned-collision.txt"), "legacy planned collision\n");
+    git(pair.path, "add", "legacy-planned-collision.txt");
+    git(pair.path, "commit", "-m", "legacy planned collision");
+    const legacySha = git(pair.path, "rev-parse", "HEAD");
+    git(pair.path, "checkout", "main");
+    git(pair.path, "update-ref", `refs/heads/${namespace}/${branchName}`, legacySha);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, pair.head);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, pair.head);
+
+    for (const isRemote of [0, 1]) {
+      db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, ?, ?)")
+        .run(pair.legacyId, branchName, isRemote, legacySha);
+      db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, ?, ?)")
+        .run(pair.targetId, branchName, isRemote, pair.head);
+    }
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      preserved_name_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      preserved_name_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
   it("accepts unambiguous abbreviated preservation commits and applies exact branch SHAs", () => {
     const pair = seedPair({ name: "branch-preserve-abbrev" });
     const evidence = seedDivergentBranchCollision(pair);
@@ -446,6 +509,225 @@ describe("primary relocation v2 reconciliation", () => {
       { repo_id: pair.legacyId, name: evidence.preservedName, last_commit_sha: evidence.legacySha },
       { repo_id: pair.legacyId, name: "main", last_commit_sha: evidence.targetSha },
     ]);
+  });
+
+  for (const fixture of [
+    { repo: "accounts", branches: ["origin/build/accounts-v1"] },
+    { repo: "sandboxes", branches: ["origin/build/managed-adapters-v1"] },
+    {
+      repo: "infinity",
+      branches: [
+        "origin/build/checkpoint-broker-v1",
+        "origin/build/infinity-v1",
+        "origin/build/portable-api-broker-v1",
+      ],
+    },
+  ]) {
+    it(`validates ${fixture.repo} remote branch rows against remote-tracking refs`, () => {
+      const pair = seedPair({ name: `remote-${fixture.repo}` });
+      const evidence = seedDivergentRemoteBranchCollisions(pair, fixture.branches);
+      for (const branchName of fixture.branches) {
+        git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+      }
+
+      const dry = relocatePrimaryRepo(requestFor(pair, {
+        preserveDivergentBranchesUnder: evidence.namespace,
+      }));
+
+      expect(dry.plan.can_apply).toBe(true);
+      expect(dry.plan.collisions.filter(({ table, decision }) => (
+        table === "branches" && decision === "preserve"
+      ))).toHaveLength(fixture.branches.length);
+    });
+  }
+
+  it("fails closed for a remote-marked row without a configured remote prefix", () => {
+    const pair = seedPair({ name: "stale-remote-local-slash" });
+    const branchName = "build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("validates a local origin slash row against its local head", () => {
+    const pair = seedPair({ name: "local-origin-slash" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    getDb().query("UPDATE branches SET is_remote = 0 WHERE name = ? AND repo_id IN (?, ?)")
+      .run(branchName, pair.legacyId, pair.targetId);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.legacySha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("fails closed for a stale remote-marked row named after a configured remote", () => {
+    const pair = seedPair({ name: "stale-symbolic-remote-head" });
+    const branchName = "origin";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", "refs/heads/origin", evidence.targetSha);
+    git(pair.path, "update-ref", "refs/remotes/origin/main", evidence.legacySha);
+    git(pair.path, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("applies a preserved remote slash branch with local branch semantics", () => {
+    const pair = seedPair({ name: "preserved-remote-local-semantics" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+    getDb().query("UPDATE branches SET ahead = 7, behind = 11 WHERE repo_id = ? AND name = ?")
+      .run(pair.legacyId, branchName);
+    const request = requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+      idempotencyKey: "preserved-remote-local-semantics-v1",
+    });
+    const dry = relocatePrimaryRepo(request);
+
+    expect(dry.plan.can_apply).toBe(true);
+    relocatePrimaryRepo({ ...request, apply: true, expectedPlanHash: dry.plan.plan_hash });
+
+    expect(getDb().query(
+      "SELECT repo_id, name, is_remote, last_commit_sha, ahead, behind FROM branches WHERE name = ?",
+    ).get(`${evidence.namespace}/${branchName}`)).toEqual({
+      repo_id: pair.legacyId,
+      name: `${evidence.namespace}/${branchName}`,
+      is_remote: 0,
+      last_commit_sha: evidence.legacySha,
+      ahead: 0,
+      behind: 0,
+    });
+  });
+
+  for (const fixture of [
+    { name: "missing", localCommit: null },
+    { name: "different", localCommit: "target" },
+  ] as const) {
+    it(`requires preserved origin namespace evidence at the local head when it is ${fixture.name}`, () => {
+      const pair = seedPair({ name: `preserved-origin-${fixture.name}` });
+      const evidence = seedDivergentBranchCollision(pair, "origin");
+      git(pair.path, "update-ref", "-d", "refs/heads/origin/main");
+      if (fixture.localCommit === "target") {
+        git(pair.path, "update-ref", "refs/heads/origin/main", evidence.targetSha);
+      }
+      git(pair.path, "update-ref", "refs/remotes/origin/main", evidence.legacySha);
+
+      const dry = relocatePrimaryRepo(requestFor(pair, {
+        preserveDivergentBranchesUnder: evidence.namespace,
+      }));
+
+      expect(dry.plan.can_apply).toBe(false);
+      expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+        table: "branches",
+        decision: "block",
+        preserved_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }));
+    });
+  }
+
+  it("fails closed when configured-remote target evidence conflicts with a same-name local head", () => {
+    const pair = seedPair({ name: "remote-target-ambiguous" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.legacySha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("allows same-commit local and remote-tracking target refs", () => {
+    const pair = seedPair({ name: "remote-target-same-commit" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("fails closed when a remote target branch ref is missing", () => {
+    const pair = seedPair({ name: "remote-branch-missing" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("fails closed when a remote target branch ref resolves to another commit", () => {
+    const pair = seedPair({ name: "remote-branch-mismatch" });
+    const branchName = "origin/build/managed-adapters-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.legacySha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
   });
 
   it("fails closed when preserved branch metadata names a missing object", () => {

@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Client } from "pg";
 import { getDb, getDbPath } from "../db/database.js";
+import { applyPostgresMigrations } from "../db/pg-migrations.js";
 import type { ScanResult } from "../types/index.js";
 import { getConfig, getHookQueuePath, getWorkspaceRoots } from "./config.js";
 import { drainHookQueue, installPostCommitHooks } from "./repo-hooks.js";
@@ -1032,6 +1033,7 @@ export async function syncRepoCatalog(
     await remote.query("BEGIN");
     transactionOpen = true;
     await prepareRemoteSearchPath(remote, getReposDatabaseSchema(options));
+    await applyPostgresMigrations(remote);
     await ensureRemoteSyncSchema(remote);
     onProgress?.(`[sync] ${direction} repo catalog`);
     const rowsSynced = direction === "push"

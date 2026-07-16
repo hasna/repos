@@ -68,6 +68,164 @@ describe("scanner", () => {
     expect(branches.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("classifies slash branches from their full ref namespace", async () => {
+    const repoPath = createTestRepo("repo-with-local-and-remote-slash-branches", 1);
+    execFileSync("git", ["checkout", "-b", "build/accounts-v1"], { cwd: repoPath, stdio: "pipe" });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/remotes/origin/build/accounts-v1", head], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branches = listBranches({ repo_id: repo!.id });
+
+    expect(branches).toContainEqual(expect.objectContaining({
+      name: "build/accounts-v1",
+      is_remote: 0,
+    }));
+    expect(branches).toContainEqual(expect.objectContaining({
+      name: "origin/build/accounts-v1",
+      is_remote: 1,
+    }));
+  });
+
+  it("persists local and remote refs with the same display name", async () => {
+    const repoPath = createTestRepo("repo-with-same-name-local-and-remote-branches", 1);
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/heads/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const matching = listBranches({ repo_id: repo!.id }).filter(({ name }) => name === "origin/main");
+
+    expect(matching).toHaveLength(2);
+    expect(matching.map(({ is_remote }) => is_remote).sort()).toEqual([0, 1]);
+  });
+
+  it("removes stale origin remote branch rows on rescan", async () => {
+    const repoPath = createTestRepo("repo-with-pruned-origin-branch", 1);
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    expect(listBranches({ repo_id: repo!.id })).toContainEqual(expect.objectContaining({
+      name: "origin/main",
+      is_remote: 1,
+    }));
+
+    execFileSync("git", ["update-ref", "-d", "refs/remotes/origin/main"], { cwd: repoPath, stdio: "pipe" });
+    await scanRepos([TEST_DIR]);
+
+    expect(listBranches({ repo_id: repo!.id })).not.toContainEqual(expect.objectContaining({
+      name: "origin/main",
+      is_remote: 1,
+    }));
+  });
+
+  it("preserves existing branch rows when branch enumeration fails", async () => {
+    const repoPath = createTestRepo("repo-with-failed-branch-enumeration", 1);
+    execFileSync("git", ["checkout", "-b", "feature/preserved"], { cwd: repoPath, stdio: "pipe" });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branchesBeforeFailure = listBranches({ repo_id: repo!.id });
+    expect(branchesBeforeFailure).toContainEqual(expect.objectContaining({
+      name: "feature/preserved",
+      is_remote: 0,
+    }));
+
+    execFileSync("git", ["pack-refs", "--all"], { cwd: repoPath, stdio: "pipe" });
+    writeFileSync(join(repoPath, ".git", "packed-refs"), "not-a-valid-packed-ref\n");
+
+    await scanRepos([TEST_DIR]);
+
+    expect(listBranches({ repo_id: repo!.id })).toEqual(branchesBeforeFailure);
+  });
+
+  it("replaces existing branch rows when branch enumeration succeeds with no refs", async () => {
+    const repoPath = createTestRepo("repo-with-successful-empty-branch-enumeration", 1);
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    expect(listBranches({ repo_id: repo!.id })).not.toHaveLength(0);
+
+    const branchName = execFileSync("git", ["branch", "--show-current"], {
+      cwd: repoPath,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["update-ref", "-d", `refs/heads/${branchName}`], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+
+    await scanRepos([TEST_DIR]);
+
+    expect(listBranches({ repo_id: repo!.id })).toHaveLength(0);
+  });
+
+  it("skips symbolic remote HEAD refs", async () => {
+    const repoPath = createTestRepo("repo-with-symbolic-remote-head", 1);
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+    execFileSync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branches = listBranches({ repo_id: repo!.id });
+
+    expect(branches).toContainEqual(expect.objectContaining({ name: "origin/main", is_remote: 1 }));
+    expect(branches).not.toContainEqual(expect.objectContaining({ name: "origin", is_remote: 1 }));
+    expect(branches).not.toContainEqual(expect.objectContaining({ name: "origin/HEAD", is_remote: 1 }));
+  });
+
+  it("preserves apostrophes and pipe characters in branch names", async () => {
+    const repoPath = createTestRepo("repo-with-delimiter-branch", 1);
+    const branchName = "feature/o'hare|pipe";
+    execFileSync("git", ["checkout", "-b", branchName], { cwd: repoPath, stdio: "pipe" });
+    const sha = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      cwd: repoPath,
+      encoding: "utf8",
+    }).trim();
+    const date = execFileSync("git", ["show", "-s", "--format=%ci", "HEAD"], {
+      cwd: repoPath,
+      encoding: "utf8",
+    }).trim();
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branches = listBranches({ repo_id: repo!.id });
+
+    expect(branches).toContainEqual(expect.objectContaining({
+      name: branchName,
+      is_remote: 0,
+      last_commit_sha: sha,
+      last_commit_date: date,
+    }));
+  });
+
   it("should index tags", async () => {
     const repoPath = createTestRepo("repo-with-tag", 1);
     execSync(`git tag v1.0.0`, { cwd: repoPath, stdio: "pipe" });
