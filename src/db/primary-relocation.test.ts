@@ -501,21 +501,21 @@ describe("primary relocation v2 reconciliation", () => {
     });
   }
 
-  it("validates a stale remote-marked local slash branch against its local head", () => {
+  it("fails closed for a remote-marked row without a configured remote prefix", () => {
     const pair = seedPair({ name: "stale-remote-local-slash" });
     const branchName = "build/accounts-v1";
     const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
     git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
-    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.legacySha);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
 
     const dry = relocatePrimaryRepo(requestFor(pair, {
       preserveDivergentBranchesUnder: evidence.namespace,
     }));
 
-    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.can_apply).toBe(false);
     expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
       table: "branches",
-      decision: "preserve",
+      decision: "block",
       target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
     }));
   });

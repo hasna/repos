@@ -1127,9 +1127,9 @@ function resolveTargetBranchRef(path: string, branchName: string, isRemoteRow: b
   const configuredRemote = configuredRemotes.find((name) => branchName.startsWith(`${name}/`));
   if (!configuredRemote) {
     return {
-      ref: localRef,
-      commit: localCommit,
-      status: localCommit ? "ok" : "missing",
+      ref: null,
+      commit: null,
+      status: "invalid",
       local_ref: localRef,
       local_commit: localCommit,
       remote_ref: null,

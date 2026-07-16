@@ -166,13 +166,14 @@ legacy branch rows may be preserved as deterministic `<namespace>/<branch>` rows
 the target checkout must already contain exact
 `refs/heads/<namespace>/<source-branch>` evidence at the reviewed SHA. Preserved
 refs are always local heads, even when the namespace matches a configured remote
-name. Target branch evidence is also read from `refs/heads/<branch>` unless the
-branch begins with a configured remote name such as `origin/`; in that case the
-exact `refs/remotes/<branch>` ref is required. A same-name local head may coexist
-only when it resolves to the same commit; conflicting local and remote-tracking
-commits are ambiguous and block relocation. A remote-marked row named exactly
-like a configured remote is stale or ambiguous and also blocks relocation. Apply
-never creates Git refs. Apply
+name. Local target branch rows always require exact `refs/heads/<branch>`
+evidence, including local rows named `origin/...`. Remote-marked rows must begin
+with a configured remote prefix such as `origin/` and require exact
+`refs/remotes/<branch>` evidence; they never fall back to a local head. A
+same-name local head may coexist only when it resolves to the same commit;
+conflicting local and remote-tracking commits are ambiguous and block relocation.
+A remote-marked row named exactly like a configured remote is stale or ambiguous
+and also blocks relocation. Apply never creates Git refs. Apply
 revalidates the plan under one immediate SQLite
 transaction, reparents supported children and catalog- or path-bound worktree
 leases, converges graph edges by their final mapped identity, deletes only the
