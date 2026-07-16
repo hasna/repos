@@ -151,7 +151,7 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
     ) {
       return { rows: [], rowCount: 0 };
     }
-    if (normalized.startsWith("SELECT version, mode, actor, plan_hash, counts_json FROM repos_remote_identity_cleanup_audit")) {
+    if (normalized.startsWith("SELECT idempotency_key, version, mode, actor, plan_hash, counts_json FROM repos_remote_identity_cleanup_audit")) {
       const row = this.audits.get(String(params[0]));
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
@@ -208,6 +208,7 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
     }
     if (normalized.startsWith("INSERT INTO repos_remote_identity_cleanup_audit")) {
       this.audits.set(String(params[0]), {
+        idempotency_key: params[0],
         version: params[1],
         mode: params[2],
         actor: params[3],
@@ -460,8 +461,8 @@ describe("auto-index", () => {
     expect(indexOf("SELECT pg_advisory_lock")).toBe(0);
     expect(indexOf("BEGIN ISOLATION LEVEL SERIALIZABLE")).toBeGreaterThan(indexOf("SELECT pg_advisory_lock"));
     expect(indexOf("BEGIN ISOLATION LEVEL SERIALIZABLE")).toBeLessThan(indexOf("CREATE TABLE IF NOT EXISTS"));
-    expect(indexOf("CREATE TABLE IF NOT EXISTS")).toBeLessThan(indexOf("SELECT version, mode, actor"));
-    expect(indexOf("SELECT pg_advisory_xact_lock")).toBeLessThan(indexOf("SELECT version, mode, actor"));
+    expect(indexOf("CREATE TABLE IF NOT EXISTS")).toBeLessThan(indexOf("SELECT idempotency_key, version, mode, actor"));
+    expect(indexOf("SELECT pg_advisory_xact_lock")).toBeLessThan(indexOf("SELECT idempotency_key, version, mode, actor"));
     expect(indexOf("LOCK TABLE repos, remotes")).toBeLessThan(indexOf("SELECT id, name, org, description"));
     expect(indexOf("SELECT id, name, org, description")).toBeLessThan(indexOf("UPDATE repos SET remote_url"));
     expect(applyQueries.filter((query) => query.startsWith("SELECT id, name, org, description, remote_url,"))).toHaveLength(3);
@@ -643,6 +644,89 @@ describe("auto-index", () => {
       remoteClient: replaced,
     })).rejects.toThrow("remote identity cleanup verification failed");
     expect(replaced.queries.at(-2)).toBe("ROLLBACK");
+  });
+
+  it("reads back dry-run and apply audit rows exactly before commit", async () => {
+    const dry = new FakeRemoteCleanupClient();
+    dry.afterAuditInsert = () => {
+      dry.audits.get("dry-readback")!.mode = "dry_run_substitution";
+    };
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "dry-readback",
+      remoteClient: dry,
+    })).rejects.toThrow("remote identity cleanup persisted audit is invalid");
+    expect(dry.queries.at(-2)).toBe("ROLLBACK");
+
+    const apply = new FakeRemoteCleanupClient();
+    apply.repos.set(1, {
+      id: 1,
+      name: "tool",
+      org: "team",
+      description: null,
+      remote_url: "github.com/hasna/tool",
+      search_vector: "canonical:github.com/hasna/tool",
+    });
+    const plan = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "apply-readback-plan",
+      remoteClient: apply,
+    });
+    apply.afterAuditInsert = () => {
+      const row = apply.audits.get("apply-readback");
+      if (row) row.counts_json = JSON.stringify({});
+    };
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "apply-readback",
+      expectedPlanHash: plan.plan_hash,
+      apply: true,
+      remoteClient: apply,
+    })).rejects.toThrow("remote identity cleanup persisted audit is invalid");
+    expect(apply.queries.at(-2)).toBe("ROLLBACK");
+  });
+
+  it("rejects malformed replay mode, hash, and exact counts without returning stored text", async () => {
+    const marker = "stored-audit-private-marker";
+    const mutate = [
+      (row: Record<string, unknown>) => { row.mode = marker; },
+      (row: Record<string, unknown>) => { row.plan_hash = "A".repeat(64); },
+      (row: Record<string, unknown>) => {
+        row.counts_json = JSON.stringify({
+          repos_scanned: 0,
+          repos_update: 0,
+          remotes_scanned: 0,
+          remotes_update: 0,
+          remotes_delete: 0,
+          search_vectors_repaired: 0,
+          extra: marker,
+        });
+      },
+    ];
+    for (const [index, mutateRow] of mutate.entries()) {
+      const remote = new FakeRemoteCleanupClient();
+      const key = `malformed-replay-${index}`;
+      await cleanupRemoteIdentities({
+        actor: "review-remediator",
+        idempotencyKey: key,
+        remoteClient: remote,
+      });
+      mutateRow(remote.audits.get(key)!);
+      let failure: unknown;
+      try {
+        await cleanupRemoteIdentities({
+          actor: "review-remediator",
+          idempotencyKey: key,
+          remoteClient: remote,
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe("remote identity cleanup persisted audit is invalid");
+      expect(String(failure)).not.toContain(marker);
+      expect(remote.queries.at(-2)).toBe("ROLLBACK");
+    }
   });
 
   it("uses the configured schema fallback and replays same-key dry runs deterministically", async () => {

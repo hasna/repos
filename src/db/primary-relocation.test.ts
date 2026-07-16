@@ -888,6 +888,65 @@ describe("primary relocation v2 reconciliation", () => {
     expect(getDb().query("SELECT count(*) AS count FROM commits WHERE repo_id = ?").get(pair.targetId)).toEqual({ count: 2 });
   });
 
+  it("rolls back when an audit trigger substitutes the just-inserted receipt", () => {
+    const pair = seedPair();
+    const request = requestFor(pair);
+    const dry = relocatePrimaryRepo(request);
+    getDb().exec(`CREATE TRIGGER substitute_receipt AFTER INSERT ON repo_relocation_audit
+      BEGIN
+        UPDATE repo_relocation_audit SET actor = 'trigger:substitution' WHERE id = NEW.id;
+      END`);
+
+    expectCode(() => relocatePrimaryRepo({
+      ...request,
+      apply: true,
+      expectedPlanHash: dry.plan.plan_hash,
+    }), "TRANSACTION_CONFLICT");
+    expect(getDb().query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
+    expect(getDb().query("SELECT id, path FROM repos ORDER BY id").all()).toEqual([
+      { id: pair.legacyId, path: pair.sourcePath },
+      { id: pair.targetId, path: pair.path },
+    ]);
+  });
+
+  it("rolls back same-cardinality post-receipt drift across planned relocation state", () => {
+    const pair = seedPair();
+    const db = getDb();
+    insertChildFixtures(pair.legacyId, pair.targetId);
+    db.exec(`CREATE TABLE worktree_leases (
+      lease_id TEXT PRIMARY KEY, repo_path TEXT NOT NULL,
+      repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    )`);
+    db.query("INSERT INTO worktree_leases (lease_id, repo_path, repo_catalog_id) VALUES ('target-lease', ?, ?)")
+      .run(pair.path, pair.targetId);
+    db.query("INSERT INTO edges (source_type, source_id, relation, target_type, target_id, metadata) VALUES ('repo', ?, 'depends_on', 'repo', '999', '{}')")
+      .run(String(pair.targetId));
+    const request = requestFor(pair);
+    const dry = relocatePrimaryRepo(request);
+    const beforeCommit = db.query("SELECT id, message FROM commits ORDER BY id").all();
+    db.exec(`CREATE TRIGGER substitute_relocation_state AFTER INSERT ON repo_relocation_audit
+      BEGIN
+        UPDATE repos SET name = 'canonical-substitution' WHERE id = NEW.repo_id;
+        UPDATE commits SET message = 'same-count-substitution'
+          WHERE id = (SELECT min(id) FROM commits WHERE repo_id = NEW.repo_id);
+        UPDATE edges SET metadata = '{"trigger":true}'
+          WHERE id = (SELECT min(id) FROM edges);
+        UPDATE worktree_leases SET metadata = '{"trigger":true}'
+          WHERE lease_id = 'target-lease';
+      END`);
+
+    expectCode(() => relocatePrimaryRepo({
+      ...request,
+      apply: true,
+      expectedPlanHash: dry.plan.plan_hash,
+    }), "TRANSACTION_CONFLICT");
+    expect(db.query("SELECT id, message FROM commits ORDER BY id").all()).toEqual(beforeCommit);
+    expect(db.query("SELECT metadata FROM edges").get()).toEqual({ metadata: "{}" });
+    expect(db.query("SELECT metadata FROM worktree_leases").get()).toEqual({ metadata: "{}" });
+    expect(db.query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
+  });
+
   it("returns the persisted receipt on same-request retry and blocks same-key different requests", () => {
     const pair = seedPair();
     const request = requestFor(pair);

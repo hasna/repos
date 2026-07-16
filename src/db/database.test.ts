@@ -551,7 +551,7 @@ describe("database", () => {
     seed.close();
 
     try {
-      expect(() => getDb(path)).toThrow("remote identity successor migration failed canonical verification");
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
       closeDb();
       const raw = new Database(path);
       expect(raw.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({ remote_url: unsafe });
@@ -590,10 +590,71 @@ describe("database", () => {
     seed.close();
 
     try {
-      expect(() => getDb(path)).toThrow("remote identity successor migration failed canonical verification");
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
       closeDb();
       const raw = new Database(path);
       expect(raw.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({ remote_url: unsafe });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back v9 when the marker trigger makes canonical same-count substitutions", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-exact-marker-"));
+    const path = join(dir, "repos.db");
+    const original = "github.com/hasna/original";
+    const substituted = "github.com/hasna/substituted";
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT
+      );
+      INSERT INTO repos VALUES (1, '/tmp/exact-marker', 'exact-marker', '${original}');
+      INSERT INTO remotes VALUES (11, '${original}', '${original}');
+      INSERT INTO repo_relocation_audit VALUES (
+        'exact-receipt', '${original}',
+        '{"remote_url":"${original}"}',
+        '{"remote_url":"${original}"}',
+        '{"remote_url":"${original}"}'
+      );
+      CREATE TRIGGER migrations_v9_substitute AFTER INSERT ON migrations
+      WHEN NEW.version = 9
+      BEGIN
+        UPDATE repos SET remote_url = '${substituted}' WHERE id = 1;
+        DELETE FROM remotes WHERE id = 11;
+        INSERT INTO remotes VALUES (12, '${substituted}', '${substituted}');
+        UPDATE repo_relocation_audit SET
+          expected_remote = '${substituted}',
+          source_json = '{"remote_url":"${substituted}"}'
+          WHERE id = 'exact-receipt';
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT id, remote_url FROM repos").all()).toEqual([{ id: 1, remote_url: original }]);
+      expect(raw.query("SELECT id, url, fetch_url FROM remotes").all()).toEqual([{
+        id: 11,
+        url: original,
+        fetch_url: original,
+      }]);
+      expect(raw.query("SELECT expected_remote, source_json FROM repo_relocation_audit").get()).toEqual({
+        expected_remote: original,
+        source_json: JSON.stringify({ remote_url: original }),
+      });
       expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
       raw.close();
     } finally {

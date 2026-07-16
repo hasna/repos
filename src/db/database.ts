@@ -180,8 +180,8 @@ export function closeDb(): void {
 interface Migration {
   version: number;
   sql?: string;
-  run?: (db: Database) => void;
-  verifyAfterMarker?: (db: Database) => void;
+  run?: (db: Database) => unknown;
+  verifyAfterMarker?: (db: Database, runResult: unknown) => void;
 }
 
 function sanitizeRelocationSnapshot(value: string): string {
@@ -201,31 +201,47 @@ function sanitizeRelocationSnapshot(value: string): string {
   return JSON.stringify(snapshot);
 }
 
-function verifyV9RemoteIdentityState(db: Database): void {
-  const reposCanonical = (db.query("SELECT remote_url FROM repos").all() as Array<{ remote_url: unknown }>).every(
-    (row) => row.remote_url === sanitizeRemoteIdentity(row.remote_url),
-  );
-  const remotesCanonical = (db.query("SELECT url, fetch_url FROM remotes").all() as Array<{
-    url: unknown;
-    fetch_url: unknown;
-  }>).every((row) => {
-    const url = sanitizeRemoteIdentity(row.url);
-    return url !== null
-      && row.url === url
-      && row.fetch_url === sanitizeRemoteIdentity(row.fetch_url);
-  });
-  const auditsCanonical = (db.query(`SELECT expected_remote, source_json, target_json, after_json
-    FROM repo_relocation_audit`).all() as Array<{
+interface V9RemoteIdentityTargetState {
+  repos: Array<{ id: number; remote_url: string | null }>;
+  remotes: Array<{ id: number; url: string; fetch_url: string | null }>;
+  audits: Array<{
+    id: string;
     expected_remote: string;
     source_json: string;
     target_json: string;
     after_json: string;
-  }>).every((row) => row.expected_remote === (sanitizeRemoteIdentity(row.expected_remote) ?? "")
-    && row.source_json === sanitizeRelocationSnapshot(row.source_json)
-    && row.target_json === sanitizeRelocationSnapshot(row.target_json)
-    && row.after_json === sanitizeRelocationSnapshot(row.after_json));
-  if (!reposCanonical || !remotesCanonical || !auditsCanonical) {
-    throw new Error("remote identity successor migration failed canonical verification");
+  }>;
+}
+
+function stableMigrationState(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableMigrationState).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableMigrationState(record[key])}`).join(",")}}`;
+}
+
+function readV9RemoteIdentityState(db: Database): V9RemoteIdentityTargetState {
+  return {
+    repos: (db.query("SELECT id, remote_url FROM repos").all() as V9RemoteIdentityTargetState["repos"])
+      .sort((left, right) => left.id - right.id),
+    remotes: (db.query("SELECT id, url, fetch_url FROM remotes").all() as V9RemoteIdentityTargetState["remotes"])
+      .sort((left, right) => left.id - right.id),
+    audits: (db.query(`SELECT id, expected_remote, source_json, target_json, after_json
+      FROM repo_relocation_audit`).all() as V9RemoteIdentityTargetState["audits"])
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+  };
+}
+
+function verifyV9RemoteIdentityState(db: Database, expected: unknown): void {
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) {
+    throw new Error("remote identity successor migration is missing exact target state");
+  }
+  const actual = readV9RemoteIdentityState(db);
+  // Compare complete ID-keyed target rows, including deletion and exact
+  // cardinality. Canonicality alone would allow a trigger to substitute a
+  // different canonical value or replace one row with another.
+  if (stableMigrationState(actual) !== stableMigrationState(expected)) {
+    throw new Error("remote identity successor migration failed exact-state verification");
   }
   if (db.query("PRAGMA foreign_key_check").all().length > 0) {
     throw new Error("remote identity successor migration failed foreign-key verification");
@@ -247,9 +263,9 @@ function runMigrations(db: Database): void {
       const applied = db.query("SELECT 1 FROM migrations WHERE version = ?").get(migration.version);
       if (!applied) {
         if (migration.sql) db.exec(migration.sql);
-        migration.run?.(db);
+        const runResult = migration.run?.(db);
         db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
-        migration.verifyAfterMarker?.(db);
+        migration.verifyAfterMarker?.(db, runResult);
       }
       db.exec("COMMIT");
     } catch (error) {
@@ -615,14 +631,21 @@ const MIGRATIONS: Migration[] = [
         id: number;
         remote_url: string | null;
       }>;
+      const targetRepos = repoRows
+        .map((row) => ({ id: row.id, remote_url: sanitizeRemoteIdentity(row.remote_url) }))
+        .sort((left, right) => left.id - right.id);
       const updateRepo = db.query("UPDATE repos SET remote_url = ? WHERE id = ?");
-      for (const row of repoRows) updateRepo.run(sanitizeRemoteIdentity(row.remote_url), row.id);
+      for (const row of targetRepos) updateRepo.run(row.remote_url, row.id);
 
       const remoteRows = db.query("SELECT id, url, fetch_url FROM remotes").all() as Array<{
         id: number;
         url: string;
         fetch_url: string | null;
       }>;
+      const targetRemotes = remoteRows.flatMap((row) => {
+        const url = sanitizeRemoteIdentity(row.url);
+        return url ? [{ id: row.id, url, fetch_url: sanitizeRemoteIdentity(row.fetch_url) }] : [];
+      }).sort((left, right) => left.id - right.id);
       const updateRemote = db.query("UPDATE remotes SET url = ?, fetch_url = ? WHERE id = ?");
       const removeRemote = db.query("DELETE FROM remotes WHERE id = ?");
       for (const row of remoteRows) {
@@ -642,14 +665,21 @@ const MIGRATIONS: Migration[] = [
         target_json: string;
         after_json: string;
       }>;
+      const targetAudits = auditRows.map((row) => ({
+        id: row.id,
+        expected_remote: sanitizeRemoteIdentity(row.expected_remote) ?? "",
+        source_json: sanitizeRelocationSnapshot(row.source_json),
+        target_json: sanitizeRelocationSnapshot(row.target_json),
+        after_json: sanitizeRelocationSnapshot(row.after_json),
+      })).sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
       const updateAudit = db.query(`UPDATE repo_relocation_audit SET
         expected_remote = ?, source_json = ?, target_json = ?, after_json = ? WHERE id = ?`);
-      for (const row of auditRows) {
+      for (const row of targetAudits) {
         updateAudit.run(
-          sanitizeRemoteIdentity(row.expected_remote) ?? "",
-          sanitizeRelocationSnapshot(row.source_json),
-          sanitizeRelocationSnapshot(row.target_json),
-          sanitizeRelocationSnapshot(row.after_json),
+          row.expected_remote,
+          row.source_json,
+          row.target_json,
+          row.after_json,
           row.id,
         );
       }
@@ -657,7 +687,13 @@ const MIGRATIONS: Migration[] = [
       if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'fts_repos'").get()) {
         db.exec("INSERT INTO fts_repos(fts_repos) VALUES ('rebuild')");
       }
-      verifyV9RemoteIdentityState(db);
+      const expected: V9RemoteIdentityTargetState = {
+        repos: targetRepos,
+        remotes: targetRemotes,
+        audits: targetAudits,
+      };
+      verifyV9RemoteIdentityState(db, expected);
+      return expected;
     },
     verifyAfterMarker: verifyV9RemoteIdentityState,
   },

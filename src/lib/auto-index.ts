@@ -391,24 +391,70 @@ function cleanupStatesEqual(expected: Map<number, string>, actual: Map<number, s
   return true;
 }
 
+const CLEANUP_COUNT_FIELDS: Array<keyof RemoteIdentityCleanupCounts> = [
+  "repos_scanned",
+  "repos_update",
+  "remotes_scanned",
+  "remotes_update",
+  "remotes_delete",
+  "search_vectors_repaired",
+];
+
 function parseCleanupCounts(value: unknown): RemoteIdentityCleanupCounts {
   const parsed = typeof value === "string" ? JSON.parse(value) as unknown : value;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("invalid cleanup audit");
+    throw cleanupFailure("remote identity cleanup persisted audit is invalid");
   }
   const counts = parsed as Record<string, unknown>;
-  const fields: Array<keyof RemoteIdentityCleanupCounts> = [
-    "repos_scanned",
-    "repos_update",
-    "remotes_scanned",
-    "remotes_update",
-    "remotes_delete",
-    "search_vectors_repaired",
-  ];
-  if (fields.some((field) => !Number.isSafeInteger(counts[field]) || Number(counts[field]) < 0)) {
-    throw new Error("invalid cleanup audit");
+  const keys = Object.keys(counts).sort();
+  const expectedKeys = [...CLEANUP_COUNT_FIELDS].sort();
+  if (
+    keys.length !== expectedKeys.length
+    || keys.some((key, index) => key !== expectedKeys[index])
+    || CLEANUP_COUNT_FIELDS.some((field) => !Number.isSafeInteger(counts[field]) || Number(counts[field]) < 0)
+  ) {
+    throw cleanupFailure("remote identity cleanup persisted audit is invalid");
   }
-  return Object.fromEntries(fields.map((field) => [field, Number(counts[field])])) as unknown as RemoteIdentityCleanupCounts;
+  return Object.fromEntries(CLEANUP_COUNT_FIELDS.map((field) => [field, Number(counts[field])])) as unknown as RemoteIdentityCleanupCounts;
+}
+
+function cleanupCountsEqual(
+  left: RemoteIdentityCleanupCounts,
+  right: RemoteIdentityCleanupCounts,
+): boolean {
+  return CLEANUP_COUNT_FIELDS.every((field) => left[field] === right[field]);
+}
+
+function validateCleanupAuditRow(
+  row: Record<string, unknown>,
+  expected: {
+    idempotencyKey: string;
+    version: number;
+    mode: "dry_run" | "apply";
+    actor: string;
+    planHash?: string;
+    counts?: RemoteIdentityCleanupCounts;
+  },
+): { planHash: string; counts: RemoteIdentityCleanupCounts } {
+  try {
+    const planHash = typeof row["plan_hash"] === "string" ? row["plan_hash"] : "";
+    const counts = parseCleanupCounts(row["counts_json"]);
+    if (
+      row["idempotency_key"] !== expected.idempotencyKey
+      || row["version"] !== expected.version
+      || row["mode"] !== expected.mode
+      || row["actor"] !== expected.actor
+      || !/^[0-9a-f]{64}$/.test(planHash)
+      || (expected.planHash !== undefined && planHash !== expected.planHash)
+      || (expected.counts !== undefined && !cleanupCountsEqual(counts, expected.counts))
+    ) {
+      throw cleanupFailure("remote identity cleanup persisted audit is invalid");
+    }
+    return { planHash, counts };
+  } catch (error) {
+    if (error instanceof RemoteIdentityCleanupFailure) throw error;
+    throw cleanupFailure("remote identity cleanup persisted audit is invalid");
+  }
 }
 
 export async function cleanupRemoteIdentities(
@@ -470,31 +516,32 @@ export async function cleanupRemoteIdentities(
     `);
     await remote.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [idempotencyKey]);
     const existing = await remote.query(`
-      SELECT version, mode, actor, plan_hash, counts_json
+      SELECT idempotency_key, version, mode, actor, plan_hash, counts_json
       FROM repos_remote_identity_cleanup_audit
       WHERE idempotency_key = $1
     `, [idempotencyKey]);
+    if (existing.rows.length > 1) {
+      throw cleanupFailure("remote identity cleanup persisted audit is invalid");
+    }
     if (existing.rows[0]) {
-      const row = existing.rows[0]!;
-      const applied = row["mode"] === "apply";
-      if (
-        Number(row["version"]) !== version
-        || String(row["actor"]) !== actor
-        || applied !== Boolean(options.apply)
-        || (options.expectedPlanHash && String(row["plan_hash"]) !== options.expectedPlanHash)
-      ) {
-        throw cleanupFailure("remote identity cleanup idempotency conflict");
-      }
+      const mode = options.apply ? "apply" : "dry_run";
+      const validatedAudit = validateCleanupAuditRow(existing.rows[0]!, {
+        idempotencyKey,
+        version,
+        mode,
+        actor,
+        planHash: options.expectedPlanHash,
+      });
       await remote.query("COMMIT");
       transactionOpen = false;
       return {
         schema: REMOTE_IDENTITY_CLEANUP_SCHEMA,
         version: 1,
-        applied,
+        applied: Boolean(options.apply),
         replayed: true,
         idempotency_key: idempotencyKey,
-        plan_hash: String(row["plan_hash"]),
-        counts: parseCleanupCounts(row["counts_json"]),
+        plan_hash: validatedAudit.planHash,
+        counts: validatedAudit.counts,
       };
     }
 
@@ -704,6 +751,22 @@ export async function cleanupRemoteIdentities(
         (idempotency_key, version, mode, actor, plan_hash, counts_json)
       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
     `, [idempotencyKey, version, mode, actor, planHash, JSON.stringify(counts)]);
+    const persistedAudit = await remote.query(`
+      SELECT idempotency_key, version, mode, actor, plan_hash, counts_json
+      FROM repos_remote_identity_cleanup_audit
+      WHERE idempotency_key = $1
+    `, [idempotencyKey]);
+    if (persistedAudit.rows.length !== 1) {
+      throw cleanupFailure("remote identity cleanup persisted audit is invalid");
+    }
+    validateCleanupAuditRow(persistedAudit.rows[0]!, {
+      idempotencyKey,
+      version,
+      mode,
+      actor,
+      planHash,
+      counts,
+    });
     if (options.apply) {
       // The audit insert is still inside the serializable transaction. Verify
       // the complete post-state again so triggers cannot contaminate or change
