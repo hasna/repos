@@ -5,6 +5,18 @@ export { applyPostgresMigrations } from "./db/pg-migrations.js";
 export type { PostgresMigrationClient } from "./db/pg-migrations.js";
 export { sanitizeRemoteIdentity, sanitizeRemoteOutput } from "./lib/remote-identity.js";
 export {
+  BranchAdjudicationError,
+  adjudicateBranches,
+} from "./db/branch-adjudication.js";
+export type {
+  BranchAdjudicationErrorCode,
+  BranchAdjudicationPlannedRow,
+  BranchAdjudicationReceipt,
+  BranchAdjudicationRequest,
+  BranchAdjudicationResult,
+  BranchAdjudicationRowSpec,
+} from "./db/branch-adjudication.js";
+export {
   PrimaryRelocationError,
   relocatePrimaryRepo,
   sanitizeGitRemoteUrl,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { registerEventsCommands } from "@hasna/events/commander";
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { program } from "commander";
 import { getCliVersion } from "./version.js";
 import { parseIntOption } from "./args.js";
@@ -17,6 +18,12 @@ import {
   getRepoStats,
   AmbiguousRepoNameError,
 } from "../db/repos.js";
+import {
+  BranchAdjudicationError,
+  adjudicateBranches,
+  type BranchAdjudicationRequest,
+  type BranchAdjudicationRowSpec,
+} from "../db/branch-adjudication.js";
 import {
   PrimaryRelocationError,
   relocatePrimaryRepo,
@@ -474,6 +481,104 @@ registry
       if (json) {
         const details = error instanceof PrimaryRelocationError ? error.details : undefined;
         console.log(JSON.stringify({ schema: "open-repos.primary-relocation.v2", ok: false, error: { code, message, details } }, null, 2));
+      } else {
+        console.error(chalk.red(`${code}: ${message}`));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+function branchAdjudicationSpecFromFile(path: string): Omit<BranchAdjudicationRequest, "actor" | "idempotencyKey" | "apply" | "expectedPlanHash" | "databasePath"> & {
+  actor?: string;
+  idempotency_key?: string;
+  idempotencyKey?: string;
+} {
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new BranchAdjudicationError("INVALID_REQUEST", "spec file must contain a JSON object");
+  }
+  const object = parsed as Record<string, unknown>;
+  if (!Array.isArray(object["rows"])) {
+    throw new BranchAdjudicationError("INVALID_REQUEST", "spec file must contain rows[]");
+  }
+  const rows = object["rows"].map((value, index): BranchAdjudicationRowSpec => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new BranchAdjudicationError("INVALID_REQUEST", `rows[${index}] must be an object`);
+    }
+    const row = value as Record<string, unknown>;
+    const expectedIsRemote = row["expected_is_remote"] ?? row["expectedIsRemote"];
+    return {
+      id: Number(row["id"]),
+      repoId: Number(row["repo_id"] ?? row["repoId"]),
+      name: String(row["name"] ?? ""),
+      action: "reclassify-local",
+      expectedIsRemote: expectedIsRemote === undefined
+        ? undefined
+        : typeof expectedIsRemote === "boolean" || typeof expectedIsRemote === "number"
+          ? expectedIsRemote
+          : Number.NaN,
+      expectedLastCommitSha: String(row["expected_last_commit_sha"] ?? row["expectedLastCommitSha"] ?? ""),
+      expectedRepoRevision: typeof (row["expected_repo_revision"] ?? row["expectedRepoRevision"]) === "string"
+        ? String(row["expected_repo_revision"] ?? row["expectedRepoRevision"])
+        : undefined,
+      evidenceRepoPath: String(row["evidence_repo_path"] ?? row["evidenceRepoPath"] ?? ""),
+      evidenceRef: typeof (row["evidence_ref"] ?? row["evidenceRef"]) === "string"
+        ? String(row["evidence_ref"] ?? row["evidenceRef"])
+        : undefined,
+    };
+  });
+  return {
+    rows,
+    actor: typeof object["actor"] === "string" ? object["actor"] : undefined,
+    idempotency_key: typeof object["idempotency_key"] === "string" ? object["idempotency_key"] : undefined,
+    idempotencyKey: typeof object["idempotencyKey"] === "string" ? object["idempotencyKey"] : undefined,
+  };
+}
+
+registry
+  .command("adjudicate-branches")
+  .description("Dry-run or apply exact audited branch-row adjudications")
+  .requiredOption("--spec <path>", "JSON spec containing exact guarded branch row adjudications")
+  .option("--actor <actor>", "Auditable operator or workflow identity; overrides spec actor")
+  .option("--idempotency-key <key>", "Stable unique key for this logical adjudication; overrides spec key")
+  .option("--expected-plan-hash <sha256>", "Exact plan hash emitted by reviewed dry run; required with --apply")
+  .option("--dry-run", "Plan exact row adjudication without writing (default)")
+  .option("--apply", "Atomically apply exact row adjudication using the reviewed plan hash")
+  .option("--json", "Output the versioned JSON result")
+  .action((opts) => {
+    const json = Boolean(opts.json);
+    try {
+      if (opts.apply && opts.dryRun) {
+        throw new BranchAdjudicationError("INVALID_REQUEST", "--apply and --dry-run are mutually exclusive");
+      }
+      const spec = branchAdjudicationSpecFromFile(opts.spec);
+      const actor = opts.actor ?? spec.actor;
+      const idempotencyKey = opts.idempotencyKey ?? spec.idempotencyKey ?? spec.idempotency_key;
+      const result = adjudicateBranches({
+        rows: spec.rows,
+        actor,
+        idempotencyKey,
+        apply: Boolean(opts.apply),
+        expectedPlanHash: opts.expectedPlanHash,
+        databasePath: getDbPath(),
+      });
+      if (json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else if (result.applied) {
+        const replayed = result.replayed ? "replayed " : "";
+        console.log(chalk.green(`✓ ${replayed}branch adjudication applied for ${result.plan.rows.length} row(s)`));
+        console.log(chalk.dim(`  Receipt: ${result.receipt!.id}`));
+      } else {
+        console.log(chalk.yellow(`Dry run: ${result.plan.rows.length} branch row(s) can be adjudicated`));
+        console.log(chalk.dim(`  Plan: ${result.plan.plan_hash}`));
+        console.log(chalk.dim("  Re-run with --apply --expected-plan-hash <plan> after review."));
+      }
+    } catch (error) {
+      const code = error instanceof BranchAdjudicationError ? error.code : "UNEXPECTED_ERROR";
+      const message = error instanceof Error ? error.message : "unknown branch adjudication error";
+      if (json) {
+        const details = error instanceof BranchAdjudicationError ? error.details : undefined;
+        console.log(JSON.stringify({ schema: "open-repos.branch-adjudication.v1", ok: false, error: { code, message, details } }, null, 2));
       } else {
         console.error(chalk.red(`${code}: ${message}`));
       }
