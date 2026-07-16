@@ -133,6 +133,24 @@ function insertChildFixtures(legacyId: number, targetId: number) {
   db.query("INSERT INTO pull_requests (repo_id, number, title, author, created_at) VALUES (?, 7, 'Move', 'A', '2026-07-14')").run(targetId);
 }
 
+function seedDivergentBranchCollision(
+  pair: ReturnType<typeof seedPair>,
+  namespace = "legacy-preserved",
+) {
+  const db = getDb();
+  git(pair.path, "checkout", "-b", "legacy-source");
+  writeFileSync(join(pair.path, "legacy-branch.txt"), "legacy branch\n");
+  git(pair.path, "add", "legacy-branch.txt");
+  git(pair.path, "commit", "-m", "legacy branch");
+  const legacySha = git(pair.path, "rev-parse", "HEAD");
+  const preservedName = `${namespace}/main`;
+  git(pair.path, "update-ref", `refs/heads/${preservedName}`, legacySha);
+  git(pair.path, "checkout", "main");
+  db.query("INSERT INTO branches (repo_id, name, last_commit_sha) VALUES (?, 'main', ?)").run(pair.legacyId, legacySha);
+  db.query("INSERT INTO branches (repo_id, name, last_commit_sha) VALUES (?, 'main', ?)").run(pair.targetId, pair.head);
+  return { namespace, legacySha, preservedName, targetSha: pair.head };
+}
+
 beforeEach(() => {
   closeDb();
   root = mkdtempSync(join(tmpdir(), "repos-reconcile-v2-"));
@@ -293,6 +311,118 @@ describe("primary relocation v2 reconciliation", () => {
     expect(JSON.stringify(error.details)).not.toContain("legacy");
     expect(JSON.stringify(error.details)).not.toContain("target\"");
     expect(db.query("SELECT message FROM commits ORDER BY repo_id").all()).toEqual([{ message: "legacy" }, { message: "target" }]);
+  });
+
+  it("keeps divergent branch collisions fail-closed by default", () => {
+    const pair = seedPair({ name: "branch-default" });
+    seedDivergentBranchCollision(pair);
+
+    const dry = relocatePrimaryRepo(requestFor(pair));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "branches", decision: "block" }));
+    const error = expectCode(() => relocatePrimaryRepo({
+      ...requestFor(pair),
+      apply: true,
+      expectedPlanHash: dry.plan.plan_hash,
+    }), "DIVERGENT_COLLISION");
+    expect(error.details?.collisions?.[0]).toMatchObject({ table: "branches", decision: "block" });
+    expect(getDb().query("SELECT repo_id, name FROM branches ORDER BY repo_id, name").all()).toEqual([
+      { repo_id: pair.legacyId, name: "main" },
+      { repo_id: pair.targetId, name: "main" },
+    ]);
+  });
+
+  it("requires exact target refs before preserving divergent legacy branches", () => {
+    const pair = seedPair({ name: "branch-missing-evidence" });
+    const db = getDb();
+    db.query("INSERT INTO branches (repo_id, name, last_commit_sha) VALUES (?, 'main', ?)").run(pair.legacyId, "a".repeat(40));
+    db.query("INSERT INTO branches (repo_id, name, last_commit_sha) VALUES (?, 'main', ?)").run(pair.targetId, pair.head);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, { preserveDivergentBranchesUnder: "legacy-preserved" }));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      preserved_name_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+    expectCode(() => relocatePrimaryRepo({
+      ...requestFor(pair, { preserveDivergentBranchesUnder: "legacy-preserved" }),
+      apply: true,
+      expectedPlanHash: dry.plan.plan_hash,
+    }), "DIVERGENT_COLLISION");
+  });
+
+  it("preserves divergent legacy branches under an explicit reviewed namespace", () => {
+    const pair = seedPair({ name: "branch-preserve" });
+    const evidence = seedDivergentBranchCollision(pair);
+    const defaultDry = relocatePrimaryRepo(requestFor(pair));
+    const request = requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+      idempotencyKey: "branch-preserve-cutover-v1",
+    });
+    const dry = relocatePrimaryRepo(request);
+
+    expect(defaultDry.plan.can_apply).toBe(false);
+    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.plan_hash).not.toBe(defaultDry.plan.plan_hash);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      preserved_name_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      preserved_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+
+    const applied = relocatePrimaryRepo({ ...request, apply: true, expectedPlanHash: dry.plan.plan_hash });
+    const retry = relocatePrimaryRepo({ ...request, apply: true, expectedPlanHash: dry.plan.plan_hash });
+    expect(retry.replayed).toBe(true);
+    expect(retry.receipt?.id).toBe(applied.receipt?.id);
+    expect(getDb().query("SELECT repo_id, name, last_commit_sha FROM branches ORDER BY name").all()).toEqual([
+      { repo_id: pair.legacyId, name: evidence.preservedName, last_commit_sha: evidence.legacySha },
+      { repo_id: pair.legacyId, name: "main", last_commit_sha: evidence.targetSha },
+    ]);
+    expect(getDb().query("SELECT id FROM repos WHERE id = ?").get(pair.targetId)).toBeNull();
+  });
+
+  it("does not let branch preservation mask non-branch divergence", () => {
+    const pair = seedPair({ name: "branch-preserve-nonbranch" });
+    seedDivergentBranchCollision(pair);
+    const db = getDb();
+    db.query("INSERT INTO commits (repo_id, sha, author_name, author_email, date, message) VALUES (?, 'same', 'A', 'a@invalid', '2026', 'legacy')").run(pair.legacyId);
+    db.query("INSERT INTO commits (repo_id, sha, author_name, author_email, date, message) VALUES (?, 'same', 'A', 'a@invalid', '2026', 'target')").run(pair.targetId);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, { preserveDivergentBranchesUnder: "legacy-preserved" }));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "branches", decision: "preserve" }));
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "commits", decision: "block" }));
+  });
+
+  it("binds preservation evidence into the reviewed plan hash and revalidates apply", () => {
+    const pair = seedPair({ name: "branch-preserve-revalidate" });
+    const evidence = seedDivergentBranchCollision(pair);
+    const request = requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+      idempotencyKey: "branch-preserve-revalidate-v1",
+    });
+    const dry = relocatePrimaryRepo(request);
+    expect(dry.plan.can_apply).toBe(true);
+
+    git(pair.path, "checkout", "-b", "preservation-drift");
+    writeFileSync(join(pair.path, "preservation-drift.txt"), "drift\n");
+    git(pair.path, "add", "preservation-drift.txt");
+    git(pair.path, "commit", "-m", "preservation drift");
+    git(pair.path, "update-ref", `refs/heads/${evidence.preservedName}`, git(pair.path, "rev-parse", "HEAD"));
+    git(pair.path, "checkout", "main");
+
+    expectCode(() => relocatePrimaryRepo({
+      ...request,
+      apply: true,
+      expectedPlanHash: dry.plan.plan_hash,
+    }), "PLAN_HASH_MISMATCH");
+    expect(getDb().query("SELECT repo_id, name FROM branches ORDER BY repo_id, name").all()).toEqual([
+      { repo_id: pair.legacyId, name: "main" },
+      { repo_id: pair.targetId, name: "main" },
+    ]);
   });
 
   it("requires reviewed plan hash and rejects stale plans, row revisions, and row paths", () => {

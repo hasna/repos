@@ -426,6 +426,7 @@ registry
   .requiredOption("--actor <actor>", "Auditable operator or workflow identity")
   .requiredOption("--idempotency-key <key>", "Stable unique key for this logical relocation")
   .option("--expected-plan-hash <sha256>", "Exact plan hash emitted by the dry run; required with --apply")
+  .option("--preserve-divergent-branches-under <namespace>", "Preserve divergent legacy branches as <namespace>/<branch> when exact target refs already exist")
   .option("--dry-run", "Plan reconciliation without writing (default)")
   .option("--apply", "Atomically reconcile both rows using the supplied dry-run plan hash")
   .option("--json", "Output the versioned JSON result")
@@ -450,6 +451,7 @@ registry
         actor: opts.actor,
         idempotencyKey: opts.idempotencyKey,
         expectedPlanHash: opts.expectedPlanHash,
+        preserveDivergentBranchesUnder: opts.preserveDivergentBranchesUnder,
         apply: Boolean(opts.apply),
         databasePath: getDbPath(),
       });
