@@ -138,6 +138,47 @@ describe("scanner", () => {
     }));
   });
 
+  it("preserves existing branch rows when branch enumeration fails", async () => {
+    const repoPath = createTestRepo("repo-with-failed-branch-enumeration", 1);
+    execFileSync("git", ["checkout", "-b", "feature/preserved"], { cwd: repoPath, stdio: "pipe" });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branchesBeforeFailure = listBranches({ repo_id: repo!.id });
+    expect(branchesBeforeFailure).toContainEqual(expect.objectContaining({
+      name: "feature/preserved",
+      is_remote: 0,
+    }));
+
+    execFileSync("git", ["pack-refs", "--all"], { cwd: repoPath, stdio: "pipe" });
+    writeFileSync(join(repoPath, ".git", "packed-refs"), "not-a-valid-packed-ref\n");
+
+    await scanRepos([TEST_DIR]);
+
+    expect(listBranches({ repo_id: repo!.id })).toEqual(branchesBeforeFailure);
+  });
+
+  it("replaces existing branch rows when branch enumeration succeeds with no refs", async () => {
+    const repoPath = createTestRepo("repo-with-successful-empty-branch-enumeration", 1);
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    expect(listBranches({ repo_id: repo!.id })).not.toHaveLength(0);
+
+    const branchName = execFileSync("git", ["branch", "--show-current"], {
+      cwd: repoPath,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["update-ref", "-d", `refs/heads/${branchName}`], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+
+    await scanRepos([TEST_DIR]);
+
+    expect(listBranches({ repo_id: repo!.id })).toHaveLength(0);
+  });
+
   it("skips symbolic remote HEAD refs", async () => {
     const repoPath = createTestRepo("repo-with-symbolic-remote-head", 1);
     execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {

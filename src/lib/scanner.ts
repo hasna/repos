@@ -14,17 +14,22 @@ import {
 } from "../db/repos.js";
 import type { ScanResult } from "../types/index.js";
 
-function git(repoPath: string, args: string[]): string {
+function gitWithStatus(repoPath: string, args: string[]): { ok: boolean; output: string } {
   try {
-    return execFileSync("git", ["-C", repoPath, ...args], {
+    const output = execFileSync("git", ["-C", repoPath, ...args], {
       encoding: "utf-8",
       timeout: 30_000,
       maxBuffer: 50 * 1024 * 1024,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
+    return { ok: true, output };
   } catch {
-    return "";
+    return { ok: false, output: "" };
   }
+}
+
+function git(repoPath: string, args: string[]): string {
+  return gitWithStatus(repoPath, args).output;
 }
 
 function isGitRepo(dir: string): boolean {
@@ -159,12 +164,13 @@ function indexRepo(repoPath: string, full = false): {
   );
 
   // Index branches
-  const branchOutput = git(repoPath, [
+  const branchResult = gitWithStatus(repoPath, [
     "for-each-ref",
     "--format=%(refname)%00%(symref)%00%(objectname:short)%00%(committerdate:iso8601)",
     "refs/heads",
     "refs/remotes",
   ]);
+  const branchOutput = branchResult.output;
   const branchEntries: Array<{
     name: string; is_remote: boolean; last_commit_sha: string | null;
     last_commit_date: string | null; ahead: number; behind: number;
@@ -212,7 +218,9 @@ function indexRepo(repoPath: string, full = false): {
     }
   }
 
-  const branchesInserted = replaceBranches(repo.id, branchEntries);
+  const branchesInserted = branchResult.ok
+    ? replaceBranches(repo.id, branchEntries)
+    : 0;
 
   // Index tags
   const tagOutput = git(repoPath, [
