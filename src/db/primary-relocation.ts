@@ -31,6 +31,8 @@ const OPERATION = "primary_relocation" as const;
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const SAFE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$/;
+const DEFAULT_GIT_COMMAND_TIMEOUT_MS = 10_000;
+export const FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS = 120_000;
 
 const CHILD_TABLES = [
   { table: "commits", key: ["sha"] },
@@ -385,7 +387,7 @@ function safeRepo(repo: Repo): Repo {
   };
 }
 
-function runGitRaw(path: string, args: string[]): Buffer {
+function runGitRaw(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND_TIMEOUT_MS): Buffer {
   try {
     const env = Object.fromEntries(
       Object.entries(process.env).filter(([key, value]) => !/^GIT_/i.test(key) && value !== undefined),
@@ -406,7 +408,7 @@ function runGitRaw(path: string, args: string[]): Buffer {
       ...args,
     ], {
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 10_000,
+      timeout: timeoutMs,
       maxBuffer: 128 * 1024 * 1024,
       env: {
         ...env,
@@ -424,8 +426,8 @@ function runGitRaw(path: string, args: string[]): Buffer {
   }
 }
 
-function runGit(path: string, args: string[]): string {
-  return runGitRaw(path, args).toString("utf8").trim();
+function runGit(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND_TIMEOUT_MS): string {
+  return runGitRaw(path, args, timeoutMs).toString("utf8").trim();
 }
 
 function errnoCode(error: unknown): string | undefined {
@@ -603,7 +605,7 @@ function assertCompleteLocalObjectGraph(path: string, common: string, objects: s
     "-c", `fetch.fsck.skipList=${nullDevice}`,
     "-c", `receive.fsck.skipList=${nullDevice}`,
     "fsck", "--full", "--strict", "--no-reflogs", "--no-dangling", "--no-progress",
-  ]);
+  ], FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS);
 }
 
 interface LocalConfigEntry {

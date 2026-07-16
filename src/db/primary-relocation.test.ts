@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "./database.js";
 import {
+  FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS,
   PrimaryRelocationError,
   relocatePrimaryRepo,
   sanitizeGitRemoteUrl,
@@ -482,6 +483,15 @@ describe("primary relocation v2 reconciliation", () => {
     const promisor = seedPair({ legacyId: 662, targetId: 1509, name: "promisor-marker" });
     writeFileSync(join(promisor.path, ".git", "objects", "pack", "fixture.promisor"), "");
     expectCode(() => relocatePrimaryRepo(requestFor(promisor)), "TARGET_UNTRUSTED_GIT_AUTHORITY");
+  });
+
+  it("guards full object-graph fsck with a repo-scale bounded timeout", () => {
+    expect(FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    expect(FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS).toBeLessThanOrEqual(300_000);
+
+    const source = readFileSync(new URL("./primary-relocation.ts", import.meta.url), "utf8");
+    const fsckCall = source.match(/runGit\(path,\s*\[[\s\S]*?"fsck", "--full", "--strict", "--no-reflogs", "--no-dangling", "--no-progress",\s*\]\s*,\s*([A-Z0-9_]+)\s*\)/);
+    expect(fsckCall?.[1]).toBe("FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS");
   });
 
   it("rejects missing tracked blobs and missing reachable commit and tree history", () => {
