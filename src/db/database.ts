@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
 
 function findNearestReposDb(startDir: string): string | null {
   let dir = resolve(startDir);
@@ -14,12 +15,23 @@ function findNearestReposDb(startDir: string): string | null {
   return null;
 }
 
+function rejectSqliteMemoryUri(path: string): string {
+  if (path.startsWith("file::memory:")) {
+    throw new Error("SQLite memory URI paths are unsupported; use exact :memory:");
+  }
+  return path;
+}
+
 export function getDbPath(): string {
   if (process.env["HASNA_REPOS_DB_PATH"]) {
-    return process.env["HASNA_REPOS_DB_PATH"];
+    return rejectSqliteMemoryUri(process.env["HASNA_REPOS_DB_PATH"]);
   }
   if (process.env["REPOS_DB_PATH"]) {
-    return process.env["REPOS_DB_PATH"];
+    return rejectSqliteMemoryUri(process.env["REPOS_DB_PATH"]);
+  }
+
+  if (process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] === "1") {
+    throw new Error("an explicit Repos database path is required");
   }
 
   const cwd = process.cwd();
@@ -39,6 +51,7 @@ export function getDbPath(): string {
 
 let _db: Database | null = null;
 let _dbPath: string | null = null;
+let _dbMigrated = false;
 const WAL_NEGOTIATION_TIMEOUT_MS = 5_000;
 const WAL_NEGOTIATION_WAIT_MS = 10;
 const walNegotiationWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
@@ -71,12 +84,60 @@ function enableWalWithBoundedRetry(db: Database): void {
   }
 }
 
-export function getDb(customPath?: string): Database {
-  const path = customPath || getDbPath();
+export interface DatabaseOpenOptions {
+  migrate?: boolean;
+}
 
-  if (_db && _dbPath === path) return _db;
+export interface NonMigratingDatabaseContext {
+  db: Database;
+  path: string;
+  close: () => void;
+}
 
-  if (path !== ":memory:" && !path.startsWith("file::memory:")) {
+function normalizeDbPath(path: string): string {
+  rejectSqliteMemoryUri(path);
+  if (path === ":memory:" || path.startsWith("file:")) return path;
+  return resolve(path);
+}
+
+function getExplicitNonDefaultDbPath(customPath?: string): string {
+  const configured = customPath
+    ?? process.env["HASNA_REPOS_DB_PATH"]
+    ?? process.env["REPOS_DB_PATH"];
+  if (!configured) {
+    throw new Error("migrate:false requires an explicit non-default Repos database path");
+  }
+  const path = normalizeDbPath(configured);
+  if (path === ":memory:") return path;
+
+  const home = process.env["HOME"] || process.env["USERPROFILE"] || "~";
+  const defaults = [
+    normalizeDbPath(join(home, ".hasna", "repos", "repos.db")),
+    normalizeDbPath(join(home, ".git-local", "repos.db")),
+  ];
+  if (defaults.includes(path)) {
+    throw new Error("migrate:false requires an explicit non-default Repos database path");
+  }
+  return path;
+}
+
+export function getDb(customPath?: string, options: DatabaseOpenOptions = {}): Database {
+  if (_db) {
+    if (customPath !== undefined && normalizeDbPath(customPath) !== _dbPath) {
+      throw new Error("cannot switch Repos database paths while a database is open; call closeDb() first");
+    }
+    if (options.migrate !== false && !_dbMigrated) {
+      runMigrations(_db);
+      _dbMigrated = true;
+    }
+    return _db;
+  }
+
+  const path = options.migrate === false
+    ? getExplicitNonDefaultDbPath(customPath)
+    : normalizeDbPath(customPath ?? getDbPath());
+
+  if (path !== ":memory:") {
     const dir = dirname(path);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
@@ -93,9 +154,13 @@ export function getDb(customPath?: string): Database {
     db.exec("PRAGMA synchronous = NORMAL");
     db.exec("PRAGMA foreign_keys = ON");
 
-    runMigrations(db);
+    if (options.migrate !== false) {
+      runMigrations(db);
+      _dbMigrated = true;
+    }
   } catch (error) {
     db.close();
+    _dbMigrated = false;
     throw error;
   }
 
@@ -104,11 +169,119 @@ export function getDb(customPath?: string): Database {
   return db;
 }
 
+/**
+ * Open an exact caller-selected registry for inspection without running schema
+ * migrations or changing the process-wide singleton. File-backed contexts are
+ * read-only, so a planning call cannot create a database, negotiate WAL, or
+ * persist a pending migration. An already-open in-memory context is reused
+ * because SQLite cannot reopen the same private in-memory database.
+ */
+export function openNonMigratingDb(customPath?: string): NonMigratingDatabaseContext {
+  if (_db) {
+    if (customPath !== undefined && normalizeDbPath(customPath) !== _dbPath) {
+      throw new Error("cannot switch Repos database paths while a database is open; call closeDb() first");
+    }
+    return { db: _db, path: _dbPath!, close: () => {} };
+  }
+  if (customPath === undefined) {
+    throw new Error("non-migrating Repos access requires an explicit database path");
+  }
+  const path = normalizeDbPath(customPath);
+  if (path === ":memory:") {
+    throw new Error("non-migrating in-memory Repos access requires an active database context");
+  }
+  if (!existsSync(path)) {
+    throw new Error("non-migrating Repos database does not exist");
+  }
+  const db = new Database(path, { readonly: true, create: false });
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec("PRAGMA foreign_keys = ON");
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+  return { db, path, close: () => db.close() };
+}
+
+/** Apply pending migrations to an already-open, caller-owned database. */
+export function migrateDb(db: Database): void {
+  runMigrations(db);
+}
+
 export function closeDb(): void {
   if (_db) {
     _db.close();
     _db = null;
     _dbPath = null;
+    _dbMigrated = false;
+  }
+}
+
+interface Migration {
+  version: number;
+  sql?: string;
+  run?: (db: Database) => unknown;
+  verifyAfterMarker?: (db: Database, runResult: unknown) => void;
+}
+
+function sanitizeRelocationSnapshot(value: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("remote identity migration found an invalid relocation snapshot");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("remote identity migration found an invalid relocation snapshot");
+  }
+  const snapshot = parsed as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(snapshot, "remote_url")) {
+    snapshot["remote_url"] = sanitizeRemoteIdentity(snapshot["remote_url"]);
+  }
+  return JSON.stringify(snapshot);
+}
+
+interface V9RemoteIdentityTargetState {
+  repos: Array<{ id: number; remote_url: string | null }>;
+  remotes: Array<{ id: number; url: string; fetch_url: string | null }>;
+  audits: Array<Record<string, unknown>>;
+}
+
+function stableMigrationState(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableMigrationState).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableMigrationState(record[key])}`).join(",")}}`;
+}
+
+function readV9RemoteIdentityState(db: Database): V9RemoteIdentityTargetState {
+  return {
+    repos: (db.query("SELECT id, remote_url FROM repos").all() as V9RemoteIdentityTargetState["repos"])
+      .sort((left, right) => left.id - right.id),
+    remotes: (db.query("SELECT id, url, fetch_url FROM remotes").all() as V9RemoteIdentityTargetState["remotes"])
+      .sort((left, right) => left.id - right.id),
+    // The complete durable receipt is part of the exact migration target.
+    // Selecting only the rewritten fields would let a marker-time trigger
+    // alter an actor, hash, count, revision, or timestamp without detection.
+    audits: (db.query("SELECT * FROM repo_relocation_audit").all() as V9RemoteIdentityTargetState["audits"])
+      .sort((left, right) => String(left["id"]) < String(right["id"]) ? -1 : String(left["id"]) > String(right["id"]) ? 1 : 0),
+  };
+}
+
+function verifyV9RemoteIdentityState(db: Database, expected: unknown): void {
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) {
+    throw new Error("remote identity successor migration is missing exact target state");
+  }
+  const actual = readV9RemoteIdentityState(db);
+  // Compare complete ID-keyed target rows, including deletion and exact
+  // cardinality. Canonicality alone would allow a trigger to substitute a
+  // different canonical value or replace one row with another.
+  if (stableMigrationState(actual) !== stableMigrationState(expected)) {
+    throw new Error("remote identity successor migration failed exact-state verification");
+  }
+  if (db.query("PRAGMA foreign_key_check").all().length > 0) {
+    throw new Error("remote identity successor migration failed foreign-key verification");
   }
 }
 
@@ -126,8 +299,10 @@ function runMigrations(db: Database): void {
       // waited for the write lock, so the marker must be read under that lock.
       const applied = db.query("SELECT 1 FROM migrations WHERE version = ?").get(migration.version);
       if (!applied) {
-        db.exec(migration.sql);
+        if (migration.sql) db.exec(migration.sql);
+        const runResult = migration.run?.(db);
         db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
+        migration.verifyAfterMarker?.(db, runResult);
       }
       db.exec("COMMIT");
     } catch (error) {
@@ -137,7 +312,7 @@ function runMigrations(db: Database): void {
   }
 }
 
-const MIGRATIONS = [
+const MIGRATIONS: Migration[] = [
   {
     version: 1,
     sql: `
@@ -419,5 +594,137 @@ const MIGRATIONS = [
       CREATE INDEX idx_repo_relocation_audit_repo
         ON repo_relocation_audit(repo_id, created_at);
     `,
+  },
+  {
+    // Remote identities are public catalog metadata, never credential-bearing
+    // transport URLs. This data rewrite and its version marker share the
+    // outer BEGIN IMMEDIATE transaction in runMigrations.
+    version: 8,
+    run(db) {
+      const tableColumns = (table: string) => new Set(
+        (db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name),
+      );
+      const repoColumns = tableColumns("repos");
+      if (repoColumns.has("id") && repoColumns.has("remote_url")) {
+        const repoRows = db.query("SELECT id, remote_url FROM repos").all() as Array<{
+          id: number;
+          remote_url: string | null;
+        }>;
+        const updateRepo = db.query("UPDATE repos SET remote_url = ? WHERE id = ?");
+        for (const row of repoRows) {
+          updateRepo.run(sanitizeRemoteIdentity(row.remote_url), row.id);
+        }
+      }
+
+      const remoteColumns = tableColumns("remotes");
+      if (remoteColumns.has("id") && remoteColumns.has("url") && remoteColumns.has("fetch_url")) {
+        const remoteRows = db.query("SELECT id, url, fetch_url FROM remotes").all() as Array<{
+          id: number;
+          url: string;
+          fetch_url: string | null;
+        }>;
+        const updateRemote = db.query("UPDATE remotes SET url = ?, fetch_url = ? WHERE id = ?");
+        const deleteRemote = db.query("DELETE FROM remotes WHERE id = ?");
+        for (const row of remoteRows) {
+          const url = sanitizeRemoteIdentity(row.url);
+          if (!url) {
+            deleteRemote.run(row.id);
+            continue;
+          }
+          updateRemote.run(url, sanitizeRemoteIdentity(row.fetch_url), row.id);
+        }
+      }
+
+      if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'fts_repos'").get()) {
+        db.exec("INSERT INTO fts_repos(fts_repos) VALUES ('rebuild')");
+      }
+      if (db.query("PRAGMA foreign_key_check").all().length > 0) {
+        throw new Error("remote identity migration failed foreign-key verification");
+      }
+    },
+  },
+  {
+    // V8 may already have been applied by a process that opened the registry
+    // before the incident was contained. Preserve that exact migration and use
+    // a successor for later contamination plus relocation receipt snapshots.
+    version: 9,
+    run(db) {
+      const tableColumns = (table: string) => new Set(
+        (db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name),
+      );
+      const repoColumns = tableColumns("repos");
+      const remoteColumns = tableColumns("remotes");
+      const auditColumns = tableColumns("repo_relocation_audit");
+      const required = [
+        [repoColumns, ["id", "remote_url"]],
+        [remoteColumns, ["id", "url", "fetch_url"]],
+        [auditColumns, ["id", "expected_remote", "source_json", "target_json", "after_json"]],
+      ] as const;
+      if (required.some(([columns, names]) => names.some((name) => !columns.has(name)))) {
+        throw new Error("v9 requires the exact remote-bearing schema");
+      }
+
+      const repoRows = db.query("SELECT id, remote_url FROM repos").all() as Array<{
+        id: number;
+        remote_url: string | null;
+      }>;
+      const targetRepos = repoRows
+        .map((row) => ({ id: row.id, remote_url: sanitizeRemoteIdentity(row.remote_url) }))
+        .sort((left, right) => left.id - right.id);
+      const updateRepo = db.query("UPDATE repos SET remote_url = ? WHERE id = ?");
+      for (const row of targetRepos) updateRepo.run(row.remote_url, row.id);
+
+      const remoteRows = db.query("SELECT id, url, fetch_url FROM remotes").all() as Array<{
+        id: number;
+        url: string;
+        fetch_url: string | null;
+      }>;
+      const targetRemotes = remoteRows.flatMap((row) => {
+        const url = sanitizeRemoteIdentity(row.url);
+        return url ? [{ id: row.id, url, fetch_url: sanitizeRemoteIdentity(row.fetch_url) }] : [];
+      }).sort((left, right) => left.id - right.id);
+      const updateRemote = db.query("UPDATE remotes SET url = ?, fetch_url = ? WHERE id = ?");
+      const removeRemote = db.query("DELETE FROM remotes WHERE id = ?");
+      for (const row of remoteRows) {
+        const url = sanitizeRemoteIdentity(row.url);
+        if (!url) {
+          removeRemote.run(row.id);
+          continue;
+        }
+        updateRemote.run(url, sanitizeRemoteIdentity(row.fetch_url), row.id);
+      }
+
+      const auditRows = db.query("SELECT * FROM repo_relocation_audit").all() as Array<Record<string, unknown>>;
+      const targetAudits = auditRows.map<Record<string, unknown>>((row) => ({
+        ...row,
+        expected_remote: sanitizeRemoteIdentity(row["expected_remote"]) ?? "",
+        source_json: sanitizeRelocationSnapshot(String(row["source_json"])),
+        target_json: sanitizeRelocationSnapshot(String(row["target_json"])),
+        after_json: sanitizeRelocationSnapshot(String(row["after_json"])),
+      })).sort((left, right) => String(left["id"]) < String(right["id"]) ? -1 : String(left["id"]) > String(right["id"]) ? 1 : 0);
+      const updateAudit = db.query(`UPDATE repo_relocation_audit SET
+        expected_remote = ?, source_json = ?, target_json = ?, after_json = ? WHERE id = ?`);
+      for (const row of targetAudits) {
+        updateAudit.run(
+          String(row["expected_remote"]),
+          String(row["source_json"]),
+          String(row["target_json"]),
+          String(row["after_json"]),
+          String(row["id"]),
+        );
+      }
+
+      if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'fts_repos'").get()) {
+        db.exec("INSERT INTO fts_repos(fts_repos) VALUES ('rebuild')");
+      }
+      const expected: V9RemoteIdentityTargetState = {
+        repos: targetRepos,
+        remotes: targetRemotes,
+        audits: targetAudits,
+      };
+      verifyV9RemoteIdentityState(db, expected);
+      return expected;
+    },
+    verifyAfterMarker: verifyV9RemoteIdentityState,
   },
 ];

@@ -81,6 +81,21 @@ for both rows, a canonical target below the trusted user worktree root, a
 credential-free `host/owner/name` remote, the target's exact HEAD, and a stable
 idempotency key.
 
+Before an operational dry run, verify that the packaged build and the exact
+executable selected for use came from the reviewed source commit. The verifier
+checks the outer package digest first, then the embedded clean-source
+provenance and packaged executable bytes. It does not open the registry.
+
+```bash
+repos-verify-release \
+  --expected-commit <reviewed-commit> \
+  --expected-tree <reviewed-tree> \
+  --expected-package-sha256 <reviewed-package-sha256> \
+  --expected-executable-sha256 <reviewed-executable-sha256> \
+  --package <exact-package-tarball> \
+  --executable <exact-repos-executable>
+```
+
 For the Infinity Machine cutover, the reviewed live registry map is exact:
 
 | Repository | Preserved legacy ID | Absorbed canonical ID |

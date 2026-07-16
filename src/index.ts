@@ -1,5 +1,7 @@
 export * from "./types/index.js";
-export { getDb, closeDb } from "./db/database.js";
+export { getDb, getDbPath, migrateDb, closeDb, openNonMigratingDb } from "./db/database.js";
+export type { DatabaseOpenOptions, NonMigratingDatabaseContext } from "./db/database.js";
+export { sanitizeRemoteIdentity, sanitizeRemoteOutput } from "./lib/remote-identity.js";
 export {
   PrimaryRelocationError,
   relocatePrimaryRepo,
@@ -14,7 +16,17 @@ export type {
   SafeErrorDetails,
   TableReconcileCounts,
 } from "./db/primary-relocation.js";
-export { ensureWorkspaceBootstrap, startAutoIndexWorker, syncRepoCatalog } from "./lib/auto-index.js";
+export {
+  cleanupRemoteIdentities,
+  ensureWorkspaceBootstrap,
+  startAutoIndexWorker,
+  syncRepoCatalog,
+} from "./lib/auto-index.js";
+export type {
+  RemoteIdentityCleanupCounts,
+  RemoteIdentityCleanupOptions,
+  RemoteIdentityCleanupSummary,
+} from "./lib/auto-index.js";
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
 export { discoverRepos, scanRepoPaths, scanRepos, watchRepos } from "./lib/scanner.js";
 export { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "./lib/github.js";
@@ -56,6 +68,7 @@ export {
 export type { CommandResult, OpsCommandRunner, OpsIssue, OpsReport, TodosIntegrationOptions, TodosIntegrationResult } from "./lib/repo-ops.js";
 export {
   listRepos,
+  listAllRepos,
   getRepo,
   searchRepos,
   listCommits,

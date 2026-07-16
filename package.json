@@ -11,7 +11,8 @@
   "bin": {
     "repos": "dist/cli/index.js",
     "repos-mcp": "dist/mcp/index.js",
-    "repos-serve": "dist/server/index.js"
+    "repos-serve": "dist/server/index.js",
+    "repos-verify-release": "dist/release/verify-provenance.js"
   },
   "exports": {
     ".": {
@@ -27,7 +28,7 @@
   ],
   "scripts": {
     "clean": "rm -rf dist dashboard/dist",
-    "build": "bun run clean && cd dashboard && bun run build && cd .. && bun build src/cli/index.tsx --outdir dist/cli --target bun --external ink --external react --external chalk --external @modelcontextprotocol/sdk --external pg && bun build src/mcp/index.ts --outdir dist/mcp --target bun --external @modelcontextprotocol/sdk --external pg && bun build src/server/index.ts --outdir dist/server --target bun --external pg && bun build src/index.ts --outdir dist --target bun --external pg && tsc --emitDeclarationOnly --outDir dist",
+    "build": "bun run clean && cd dashboard && bun run build && cd .. && bun build src/cli/index.tsx --outdir dist/cli --target bun --external ink --external react --external chalk --external @modelcontextprotocol/sdk --external pg && bun build src/mcp/index.ts --outdir dist/mcp --target bun --external @modelcontextprotocol/sdk --external pg && bun build src/server/index.ts --outdir dist/server --target bun --external pg && bun build src/index.ts --outdir dist --target bun --external pg && bun build src/release/verify-provenance.ts --outdir dist/release --target bun && tsc --emitDeclarationOnly --outDir dist && bun run src/release/write-provenance.ts",
     "build:dashboard": "cd dashboard && bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test",

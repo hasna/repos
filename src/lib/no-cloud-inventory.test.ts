@@ -494,7 +494,7 @@ describe("no-cloud inventory", () => {
       const report = getNoCloudInventory({ root, limit: 10 });
       const finding = report.repos.find((entry) => entry.path === "secret-remote");
 
-      expect(finding?.remote).toBe("ssh://***@git.example.com/hasna/repo.git");
+      expect(finding?.remote).toBe("git.example.com/hasna/repo");
       expect(finding?.remote).not.toContain("super-secret");
     });
   });

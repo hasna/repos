@@ -2,8 +2,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { listRepos } from "../db/repos.js";
+import { listAllRepos } from "../db/repos.js";
 import type { Repo } from "../types/index.js";
+import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 export const GITHUB_REPO_CATALOG_SCHEMA_VERSION = "open-repos.github-catalog.v1" as const;
 
@@ -213,7 +214,13 @@ export function loadGithubRepoCatalog(cachePath = getDefaultGithubCatalogCachePa
     const parsed = JSON.parse(readFileSync(cachePath, "utf-8")) as GithubRepoCatalogCache;
     if (parsed.schemaVersion !== GITHUB_REPO_CATALOG_SCHEMA_VERSION) return null;
     if (!Array.isArray(parsed.repositories)) return null;
-    return parsed;
+    return {
+      ...parsed,
+      accounts: Array.isArray(parsed.accounts)
+        ? parsed.accounts.map(sanitizeCatalogAccount)
+        : [],
+      repositories: parsed.repositories.map(sanitizeCatalogRecord),
+    };
   } catch {
     return null;
   }
@@ -430,23 +437,10 @@ export function applyGithubCatalogFilter(
 }
 
 export function extractGithubFullNameFromRemote(remoteUrl: string | null): string | null {
-  if (!remoteUrl) return null;
-  const trimmed = remoteUrl.trim();
-  if (!trimmed) return null;
-
-  const scp = trimmed.match(/^(?:[^@]+@)?github\.com:([^/\s]+)\/(.+?)(?:\.git)?$/i);
-  if (scp) return normalizeFullNameParts(scp[1], scp[2]);
-
-  try {
-    const url = new URL(trimmed);
-    if (url.hostname.toLowerCase() !== "github.com") return null;
-    const parts = url.pathname.replace(/^\/+/, "").split("/");
-    return normalizeFullNameParts(parts[0], parts[1]);
-  } catch {
-    const generic = trimmed.match(/github\.com[:/]([^/\s]+)\/(.+?)(?:\.git)?(?:[?#].*)?$/i);
-    if (!generic) return null;
-    return normalizeFullNameParts(generic[1], generic[2]);
-  }
+  const identity = sanitizeRemoteIdentity(remoteUrl);
+  if (!identity?.startsWith("github.com/")) return null;
+  const [, owner, repo] = identity.split("/");
+  return normalizeFullNameParts(owner, repo);
 }
 
 function ghApiJson(endpoint: string): unknown {
@@ -505,7 +499,7 @@ function discoverAccounts(requestJson: (endpoint: string) => unknown, warnings: 
       byLogin.set(login.toLowerCase(), {
         login,
         type: stringOrNull(user?.["type"]) ?? "User",
-        url: stringOrNull(user?.["html_url"]),
+        url: sanitizePublicWebUrl(stringOrNull(user?.["html_url"])),
       });
     }
   } catch {
@@ -524,7 +518,7 @@ function discoverAccounts(requestJson: (endpoint: string) => unknown, warnings: 
         byLogin.set(login.toLowerCase(), {
           login,
           type: "Organization",
-          url: stringOrNull(row["html_url"]),
+          url: sanitizePublicWebUrl(stringOrNull(row["html_url"])),
         });
       }
       if (orgs.length < 100) break;
@@ -869,7 +863,7 @@ function emptyCache(now: Date, staleMs: number): GithubRepoCatalogCache {
 
 function safeListLocalRepos(): Repo[] {
   try {
-    return listRepos({ limit: 100_000, offset: 0 });
+    return listAllRepos();
   } catch {
     return [];
   }
@@ -900,19 +894,54 @@ function countGitStatus(lines: string[]): { staged: number; modified: number; un
 
 function sanitizeCloneUrl(value: string | null): string | null {
   if (!value) return null;
+  const identity = sanitizeRemoteIdentity(value);
+  if (!identity) return null;
   try {
     const url = new URL(value);
-    if (url.username || url.password) {
-      url.username = "";
-      url.password = "";
-    }
-    return url.toString();
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
   } catch {
-    if (/github\.com[:/][^/\s]+\/[^/\s]+/i.test(value) && !/[A-Za-z0-9_]{20,}@/.test(value)) {
-      return value;
-    }
+    return value.includes(":") && !value.includes("://")
+      ? `ssh://${identity}.git`
+      : identity;
+  }
+}
+
+function sanitizePublicWebUrl(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
     return null;
   }
+}
+
+function sanitizeCatalogRecord(record: GithubRepoCatalogRecord): GithubRepoCatalogRecord {
+  return {
+    ...record,
+    html_url: sanitizeCloneUrl(record.html_url),
+    clone_urls: {
+      https: sanitizeCloneUrl(record.clone_urls?.https ?? null),
+      ssh: sanitizeCloneUrl(record.clone_urls?.ssh ?? null),
+    },
+  };
+}
+
+function sanitizeCatalogAccount(account: GithubCatalogAccount): GithubCatalogAccount {
+  return {
+    login: stringOrNull(account?.login) ?? "",
+    type: stringOrNull(account?.type) ?? "User",
+    url: sanitizePublicWebUrl(stringOrNull(account?.url)),
+  };
 }
 
 function normalizeFullNameParts(owner: string | undefined, repo: string | undefined): string | null {

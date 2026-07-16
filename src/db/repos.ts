@@ -10,6 +10,7 @@ import type {
   RepoStats,
   ListOptions,
 } from "../types/index.js";
+import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
 
 // ── Repos ──
 
@@ -18,6 +19,20 @@ export class AmbiguousRepoNameError extends Error {
     super(`Multiple repos have the exact name '${repoName}'; use an explicit repo ID or path`);
     this.name = "AmbiguousRepoNameError";
   }
+}
+
+export function sanitizeRepoForOutput(repo: Repo): Repo {
+  return { ...repo, remote_url: sanitizeRemoteIdentity(repo.remote_url) };
+}
+
+export function sanitizeRemoteForOutput(remote: Remote): Remote | null {
+  const url = sanitizeRemoteIdentity(remote.url);
+  if (!url) return null;
+  return {
+    ...remote,
+    url,
+    fetch_url: sanitizeRemoteIdentity(remote.fetch_url),
+  };
 }
 
 export function listRepos(opts: ListOptions & { org?: string; query?: string } = {}): Repo[] {
@@ -38,18 +53,51 @@ export function listRepos(opts: ListOptions & { org?: string; query?: string } =
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
   params.push(limit, offset);
 
-  return db
-    .query(`SELECT * FROM repos ${whereClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
-    .all(...params) as Repo[];
+  return (db
+    .query(`SELECT * FROM repos ${whereClause} ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?`)
+    .all(...params) as Repo[]).map(sanitizeRepoForOutput);
+}
+
+export function listAllRepos(
+  opts: Omit<ListOptions, "limit" | "offset"> & { org?: string; query?: string } = {},
+  pageSize = 500,
+): Repo[] {
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1) {
+    throw new Error("repository page size must be a positive integer");
+  }
+  const db = getDb();
+  const repos: Repo[] = [];
+  let lastId = 0;
+  while (true) {
+    const params: Array<string | number> = [lastId];
+    const where = ["id > ?"];
+    if (opts.org) {
+      where.push("org = ?");
+      params.push(opts.org);
+    }
+    if (opts.query) {
+      where.push("(name LIKE ? OR description LIKE ? OR remote_url LIKE ?)");
+      const query = `%${opts.query}%`;
+      params.push(query, query, query);
+    }
+    params.push(pageSize);
+    const page = (db
+      .query(`SELECT * FROM repos WHERE ${where.join(" AND ")} ORDER BY id ASC LIMIT ?`)
+      .all(...params) as Repo[]).map(sanitizeRepoForOutput);
+    repos.push(...page);
+    if (page.length < pageSize) return repos;
+    lastId = page[page.length - 1]!.id;
+  }
 }
 
 export function getRepo(idOrPath: string | number): Repo | null {
   const db = getDb();
   if (typeof idOrPath === "number") {
-    return db.query("SELECT * FROM repos WHERE id = ?").get(idOrPath) as Repo | null;
+    const row = db.query("SELECT * FROM repos WHERE id = ?").get(idOrPath) as Repo | null;
+    return row ? sanitizeRepoForOutput(row) : null;
   }
   const byPath = db.query("SELECT * FROM repos WHERE path = ?").get(idOrPath) as Repo | null;
-  if (byPath) return byPath;
+  if (byPath) return sanitizeRepoForOutput(byPath);
 
   const byName = db
     .query("SELECT * FROM repos WHERE name = ? ORDER BY id LIMIT 2")
@@ -57,18 +105,20 @@ export function getRepo(idOrPath: string | number): Repo | null {
   if (byName.length > 1) {
     throw new AmbiguousRepoNameError(idOrPath);
   }
-  return byName[0] || null;
+  return byName[0] ? sanitizeRepoForOutput(byName[0]) : null;
 }
 
 export function upsertRepo(repo: Partial<Repo> & { path: string; name: string }): Repo {
   const db = getDb();
   const existing = db.query("SELECT id FROM repos WHERE path = ?").get(repo.path) as { id: number } | null;
+  const hasRemote = Object.prototype.hasOwnProperty.call(repo, "remote_url");
+  const safeRemote = hasRemote ? sanitizeRemoteIdentity(repo.remote_url) : null;
 
   if (existing) {
     db.query(`UPDATE repos SET
       name = coalesce(?, name),
       org = coalesce(?, org),
-      remote_url = coalesce(?, remote_url),
+      remote_url = CASE WHEN ? THEN ? ELSE remote_url END,
       default_branch = coalesce(?, default_branch),
       description = coalesce(?, description),
       last_scanned = coalesce(?, last_scanned),
@@ -77,23 +127,23 @@ export function upsertRepo(repo: Partial<Repo> & { path: string; name: string })
       tag_count = coalesce(?, tag_count),
       updated_at = datetime('now')
     WHERE path = ?`).run(
-      repo.name, repo.org ?? null, repo.remote_url ?? null,
+      repo.name, repo.org ?? null, hasRemote ? 1 : 0, safeRemote,
       repo.default_branch ?? null, repo.description ?? null,
       repo.last_scanned ?? null, repo.commit_count ?? null,
       repo.branch_count ?? null, repo.tag_count ?? null,
       repo.path
     );
-    return db.query("SELECT * FROM repos WHERE id = ?").get(existing.id) as Repo;
+    return sanitizeRepoForOutput(db.query("SELECT * FROM repos WHERE id = ?").get(existing.id) as Repo);
   }
 
   db.query(`INSERT INTO repos (path, name, org, remote_url, default_branch, description, last_scanned, commit_count, branch_count, tag_count)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    repo.path, repo.name, repo.org ?? null, repo.remote_url ?? null,
+    repo.path, repo.name, repo.org ?? null, safeRemote,
     repo.default_branch ?? "main", repo.description ?? null,
     repo.last_scanned ?? null, repo.commit_count ?? 0,
     repo.branch_count ?? 0, repo.tag_count ?? 0
   );
-  return db.query("SELECT * FROM repos WHERE path = ?").get(repo.path) as Repo;
+  return sanitizeRepoForOutput(db.query("SELECT * FROM repos WHERE path = ?").get(repo.path) as Repo);
 }
 
 export function deleteRepo(id: number): boolean {
@@ -109,7 +159,8 @@ export function searchRepos(query: string, limit = 20): Repo[] {
     .all(query, limit) as { rowid: number }[];
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
-  return db.query(`SELECT * FROM repos WHERE id IN (${placeholders})`).all(...ids.map((r) => r.rowid)) as Repo[];
+  return (db.query(`SELECT * FROM repos WHERE id IN (${placeholders})`).all(...ids.map((r) => r.rowid)) as Repo[])
+    .map(sanitizeRepoForOutput);
 }
 
 // ── Commits ──
@@ -222,16 +273,24 @@ export function bulkInsertTags(tags: Array<Omit<Tag, "id">>): number {
 
 export function listRemotes(repo_id: number): Remote[] {
   const db = getDb();
-  return db.query("SELECT * FROM remotes WHERE repo_id = ?").all(repo_id) as Remote[];
+  return (db.query("SELECT * FROM remotes WHERE repo_id = ?").all(repo_id) as Remote[])
+    .map(sanitizeRemoteForOutput)
+    .filter((remote): remote is Remote => remote !== null);
 }
 
 export function bulkInsertRemotes(remotes: Array<Omit<Remote, "id">>): number {
   const db = getDb();
   const stmt = db.query(`INSERT OR REPLACE INTO remotes (repo_id, name, url, fetch_url) VALUES (?, ?, ?, ?)`);
+  const remove = db.query("DELETE FROM remotes WHERE repo_id = ? AND name = ?");
   let count = 0;
   const tx = db.transaction(() => {
     for (const r of remotes) {
-      stmt.run(r.repo_id, r.name, r.url, r.fetch_url);
+      const url = sanitizeRemoteIdentity(r.url);
+      if (!url) {
+        remove.run(r.repo_id, r.name);
+        continue;
+      }
+      stmt.run(r.repo_id, r.name, url, sanitizeRemoteIdentity(r.fetch_url));
       count++;
     }
   });

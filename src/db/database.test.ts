@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { spawn } from "node:child_process";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDb, closeDb } from "./database";
+import { listRepos } from "./repos";
 
 describe("database", () => {
   beforeAll(() => {
@@ -21,6 +22,107 @@ describe("database", () => {
     const result = db.query("PRAGMA journal_mode").get() as any;
     // In-memory DBs use "memory" journal mode; file-backed DBs use "wal"
     expect(["wal", "memory"]).toContain(result.journal_mode);
+  });
+
+  it("rejects SQLite memory URI aliases before opening or creating an artifact", () => {
+    closeDb();
+    const uri = `file::memory:?cache=shared&repos_test=${process.pid}`;
+    expect(() => getDb(uri)).toThrow("SQLite memory URI paths are unsupported; use exact :memory:");
+    expect(existsSync(uri)).toBe(false);
+    process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+    getDb(":memory:");
+  });
+
+  it("keeps parameterless SDK reads inside the active explicit database context", () => {
+    closeDb();
+    const previousPrimary = process.env["HASNA_REPOS_DB_PATH"];
+    const previousFallback = process.env["REPOS_DB_PATH"];
+    const previousRequirement = process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+    delete process.env["HASNA_REPOS_DB_PATH"];
+    delete process.env["REPOS_DB_PATH"];
+    process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] = "1";
+
+    try {
+      const isolated = getDb(":memory:");
+      isolated.query("INSERT INTO repos (path, name) VALUES ('/tmp/sdk-review', 'sdk-review')").run();
+
+      expect(listRepos({ query: "sdk-review" })).toHaveLength(1);
+      expect(getDb()).toBe(isolated);
+      expect(() => getDb(join(tmpdir(), "different-repos.db"))).toThrow(
+        "cannot switch Repos database paths while a database is open",
+      );
+    } finally {
+      closeDb();
+      if (previousPrimary === undefined) delete process.env["HASNA_REPOS_DB_PATH"];
+      else process.env["HASNA_REPOS_DB_PATH"] = previousPrimary;
+      if (previousFallback === undefined) delete process.env["REPOS_DB_PATH"];
+      else process.env["REPOS_DB_PATH"] = previousFallback;
+      if (previousRequirement === undefined) delete process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+      else process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] = previousRequirement;
+      getDb(":memory:");
+    }
+  });
+
+  it("requires migrate:false opens to use an explicit non-default path and never discovers cwd or HOME", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-unmigrated-open-"));
+    const previousHome = process.env["HOME"];
+    const previousPrimary = process.env["HASNA_REPOS_DB_PATH"];
+    const previousFallback = process.env["REPOS_DB_PATH"];
+    const previousRequirement = process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+    const defaultPath = join(dir, ".hasna", "repos", "repos.db");
+    mkdirSync(join(dir, ".repos"), { recursive: true });
+
+    try {
+      process.env["HOME"] = dir;
+      delete process.env["HASNA_REPOS_DB_PATH"];
+      delete process.env["REPOS_DB_PATH"];
+      delete process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+
+      expect(() => getDb(undefined, { migrate: false })).toThrow("explicit non-default Repos database path");
+      expect(existsSync(defaultPath)).toBe(false);
+
+      process.env["HASNA_REPOS_DB_PATH"] = defaultPath;
+      expect(() => getDb(undefined, { migrate: false })).toThrow("explicit non-default Repos database path");
+      expect(() => getDb(defaultPath, { migrate: false })).toThrow("explicit non-default Repos database path");
+      expect(existsSync(defaultPath)).toBe(false);
+    } finally {
+      closeDb();
+      if (previousHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = previousHome;
+      if (previousPrimary === undefined) delete process.env["HASNA_REPOS_DB_PATH"];
+      else process.env["HASNA_REPOS_DB_PATH"] = previousPrimary;
+      if (previousFallback === undefined) delete process.env["REPOS_DB_PATH"];
+      else process.env["REPOS_DB_PATH"] = previousFallback;
+      if (previousRequirement === undefined) delete process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+      else process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] = previousRequirement;
+      rmSync(dir, { recursive: true, force: true });
+      getDb(":memory:");
+    }
+  });
+
+  it("migrates an explicitly opened unmigrated singleton exactly once on the first normal access", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-deferred-migrate-"));
+    const path = join(dir, "isolated.db");
+    try {
+      const raw = getDb(path, { migrate: false });
+      expect(raw.query("SELECT name FROM sqlite_master WHERE name = 'migrations'").get()).toBeNull();
+
+      const migrated = getDb(path);
+      expect(migrated).toBe(raw);
+      expect(migrated.query("SELECT version FROM migrations ORDER BY version").all())
+        .toEqual([1, 2, 3, 4, 6, 7, 8, 9].map((version) => ({ version })));
+      expect(getDb(path)).toBe(migrated);
+      expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get())
+        .toEqual({ count: 1 });
+      expect(() => getDb(join(dir, "other.db"))).toThrow("cannot switch Repos database paths");
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
   });
 
   it("should create repos table", () => {
@@ -91,7 +193,7 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9]);
   });
 
   it("upgrades the live migration-5 worktree schema without skipping relocation audit", () => {
@@ -138,7 +240,7 @@ describe("database", () => {
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       closeDb();
@@ -208,6 +310,11 @@ describe("database", () => {
       ).get()).toEqual({ name: "idx_repo_relocation_audit_repo" });
       expect(recovery.query("SELECT version FROM migrations WHERE version = 7").get()).toBeNull();
       recovery.exec("DROP TABLE repo_relocation_audit_v7");
+      // This fixture intentionally models only the v7 receipt shape. Mark the
+      // later remote-bearing migrations as handled so this test remains scoped
+      // to byte-preserving v7 recovery; v9 exact-schema behavior is covered
+      // independently below.
+      recovery.exec("INSERT INTO migrations (version) VALUES (8), (9)");
       recovery.close();
 
       const db = getDb(path);
@@ -216,6 +323,390 @@ describe("database", () => {
       db.query("DELETE FROM repos WHERE id = 2").run();
       expect(db.query("SELECT * FROM repo_relocation_audit").get()).toEqual(before);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("atomically sanitizes repository and remote identities, rebuilds FTS, and reopens idempotently", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v8-remote-sanitize-"));
+    const path = join(dir, "repos.db");
+    const credential = ["member", "phrase"].join(":");
+    const queryMarker = ["access", "marker"].join("");
+    const unsafe = `https://${credential}@Code.Example.test:8443/team/tool.git?key=${queryMarker}#fragment`;
+    try {
+      const initial = getDb(path);
+      initial.query("DELETE FROM migrations WHERE version = 8").run();
+      const repo = initial.query("INSERT INTO repos (path, name, remote_url) VALUES (?, ?, ?) RETURNING id")
+        .get(join(dir, "repo"), "repo", unsafe) as { id: number };
+      initial.query("INSERT INTO remotes (repo_id, name, url, fetch_url) VALUES (?, 'origin', ?, ?)")
+        .run(repo.id, unsafe, "file:///local/fetch");
+      initial.query("INSERT INTO remotes (repo_id, name, url) VALUES (?, 'local', 'file:///local/repo')").run(repo.id);
+      closeDb();
+
+      const migrated = getDb(path);
+      expect(migrated.query("SELECT remote_url FROM repos WHERE id = ?").get(repo.id)).toEqual({
+        remote_url: "code.example.test/team/tool",
+      });
+      expect(migrated.query("SELECT name, url, fetch_url FROM remotes WHERE repo_id = ? ORDER BY name").all(repo.id)).toEqual([{
+        name: "origin",
+        url: "code.example.test/team/tool",
+        fetch_url: null,
+      }]);
+      expect(migrated.query("SELECT rowid FROM fts_repos WHERE fts_repos MATCH ?").all(queryMarker)).toEqual([]);
+      expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 8").get()).toEqual({ count: 1 });
+      closeDb();
+
+      const reopened = getDb(path);
+      expect(reopened.query("SELECT remote_url FROM repos WHERE id = ?").get(repo.id)).toEqual({
+        remote_url: "code.example.test/team/tool",
+      });
+      expect(reopened.query("SELECT count(*) AS count FROM migrations WHERE version = 8").get()).toEqual({ count: 1 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back every v8 rewrite and its marker when a synthetic migration step fails", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v8-remote-rollback-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `ssh://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    let repoId = 0;
+    try {
+      const initial = getDb(path);
+      initial.query("DELETE FROM migrations WHERE version = 8").run();
+      repoId = Number((initial.query("INSERT INTO repos (path, name, remote_url) VALUES (?, ?, ?) RETURNING id")
+        .get(join(dir, "repo"), "repo", unsafe) as { id: number }).id);
+      initial.exec(`
+        CREATE TRIGGER synthetic_v8_failure BEFORE UPDATE OF remote_url ON repos
+        WHEN NEW.id = ${repoId}
+        BEGIN SELECT RAISE(ABORT, 'synthetic migration failure'); END;
+      `);
+      closeDb();
+
+      expect(() => getDb(path)).toThrow("synthetic migration failure");
+      closeDb();
+      const afterFailure = new Database(path);
+      expect(afterFailure.query("SELECT remote_url FROM repos WHERE id = ?").get(repoId)).toEqual({ remote_url: unsafe });
+      expect(afterFailure.query("SELECT version FROM migrations WHERE version = 8").get()).toBeNull();
+      afterFailure.exec("DROP TRIGGER synthetic_v8_failure");
+      afterFailure.close();
+
+      const recovered = getDb(path);
+      expect(recovered.query("SELECT remote_url FROM repos WHERE id = ?").get(repoId)).toEqual({
+        remote_url: "git.example.test/team/tool",
+      });
+      expect(recovered.query("SELECT count(*) AS count FROM migrations WHERE version = 8").get()).toEqual({ count: 1 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("applies v9 after an exact v8 marker and sanitizes later remote-bearing state", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-after-v8-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (
+        id INTEGER PRIMARY KEY,
+        path TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        remote_url TEXT
+      );
+      CREATE TABLE remotes (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        fetch_url TEXT
+      );
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY,
+        expected_remote TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL
+      );
+    `);
+    seed.query("INSERT INTO repos (id, path, name, remote_url) VALUES (1, '/tmp/v9', 'v9', ?)").run(unsafe);
+    seed.query("INSERT INTO remotes (id, repo_id, name, url, fetch_url) VALUES (1, 1, 'origin', ?, ?)")
+      .run(unsafe, unsafe);
+    seed.query("INSERT INTO remotes (id, repo_id, name, url) VALUES (2, 1, 'local', 'file:///tmp/v9')").run();
+    const snapshot = JSON.stringify({ id: 1, path: "/tmp/v9", name: "v9", remote_url: unsafe });
+    seed.query(`INSERT INTO repo_relocation_audit
+      (id, expected_remote, source_json, target_json, after_json) VALUES ('receipt-v9', ?, ?, ?, ?)`)
+      .run(unsafe, snapshot, snapshot, snapshot);
+    seed.close();
+
+    try {
+      const migrated = getDb(path);
+      expect(migrated.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({
+        remote_url: "git.example.test/team/tool",
+      });
+      expect(migrated.query("SELECT name, url, fetch_url FROM remotes ORDER BY id").all()).toEqual([{
+        name: "origin",
+        url: "git.example.test/team/tool",
+        fetch_url: "git.example.test/team/tool",
+      }]);
+      const receipt = migrated.query(`SELECT expected_remote, source_json, target_json, after_json
+        FROM repo_relocation_audit WHERE id = 'receipt-v9'`).get() as Record<string, string>;
+      expect(receipt.expected_remote).toBe("git.example.test/team/tool");
+      for (const field of ["source_json", "target_json", "after_json"]) {
+        expect(JSON.parse(receipt[field]!)).toMatchObject({ remote_url: "git.example.test/team/tool" });
+      }
+      expect(JSON.stringify(receipt)).not.toContain("phrase");
+      expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get()).toEqual({ count: 1 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back v9 without a marker when any required remote-bearing column is missing", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-schema-guard-"));
+    const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const cases = [
+      { name: "repos.remote_url", repos: "id INTEGER PRIMARY KEY, path TEXT, name TEXT", remotes: "id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT", audit: "id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT" },
+      { name: "remotes.fetch_url", repos: "id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT", remotes: "id INTEGER PRIMARY KEY, url TEXT", audit: "id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT" },
+      { name: "repo_relocation_audit.target_json", repos: "id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT", remotes: "id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT", audit: "id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, after_json TEXT" },
+    ];
+
+    try {
+      for (const item of cases) {
+        const path = join(dir, `${item.name.replace(/[^a-z]+/gi, "-")}.db`);
+        const seed = new Database(path);
+        seed.exec(`
+          CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+          INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+          CREATE TABLE repos (${item.repos});
+          CREATE TABLE remotes (${item.remotes});
+          CREATE TABLE repo_relocation_audit (${item.audit});
+        `);
+        if (item.repos.includes("remote_url")) {
+          seed.query("INSERT INTO repos (id, path, name, remote_url) VALUES (1, '/tmp/guard', 'guard', ?)").run(unsafe);
+        }
+        seed.close();
+
+        expect(() => getDb(path)).toThrow("v9 requires the exact remote-bearing schema");
+        closeDb();
+        const raw = new Database(path);
+        expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+        if (item.repos.includes("remote_url")) {
+          expect(raw.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({ remote_url: unsafe });
+        }
+        raw.close();
+      }
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back v9 when a trigger recontaminates a sanitized value before the marker", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-trigger-guard-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT
+      );
+      INSERT INTO repos (id, path, name, remote_url)
+        VALUES (1, '/tmp/trigger-guard', 'trigger-guard', '${unsafe}');
+      CREATE TRIGGER repos_remote_recontaminate AFTER UPDATE OF remote_url ON repos
+      BEGIN
+        UPDATE repos SET remote_url = '${unsafe}' WHERE id = NEW.id;
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({ remote_url: unsafe });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back v9 when the real migration marker insert triggers recontamination", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-marker-trigger-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT
+      );
+      INSERT INTO repos (id, path, name, remote_url)
+        VALUES (1, '/tmp/marker-trigger', 'marker-trigger', '${unsafe}');
+      CREATE TRIGGER migrations_v9_recontaminate AFTER INSERT ON migrations
+      WHEN NEW.version = 9
+      BEGIN
+        UPDATE repos SET remote_url = '${unsafe}' WHERE id = 1;
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({ remote_url: unsafe });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back v9 when the marker trigger makes canonical same-count substitutions", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-exact-marker-"));
+    const path = join(dir, "repos.db");
+    const original = "github.com/hasna/original";
+    const substituted = "github.com/hasna/substituted";
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT
+      );
+      INSERT INTO repos VALUES (1, '/tmp/exact-marker', 'exact-marker', '${original}');
+      INSERT INTO remotes VALUES (11, '${original}', '${original}');
+      INSERT INTO repo_relocation_audit VALUES (
+        'exact-receipt', '${original}',
+        '{"remote_url":"${original}"}',
+        '{"remote_url":"${original}"}',
+        '{"remote_url":"${original}"}'
+      );
+      CREATE TRIGGER migrations_v9_substitute AFTER INSERT ON migrations
+      WHEN NEW.version = 9
+      BEGIN
+        UPDATE repos SET remote_url = '${substituted}' WHERE id = 1;
+        DELETE FROM remotes WHERE id = 11;
+        INSERT INTO remotes VALUES (12, '${substituted}', '${substituted}');
+        UPDATE repo_relocation_audit SET
+          expected_remote = '${substituted}',
+          source_json = '{"remote_url":"${substituted}"}'
+          WHERE id = 'exact-receipt';
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT id, remote_url FROM repos").all()).toEqual([{ id: 1, remote_url: original }]);
+      expect(raw.query("SELECT id, url, fetch_url FROM remotes").all()).toEqual([{
+        id: 11,
+        url: original,
+        fetch_url: original,
+      }]);
+      expect(raw.query("SELECT expected_remote, source_json FROM repo_relocation_audit").get()).toEqual({
+        expected_remote: original,
+        source_json: JSON.stringify({ remote_url: original }),
+      });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back v9 when the marker trigger changes a non-remote receipt field", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-complete-receipt-"));
+    const path = join(dir, "repos.db");
+    const identity = "github.com/hasna/original";
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY,
+        actor TEXT NOT NULL,
+        expected_remote TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL
+      );
+      INSERT INTO repos VALUES (1, '/tmp/complete-receipt', 'complete-receipt', '${identity}');
+      INSERT INTO repo_relocation_audit VALUES (
+        'complete-receipt', 'reviewed-actor', '${identity}',
+        '{"remote_url":"${identity}"}',
+        '{"remote_url":"${identity}"}',
+        '{"remote_url":"${identity}"}'
+      );
+      CREATE TRIGGER migrations_v9_change_actor AFTER INSERT ON migrations
+      WHEN NEW.version = 9
+      BEGIN
+        UPDATE repo_relocation_audit SET actor = 'substituted-actor'
+        WHERE id = 'complete-receipt';
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT actor FROM repo_relocation_audit").get()).toEqual({ actor: "reviewed-actor" });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
     } finally {
       closeDb();
       rmSync(dir, { recursive: true, force: true });
@@ -266,7 +757,7 @@ describe("database", () => {
       const results = await Promise.all(children.map(({ completed }) => completed));
       expect(results).toEqual(Array.from({ length: 8 }, () => ({
         code: 0,
-        stdout: JSON.stringify([1, 2, 3, 4, 6, 7].map((version) => ({ version }))),
+        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9].map((version) => ({ version }))),
         stderr: "",
       })));
     } finally {

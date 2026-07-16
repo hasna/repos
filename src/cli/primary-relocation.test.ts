@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -113,6 +114,23 @@ afterEach(() => {
 });
 
 describe("registry relocate-primary CLI", () => {
+  it("does not expose remote identity cleanup on the installed CLI", () => {
+    const result = Bun.spawnSync({
+      cmd: ["bun", "run", "src/cli/index.tsx", "registry", "--help"],
+      cwd: join(import.meta.dir, "../.."),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        HASNA_REPOS_DB_PATH: dbPath,
+        HASNA_REPOS_AUTO_BOOTSTRAP: "0",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = new TextDecoder().decode(result.stdout);
+    expect(result.exitCode).toBe(0);
+    expect(stdout).not.toContain("cleanup-remote-identities");
+  });
   it("is a dry run by default and performs no registry write", () => {
     const result = runCli([]);
     expect(result.exitCode).toBe(0);
@@ -126,6 +144,21 @@ describe("registry relocate-primary CLI", () => {
     const db = getDb(dbPath);
     expect(db.query("SELECT path FROM repos WHERE id = 661").get()).toEqual({ path: "/dev/shm/accounts" });
     expect(db.query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
+  });
+
+  it("does not persist a pending migration during a dry run", () => {
+    const raw = new Database(dbPath);
+    raw.query("DELETE FROM migrations WHERE version = 9").run();
+    raw.close();
+
+    const result = runCli([]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.toString()).applied).toBe(false);
+
+    const after = new Database(dbPath, { readonly: true });
+    expect(after.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+    expect(after.query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
+    after.close();
   });
 
   it("requires explicit --apply and persists one auditable receipt", () => {

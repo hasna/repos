@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import type { Database } from "bun:sqlite";
 import {
   closeSync,
   constants as fsConstants,
@@ -16,8 +17,11 @@ import {
 import type { Stats } from "node:fs";
 import { userInfo } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { getDb } from "./database.js";
+import { getDb, openNonMigratingDb } from "./database.js";
+import { sanitizeGitRemoteUrl } from "../lib/remote-identity.js";
 import type { Repo } from "../types/index.js";
+
+export { sanitizeGitRemoteUrl } from "../lib/remote-identity.js";
 
 const SCHEMA = "open-repos.primary-relocation.v2" as const;
 // The receipt payload remains v6. Migration 7 changes only the storage FK so
@@ -97,6 +101,8 @@ export interface PrimaryRelocationRequest {
   idempotencyKey: string;
   apply?: boolean;
   expectedPlanHash?: string;
+  /** Exact registry path used for a hermetic, read-only dry run. */
+  databasePath?: string;
 }
 
 export interface CollisionDecision {
@@ -194,6 +200,11 @@ interface ReconcilePlan {
 }
 
 let canonicalRootForTests: string | null = null;
+let relocationDbContext: Database | null = null;
+
+function relocationDb(): Database {
+  return relocationDbContext ?? getDb();
+}
 
 /** Test seam intentionally omitted from the package root export. */
 export function setPrimaryRelocationCanonicalRootForTests(root: string | null): void {
@@ -248,48 +259,11 @@ function isWithin(root: string, candidate: string): boolean {
   return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
-/** Return only a credential-free host/owner/name identity. */
-export function sanitizeGitRemoteUrl(remote: string): string {
-  const trimmed = remote.trim();
-  if (!trimmed || trimmed.includes("\0") || trimmed.includes("\\") || trimmed.startsWith("/")) return "";
-  let host = "";
-  let pathname = "";
-  try {
-    if (trimmed.includes("://")) {
-      const url = new URL(trimmed);
-      if (!["git:", "http:", "https:", "ssh:"].includes(url.protocol)) return "";
-      host = url.hostname.toLowerCase();
-      pathname = url.pathname;
-    } else {
-      const scp = trimmed.match(/^(?:[^@/:]+@)?([^/:]+):(.+)$/);
-      if (scp) {
-        host = scp[1]!.toLowerCase();
-        pathname = scp[2]!;
-      } else {
-        const parts = trimmed.split("/");
-        host = (parts.shift() || "").toLowerCase();
-        pathname = parts.join("/");
-      }
-    }
-  } catch {
-    return "";
-  }
-  const labels = host.split(".");
-  const segments = pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "").split("/").filter(Boolean);
-  if (
-    host.length > 253
-    || !labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
-    || segments.length !== 2
-    || !segments.every((segment) => segment !== "." && segment !== ".." && /^[A-Za-z0-9._-]+$/.test(segment))
-  ) return "";
-  return `${host}/${segments[0]}/${segments[1]}`;
-}
-
 function sanitizeCheckoutRemoteUrl(remote: string): string {
   const trimmed = remote.trim();
   const isNetworkUrl = trimmed.includes("://");
   const isScpSsh = /^(?:[^@/:]+@)?[^/:]+:.+$/.test(trimmed);
-  return isNetworkUrl || isScpSsh ? sanitizeGitRemoteUrl(trimmed) : "";
+  return isNetworkUrl || isScpSsh ? sanitizeGitRemoteUrl(trimmed) || "" : "";
 }
 
 function canonicalRoot(): string {
@@ -396,11 +370,11 @@ function quote(identifier: string): string {
 }
 
 function tableExists(table: string): boolean {
-  return Boolean(getDb().query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+  return Boolean(relocationDb().query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
 }
 
 function getRepo(id: number): Repo | null {
-  return getDb().query("SELECT * FROM repos WHERE id = ?").get(id) as Repo | null;
+  return relocationDb().query("SELECT * FROM repos WHERE id = ?").get(id) as Repo | null;
 }
 
 function safeRepo(repo: Repo): Repo {
@@ -947,7 +921,7 @@ function validateRows(request: ValidatedRequest, source: Repo, target: Repo): vo
 function validateNoThirdAlias(request: ValidatedRequest): void {
   let targetReal = "";
   try { targetReal = realpathSync(request.targetPath); } catch { return; }
-  const rows = getDb().query("SELECT id, path FROM repos WHERE id NOT IN (?, ?)").all(
+  const rows = relocationDb().query("SELECT id, path FROM repos WHERE id NOT IN (?, ?)").all(
     request.legacyRepoId,
     request.targetRepoId,
   ) as Array<{ id: number; path: string }>;
@@ -969,10 +943,10 @@ function validateNoThirdAlias(request: ValidatedRequest): void {
 }
 
 function unknownRepoForeignKeys(): string[] {
-  const tables = getDb().query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
+  const tables = relocationDb().query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
   const unknown: string[] = [];
   for (const { name } of tables) {
-    const fks = getDb().query(`PRAGMA foreign_key_list(${quote(name)})`).all() as Array<{ table: string }>;
+    const fks = relocationDb().query(`PRAGMA foreign_key_list(${quote(name)})`).all() as Array<{ table: string }>;
     if (fks.some((fk) => fk.table === "repos") && !KNOWN_REPO_FK_TABLES.has(name)) unknown.push(name);
   }
   return unknown.sort();
@@ -997,11 +971,23 @@ function buildChildPlan(request: ValidatedRequest): {
   const decisions: InternalDecision[] = [];
   const digests: Record<string, string> = {};
   for (const spec of CHILD_TABLES) {
-    const rows = getDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
+    const rawRows = relocationDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
       request.legacyRepoId,
       request.targetRepoId,
     ) as Array<Record<string, unknown>>;
-    digests[spec.table] = hash(rows);
+    digests[spec.table] = hash(rawRows);
+    const invalidRemoteIds = new Set<number>();
+    const rows: Array<Record<string, unknown>> = spec.table === "remotes"
+      ? rawRows.map((row) => {
+          const url = sanitizeGitRemoteUrl(String(row.url ?? ""));
+          if (!url) invalidRemoteIds.add(Number(row.id));
+          return {
+            ...row,
+            url: url || null,
+            fetch_url: sanitizeGitRemoteUrl(String(row.fetch_url ?? "")) || null,
+          } as Record<string, unknown>;
+        })
+      : rawRows;
     const legacyRows = rows.filter((row) => row.repo_id === request.legacyRepoId);
     const targetRows = rows.filter((row) => row.repo_id === request.targetRepoId);
     const legacyByKey = new Map(legacyRows.map((row) => [stable(keyFor(row, spec.key)), row]));
@@ -1012,9 +998,25 @@ function buildChildPlan(request: ValidatedRequest): {
       dedupe: 0,
       block: 0,
     };
+    for (const row of rows.filter((candidate) => invalidRemoteIds.has(Number(candidate.id)))) {
+      const logicalKey = keyFor(row, spec.key);
+      const payload = rowWithout(row, ["id", "repo_id"]);
+      const blocked: CollisionDecision = {
+        table: spec.table,
+        key_hash: hash(logicalKey),
+        source_hash: row.repo_id === request.legacyRepoId ? hash(payload) : null,
+        target_hash: hash(payload),
+        decision: "block",
+      };
+      tableCounts.block++;
+      collisions.push(blocked);
+      decisions.push({ ...blocked, row_id: Number(row.id) });
+    }
     for (const target of targetRows) {
+      if (invalidRemoteIds.has(Number(target.id))) continue;
       const logicalKey = keyFor(target, spec.key);
       const source = legacyByKey.get(stable(logicalKey));
+      if (source && invalidRemoteIds.has(Number(source.id))) continue;
       const targetPayload = rowWithout(target, ["id", "repo_id"]);
       const sourcePayload = source ? rowWithout(source, ["id", "repo_id"]) : null;
       const decision: CollisionDecision["decision"] = !source
@@ -1036,6 +1038,20 @@ function buildChildPlan(request: ValidatedRequest): {
   return { counts, collisions, decisions, digests };
 }
 
+function normalizeRelocationRemotes(request: ValidatedRequest): void {
+  const db = relocationDb();
+  const rows = db.query("SELECT id, url, fetch_url FROM remotes WHERE repo_id IN (?, ?)").all(
+    request.legacyRepoId,
+    request.targetRepoId,
+  ) as Array<{ id: number; url: string; fetch_url: string | null }>;
+  const update = db.query("UPDATE remotes SET url = ?, fetch_url = ? WHERE id = ?");
+  for (const row of rows) {
+    const url = sanitizeGitRemoteUrl(row.url);
+    if (!url) fail("TRANSACTION_CONFLICT", "remote identity changed after dry-run review");
+    update.run(url, sanitizeGitRemoteUrl(row.fetch_url || "") || null, row.id);
+  }
+}
+
 function buildEdgePlan(request: ValidatedRequest): {
   count: TableReconcileCounts;
   collisions: CollisionDecision[];
@@ -1044,7 +1060,7 @@ function buildEdgePlan(request: ValidatedRequest): {
 } {
   const legacy = String(request.legacyRepoId);
   const target = String(request.targetRepoId);
-  const rows = getDb().query(`SELECT * FROM edges
+  const rows = relocationDb().query(`SELECT * FROM edges
     WHERE (source_type = 'repo' AND source_id IN (?, ?))
        OR (target_type = 'repo' AND target_id IN (?, ?)) ORDER BY id`).all(
     legacy, target, legacy, target,
@@ -1128,11 +1144,11 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
   let leaseCount = 0;
   let leaseDigest = hash([]);
   if (tableExists("worktree_leases")) {
-    const columns = getDb().query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>;
+    const columns = relocationDb().query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>;
     if (!["lease_id", "repo_catalog_id", "repo_path"].every((column) => columns.some(({ name }) => name === column))) {
       fail("UNKNOWN_REPO_FOREIGN_KEY", "worktree_leases has an unsupported schema", { tables: ["worktree_leases"] });
     }
-    const leases = getDb().query(`SELECT * FROM worktree_leases
+    const leases = relocationDb().query(`SELECT * FROM worktree_leases
       WHERE repo_catalog_id IN (?, ?)
          OR repo_path IN (?, ?)
       ORDER BY lease_id`).all(
@@ -1164,7 +1180,7 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
       row.repo_catalog_id !== request.legacyRepoId || row.repo_path !== request.targetPath).length;
     counts.worktree_leases = { legacy: legacyLeases, target: targetLeases, move: movedLeases, dedupe: 0, block: 0 };
   }
-  const audits = getDb().query("SELECT * FROM repo_relocation_audit WHERE repo_id IN (?, ?) ORDER BY id").all(
+  const audits = relocationDb().query("SELECT * FROM repo_relocation_audit WHERE repo_id IN (?, ?) ORDER BY id").all(
     request.legacyRepoId,
     request.targetRepoId,
   );
@@ -1232,13 +1248,13 @@ function receiptFromRow(row: Record<string, unknown>): PrimaryRelocationReceipt 
     actor: String(row.actor),
     expected_current_path: String(row.expected_current_path),
     target_path: String(row.target_path),
-    expected_remote: String(row.expected_remote),
+    expected_remote: sanitizeGitRemoteUrl(String(row.expected_remote)),
     expected_head: String(row.expected_head),
     source_revision: String(row.source_revision),
     target_revision: String(row.target_revision),
-    source: JSON.parse(String(row.source_json)),
-    target: JSON.parse(String(row.target_json)),
-    after: JSON.parse(String(row.after_json)),
+    source: safeRepo(JSON.parse(String(row.source_json)) as Repo),
+    target: safeRepo(JSON.parse(String(row.target_json)) as Repo),
+    after: safeRepo(JSON.parse(String(row.after_json)) as Repo),
     counts: JSON.parse(String(row.counts_json)),
     collisions: JSON.parse(String(row.collisions_json)),
     created_at: String(row.created_at),
@@ -1268,7 +1284,7 @@ function resultFromReceipt(receipt: PrimaryRelocationReceipt): PrimaryRelocation
 }
 
 function existingIdempotentResult(request: ValidatedRequest): PrimaryRelocationResult | null {
-  const row = getDb().query("SELECT * FROM repo_relocation_audit WHERE idempotency_key = ?").get(
+  const row = relocationDb().query("SELECT * FROM repo_relocation_audit WHERE idempotency_key = ?").get(
     request.idempotencyKey,
   ) as Record<string, unknown> | null;
   if (!row) return null;
@@ -1285,7 +1301,7 @@ function existingIdempotentResult(request: ValidatedRequest): PrimaryRelocationR
 }
 
 function applyDecisions(request: ValidatedRequest, plan: ReconcilePlan): void {
-  const db = getDb();
+  const db = relocationDb();
   // Remove converged duplicates before moving their surviving row. This avoids
   // transient UNIQUE violations when multiple target-bearing edges map to the
   // same canonical post-relocation key.
@@ -1324,13 +1340,217 @@ function applyDecisions(request: ValidatedRequest, plan: ReconcilePlan): void {
   }
 }
 
+interface RelocationExactState {
+  repos: Array<Record<string, unknown>>;
+  children: Record<(typeof CHILD_TABLES)[number]["table"], Array<Record<string, unknown>>>;
+  edges: Array<Record<string, unknown>>;
+  worktree_leases: Array<Record<string, unknown>>;
+  repo_relocation_audit: Array<Record<string, unknown>>;
+}
+
+function compareRowIds(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  if (typeof left.id === "number" && typeof right.id === "number") return left.id - right.id;
+  return String(left.id) < String(right.id) ? -1 : String(left.id) > String(right.id) ? 1 : 0;
+}
+
+function compareLeaseIds(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  const leftId = String(left["lease_id"]);
+  const rightId = String(right["lease_id"]);
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+}
+
+function captureRelocationExactState(request: ValidatedRequest): RelocationExactState {
+  const db = relocationDb();
+  const children = Object.fromEntries(CHILD_TABLES.map(({ table }) => [
+    table,
+    db.query(`SELECT * FROM ${quote(table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
+      request.legacyRepoId,
+      request.targetRepoId,
+    ) as Array<Record<string, unknown>>,
+  ])) as RelocationExactState["children"];
+  const edges = db.query(`SELECT * FROM edges
+    WHERE (source_type = 'repo' AND source_id IN (?, ?))
+       OR (target_type = 'repo' AND target_id IN (?, ?)) ORDER BY id`).all(
+    String(request.legacyRepoId),
+    String(request.targetRepoId),
+    String(request.legacyRepoId),
+    String(request.targetRepoId),
+  ) as Array<Record<string, unknown>>;
+  const worktreeLeases = (tableExists("worktree_leases")
+    ? db.query(`SELECT * FROM worktree_leases
+        WHERE repo_catalog_id IN (?, ?)
+           OR repo_path IN (?, ?)
+        ORDER BY lease_id`).all(
+      request.legacyRepoId,
+      request.targetRepoId,
+      request.legacyPath,
+      request.targetPath,
+    ) as Array<Record<string, unknown>>
+    : []).sort(compareLeaseIds);
+  const audits = db.query(`SELECT * FROM repo_relocation_audit
+    WHERE repo_id IN (?, ?)`).all(
+    request.legacyRepoId,
+    request.targetRepoId,
+  ) as Array<Record<string, unknown>>;
+  return {
+    repos: db.query("SELECT * FROM repos WHERE id IN (?, ?) ORDER BY id").all(
+      request.legacyRepoId,
+      request.targetRepoId,
+    ) as Array<Record<string, unknown>>,
+    children,
+    edges,
+    worktree_leases: worktreeLeases,
+    repo_relocation_audit: audits.sort(compareRowIds),
+  };
+}
+
+function rawReceiptRow(receipt: PrimaryRelocationReceipt): Record<string, unknown> {
+  return {
+    id: receipt.id,
+    idempotency_key: receipt.idempotency_key,
+    request_hash: receipt.request_hash,
+    plan_hash: receipt.plan_hash,
+    repo_id: receipt.repo_id,
+    target_repo_id: receipt.target_repo_id,
+    operation: receipt.operation,
+    actor: receipt.actor,
+    expected_current_path: receipt.expected_current_path,
+    target_path: receipt.target_path,
+    expected_remote: receipt.expected_remote,
+    expected_head: receipt.expected_head,
+    source_revision: receipt.source_revision,
+    target_revision: receipt.target_revision,
+    source_json: JSON.stringify(receipt.source),
+    target_json: JSON.stringify(receipt.target),
+    after_json: JSON.stringify(receipt.after),
+    counts_json: JSON.stringify(receipt.counts),
+    collisions_json: JSON.stringify(receipt.collisions),
+    created_at: receipt.created_at,
+  };
+}
+
+function expectedRelocationExactState(
+  before: RelocationExactState,
+  request: ValidatedRequest,
+  plan: ReconcilePlan,
+  receipt: PrimaryRelocationReceipt,
+): RelocationExactState {
+  const decisionsByTable = new Map<string, InternalDecision[]>();
+  for (const decision of plan.decisions) {
+    const decisions = decisionsByTable.get(decision.table) ?? [];
+    decisions.push(decision);
+    decisionsByTable.set(decision.table, decisions);
+  }
+  const projectRows = (table: string, rows: Array<Record<string, unknown>>) => {
+    let projected = rows.map((row) => {
+      const copy = { ...row };
+      if (table === "remotes") {
+        copy.url = sanitizeGitRemoteUrl(String(copy.url ?? "")) || null;
+        copy.fetch_url = sanitizeGitRemoteUrl(String(copy.fetch_url ?? "")) || null;
+      }
+      return copy;
+    });
+    for (const decision of decisionsByTable.get(table) ?? []) {
+      if (decision.decision === "dedupe") {
+        projected = projected.filter((row) => Number(row.id) !== decision.row_id);
+      } else if (decision.decision === "move") {
+        projected = projected.map((row) => Number(row.id) === decision.row_id
+          ? { ...row, repo_id: request.legacyRepoId }
+          : row);
+      }
+    }
+    return projected.sort(compareRowIds);
+  };
+  const children = Object.fromEntries(CHILD_TABLES.map(({ table }) => [
+    table,
+    projectRows(table, before.children[table]),
+  ])) as RelocationExactState["children"];
+  let edges = before.edges.map((row) => ({ ...row }));
+  for (const decision of decisionsByTable.get("edges") ?? []) {
+    if (decision.decision === "dedupe") {
+      edges = edges.filter((row) => Number(row.id) !== decision.row_id);
+    } else if (decision.decision === "move") {
+      edges = edges.map((row) => Number(row.id) === decision.row_id ? {
+        ...row,
+        source_id: row.source_type === "repo" && row.source_id === String(request.targetRepoId)
+          ? String(request.legacyRepoId)
+          : row.source_id,
+        target_id: row.target_type === "repo" && row.target_id === String(request.targetRepoId)
+          ? String(request.legacyRepoId)
+          : row.target_id,
+      } : row);
+    }
+  }
+  const expectedRepo = {
+    ...plan.sourceRow,
+    path: request.targetPath,
+    name: plan.targetRow.name,
+    org: plan.targetRow.org,
+    remote_url: request.remote,
+    default_branch: plan.targetRow.default_branch,
+    description: plan.targetRow.description,
+    last_scanned: plan.targetRow.last_scanned,
+    commit_count: plan.counts.commits!.legacy + plan.counts.commits!.move,
+    branch_count: plan.counts.branches!.legacy + plan.counts.branches!.move,
+    tag_count: plan.counts.tags!.legacy + plan.counts.tags!.move,
+    created_at: earliestTimestamp(plan.sourceRow.created_at, plan.targetRow.created_at),
+    updated_at: receipt.created_at,
+  } as unknown as Record<string, unknown>;
+  return {
+    repos: [expectedRepo],
+    children,
+    edges: edges.sort(compareRowIds),
+    worktree_leases: before.worktree_leases.map((row): Record<string, unknown> => ({
+      ...row,
+      repo_catalog_id: request.legacyRepoId,
+      repo_path: request.targetPath,
+    })).sort(compareLeaseIds),
+    repo_relocation_audit: [
+      ...before.repo_relocation_audit.map((row) => ({ ...row })),
+      rawReceiptRow(receipt),
+    ].sort(compareRowIds),
+  };
+}
+
+function verifyRelocationExactState(expected: RelocationExactState, actual: RelocationExactState): void {
+  const envelope = (state: RelocationExactState) => ({
+    repos: { count: state.repos.length, digest: hash(state.repos), rows: state.repos },
+    children: Object.fromEntries(Object.entries(state.children).map(([table, rows]) => [
+      table,
+      { count: rows.length, digest: hash(rows), rows },
+    ])),
+    edges: { count: state.edges.length, digest: hash(state.edges), rows: state.edges },
+    worktree_leases: {
+      count: state.worktree_leases.length,
+      digest: hash(state.worktree_leases),
+      rows: state.worktree_leases,
+    },
+    repo_relocation_audit: {
+      count: state.repo_relocation_audit.length,
+      digest: hash(state.repo_relocation_audit),
+      rows: state.repo_relocation_audit,
+    },
+  });
+  if (stable(envelope(actual)) !== stable(envelope(expected))) {
+    fail("TRANSACTION_CONFLICT", "exact relocation receipt verification failed");
+  }
+}
+
 export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryRelocationResult {
   const validated = validateRequest(request);
   if (validated.apply) {
     const retry = existingIdempotentResult(validated);
     if (retry) return retry;
   }
-  const plan = buildPlan(validated);
+  const planningContext = validated.apply ? null : openNonMigratingDb(request.databasePath);
+  if (planningContext) relocationDbContext = planningContext.db;
+  let plan: ReconcilePlan;
+  try {
+    plan = buildPlan(validated);
+  } finally {
+    relocationDbContext = null;
+    planningContext?.close();
+  }
   const source = safeRepo(plan.sourceRow);
   const target = safeRepo(plan.targetRow);
   if (!validated.apply) {
@@ -1383,7 +1603,9 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
         actual_plan_hash: currentPlan.planHash,
       });
     }
+    const exactBefore = captureRelocationExactState(validated);
 
+    normalizeRelocationRemotes(validated);
     applyDecisions(validated, currentPlan);
     if (tableExists("worktree_leases")) {
       db.query(`UPDATE worktree_leases SET repo_catalog_id = ?, repo_path = ?
@@ -1420,7 +1642,7 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
       validated.targetPath,
       currentPlan.targetRow.name,
       currentPlan.targetRow.org,
-      currentPlan.targetRow.remote_url,
+      validated.remote,
       currentPlan.targetRow.default_branch,
       currentPlan.targetRow.description,
       currentPlan.targetRow.last_scanned,
@@ -1469,6 +1691,10 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
       receipt.expected_head, receipt.source_revision, receipt.target_revision,
       JSON.stringify(receipt.source), JSON.stringify(receipt.target), JSON.stringify(receipt.after),
       JSON.stringify(receipt.counts), JSON.stringify(receipt.collisions), receipt.created_at,
+    );
+    verifyRelocationExactState(
+      expectedRelocationExactState(exactBefore, validated, currentPlan, receipt),
+      captureRelocationExactState(validated),
     );
     const fkErrors = db.query("PRAGMA foreign_key_check").all();
     if (fkErrors.length) fail("TRANSACTION_CONFLICT", "foreign-key verification failed");

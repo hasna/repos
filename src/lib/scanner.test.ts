@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterAll } from "bun:test";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
 import { scanRepos } from "./scanner";
-import { listRepos, listCommits, listBranches, listTags } from "../db/repos";
+import { listRepos, listCommits, listBranches, listTags, listRemotes } from "../db/repos";
 
 const TEST_DIR = join(import.meta.dir, "../../.test-repos");
 
@@ -154,5 +154,21 @@ describe("scanner", () => {
     await scanRepos([TEST_DIR]);
     const repos = listRepos();
     expect(repos[0]!.default_branch).toBeTruthy();
+  });
+
+  it("normalizes credential-bearing Git remotes before scanner persistence", async () => {
+    const repoPath = createTestRepo("remote-sanitize", 1);
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
+    execFileSync("git", ["remote", "add", "origin", unsafe], { cwd: repoPath, stdio: "pipe" });
+
+    await scanRepos([TEST_DIR]);
+    const repo = listRepos()[0]!;
+    expect(repo.remote_url).toBe("git.example.test/team/tool");
+    expect(listRemotes(repo.id)).toEqual([expect.objectContaining({
+      name: "origin",
+      url: "git.example.test/team/tool",
+      fetch_url: "git.example.test/team/tool",
+    })]);
+    expect(JSON.stringify({ repo, remotes: listRemotes(repo.id) })).not.toContain(unsafe);
   });
 });

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,7 @@ import {
   applyGithubCatalogFilter,
   enumerateGithubRepoCatalog,
   extractGithubFullNameFromRemote,
+  loadGithubRepoCatalog,
   syncGithubRepoCatalog,
 } from "./github-catalog";
 import type { Repo } from "../types";
@@ -119,6 +121,144 @@ describe("github catalog SDK", () => {
     expect(cache.repositories[0]!.loop.tags).toContain("scope:hasna");
     expect(readFileSync(cachePath, "utf-8")).not.toContain("token-value");
     expect(endpoints.some((endpoint) => endpoint.startsWith("/user/repos"))).toBe(true);
+  });
+
+  test("strips userinfo, query, and fragment metadata in SDK cache and CLI JSON output", () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, "config"));
+    mkdirSync(join(dir, "cache"));
+    mkdirSync(join(dir, "tmp"));
+    const cachePath = join(dir, "github-catalog.json");
+    const requestJson = (endpoint: string): unknown => {
+      if (endpoint === "rate_limit") {
+        return { resources: { core: { limit: 5000, remaining: 100, used: 10, reset: 1782288000 } } };
+      }
+      if (endpoint === "user") {
+        return { login: "hasna", type: "User", html_url: "https://viewer:phrase@github.com/hasna?token=marker#user" };
+      }
+      if (endpoint === "/user/orgs?per_page=100&page=1") {
+        return [{ login: "hasna-labs", html_url: "https://viewer:phrase@github.com/hasna-labs?token=marker#org" }];
+      }
+      if (isPage(endpoint, 1)) {
+        return [repoPayload({
+          html_url: "https://viewer:phrase@github.com/hasna/repos?token=marker#section",
+          clone_url: "https://actor:phrase@github.com/hasna/repos.git?token=marker#fragment",
+          ssh_url: "ssh://git:phrase@github.com/hasna/repos.git?token=marker#fragment",
+        })];
+      }
+      if (isPage(endpoint, 2)) return [];
+      throw new Error(`unexpected endpoint ${endpoint}`);
+    };
+
+    const cache = syncGithubRepoCatalog({ cachePath, requestJson, includeLocal: false });
+    const sdkJson = JSON.stringify(cache);
+    expect(sdkJson).not.toContain("phrase");
+    expect(sdkJson).not.toContain("token=marker");
+    expect(sdkJson).not.toContain("#fragment");
+    expect(cache.repositories[0]!.html_url).toBe("https://github.com/hasna/repos");
+    expect(cache.repositories[0]!.clone_urls.https).toBe("https://github.com/hasna/repos.git");
+    expect(cache.repositories[0]!.clone_urls.ssh).toBe("ssh://github.com/hasna/repos.git");
+    expect(cache.accounts).toEqual([
+      { login: "hasna", type: "User", url: "https://github.com/hasna" },
+      { login: "hasna-labs", type: "Organization", url: "https://github.com/hasna-labs" },
+    ]);
+
+    const cli = spawnSync(process.execPath, [
+      "run",
+      join(import.meta.dir, "../cli/index.tsx"),
+      "gh-catalog",
+      "--cache",
+      cachePath,
+      "--cache-only",
+      "--json",
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: dir,
+        XDG_CONFIG_HOME: join(dir, "config"),
+        XDG_CACHE_HOME: join(dir, "cache"),
+        TMPDIR: join(dir, "tmp"),
+        HASNA_REPOS_DB_PATH: join(dir, "cli.db"),
+        REPOS_DB_PATH: join(dir, "cli.db"),
+        HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH: "1",
+        HASNA_REPOS_DATABASE_URL: "",
+        REPOS_DATABASE_URL: "",
+        NO_COLOR: "1",
+      },
+    });
+    expect(cli.status).toBe(0);
+    expect(cli.stderr).toBe("");
+    expect(cli.stdout).not.toContain("phrase");
+    expect(cli.stdout).not.toContain("token=marker");
+    expect(cli.stdout).not.toContain("#fragment");
+    expect(JSON.parse(cli.stdout).repositories[0].clone_urls).toEqual(cache.repositories[0]!.clone_urls);
+  });
+
+  test("sanitizes account URLs from a valid v1 cache on load, enumeration, and cache-only CLI output", () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, "config"));
+    mkdirSync(join(dir, "cache"));
+    mkdirSync(join(dir, "tmp"));
+    const cachePath = join(dir, "github-catalog.json");
+    const marker = ["cached", "phrase"].join(":");
+    const requestJson = (endpoint: string): unknown => {
+      if (endpoint === "rate_limit") {
+        return { resources: { core: { limit: 5000, remaining: 100, used: 10, reset: 1782288000 } } };
+      }
+      if (endpoint === "user") return { login: "hasna", type: "User" };
+      if (endpoint === "/user/orgs?per_page=100&page=1") return [];
+      if (isPage(endpoint, 1)) return [repoPayload()];
+      if (isPage(endpoint, 2)) return [];
+      throw new Error(`unexpected endpoint ${endpoint}`);
+    };
+    const seeded = syncGithubRepoCatalog({ cachePath, requestJson, includeLocal: false });
+    writeFileSync(cachePath, JSON.stringify({
+      ...seeded,
+      accounts: [{
+        login: "hasna",
+        type: "User",
+        url: `https://viewer:${marker}@github.com/hasna?token=marker#account`,
+        html_url: `https://viewer:${marker}@github.com/hasna?token=marker#legacy-html-url`,
+      }],
+    }));
+
+    const loaded = loadGithubRepoCatalog(cachePath);
+    const envelope = enumerateGithubRepoCatalog({ cachePath, includeLocal: false });
+    expect(loaded?.accounts).toEqual([{ login: "hasna", type: "User", url: "https://github.com/hasna" }]);
+    expect(envelope.accounts).toEqual(loaded?.accounts);
+    expect(JSON.stringify({ loaded, envelope })).not.toContain(marker);
+    expect(JSON.stringify({ loaded, envelope })).not.toContain("token=marker");
+
+    const cli = spawnSync(process.execPath, [
+      "run",
+      join(import.meta.dir, "../cli/index.tsx"),
+      "gh-catalog",
+      "--cache",
+      cachePath,
+      "--cache-only",
+      "--json",
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: dir,
+        XDG_CONFIG_HOME: join(dir, "config"),
+        XDG_CACHE_HOME: join(dir, "cache"),
+        TMPDIR: join(dir, "tmp"),
+        HASNA_REPOS_DB_PATH: join(dir, "cli.db"),
+        REPOS_DB_PATH: join(dir, "cli.db"),
+        HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH: "1",
+        HASNA_REPOS_DATABASE_URL: "",
+        REPOS_DATABASE_URL: "",
+        NO_COLOR: "1",
+      },
+    });
+    expect(cli.status).toBe(0);
+    expect(cli.stderr).toBe("");
+    expect(cli.stdout).not.toContain(marker);
+    expect(cli.stdout).not.toContain("token=marker");
+    expect(JSON.parse(cli.stdout).accounts).toEqual(loaded?.accounts);
   });
 
   test("enumerates cached records with OpenLoops filters and pagination", () => {

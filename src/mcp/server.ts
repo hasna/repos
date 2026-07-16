@@ -32,6 +32,7 @@ import {
 } from "../lib/repo-ops.js";
 import { getDb } from "../db/database.js";
 import { getCliVersion } from "../cli/version.js";
+import { sanitizeRemoteOutput } from "../lib/remote-identity.js";
 
 export const MCP_NAME = "repos";
 export const VERSION = getCliVersion();
@@ -43,7 +44,11 @@ export function buildServer(): McpServer {
   });
 
 function jsonText(value: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+  return { content: [{ type: "text" as const, text: JSON.stringify(sanitizeRemoteOutput(value)) }] };
+}
+
+function safeStringify(value: unknown, space?: number): string {
+  return JSON.stringify(sanitizeRemoteOutput(value), null, space);
 }
 
 function todosArgs(args: {
@@ -71,7 +76,7 @@ server.tool("list_repos", "List all tracked repositories", {
   query: z.string().optional().describe("Filter by name/description"),
 }, async (args) => {
   const repos = listRepos(args);
-  return { content: [{ type: "text", text: JSON.stringify(repos, null, 2) }] };
+  return { content: [{ type: "text", text: safeStringify(repos, 2) }] };
 });
 
 server.tool("get_repo", "Get a repo by ID, path, or name", {
@@ -80,7 +85,7 @@ server.tool("get_repo", "Get a repo by ID, path, or name", {
   const repo = getRepo(isNaN(Number(id)) ? id : Number(id));
   if (!repo) return { content: [{ type: "text", text: "Repo not found" }] };
   const stats = getRepoStats(repo.id);
-  return { content: [{ type: "text", text: JSON.stringify({ ...repo, ...stats }, null, 2) }] };
+  return { content: [{ type: "text", text: safeStringify({ ...repo, ...stats }, 2) }] };
 });
 
 server.tool("search_repos", "Search repos by name, description, or URL", {
@@ -88,7 +93,7 @@ server.tool("search_repos", "Search repos by name, description, or URL", {
   limit: z.number().optional().describe("Max results (default 20)"),
 }, async ({ query, limit }) => {
   const repos = searchRepos(query, limit);
-  return { content: [{ type: "text", text: JSON.stringify(repos, null, 2) }] };
+  return { content: [{ type: "text", text: safeStringify(repos, 2) }] };
 });
 
 // ── Commits ──
@@ -160,7 +165,7 @@ server.tool("list_remotes", "List remotes for a repo", {
   repo_id: z.number().describe("Repo ID"),
 }, async ({ repo_id }) => {
   const remotes = listRemotes(repo_id);
-  return { content: [{ type: "text", text: JSON.stringify(remotes, null, 2) }] };
+  return { content: [{ type: "text", text: safeStringify(remotes, 2) }] };
 });
 
 // ── Unified Search ──

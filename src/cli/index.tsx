@@ -21,7 +21,11 @@ import {
   PrimaryRelocationError,
   relocatePrimaryRepo,
 } from "../db/primary-relocation.js";
-import { ensureWorkspaceBootstrap, startAutoIndexWorker } from "../lib/auto-index.js";
+import { getDbPath } from "../db/database.js";
+import {
+  ensureWorkspaceBootstrap,
+  startAutoIndexWorker,
+} from "../lib/auto-index.js";
 import { getFilterAlias } from "../lib/config.js";
 import { getReposStatus } from "../lib/status.js";
 import { formatRepoNotFoundMessage } from "./messages.js";
@@ -447,6 +451,7 @@ registry
         idempotencyKey: opts.idempotencyKey,
         expectedPlanHash: opts.expectedPlanHash,
         apply: Boolean(opts.apply),
+        databasePath: getDbPath(),
       });
       if (json) {
         console.log(JSON.stringify(result, null, 2));

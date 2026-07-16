@@ -185,7 +185,8 @@ describe("repo ops CLI commands", () => {
     expect(result.exitCode, stdout).toBe(0);
     expect(synced.errors).toEqual([]);
     expect(synced.skipped.length).toBe(1);
-    expect(synced.skipped[0]).toContain("Could not resolve to a Repository");
+    expect(synced.skipped[0]).toContain("GitHub repository is unavailable");
+    expect(synced.skipped[0]).not.toContain("Could not resolve to a Repository");
   });
 
   test("pr queue exits non-zero on sync errors by default", () => {
@@ -218,6 +219,7 @@ describe("repo ops CLI commands", () => {
     const stdout = new TextDecoder().decode(result.stdout);
 
     expect(result.exitCode).toBe(1);
-    expect(JSON.parse(stdout).synced.errors[0]).toContain("gh pr list");
+    expect(JSON.parse(stdout).synced.errors[0]).toContain("GitHub CLI request failed exit=7");
+    expect(JSON.parse(stdout).synced.errors[0]).not.toContain("gh pr list");
   });
 });

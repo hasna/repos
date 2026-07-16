@@ -5,6 +5,7 @@ import { getDb } from "../db/database.js";
 import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
 import { getReleasePipelineParity, type OpsCommandRunner } from "./repo-ops.js";
 import type { PullRequest } from "../types/index.js";
+import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 export interface TaskSeed {
   fingerprint: string;
@@ -1087,8 +1088,8 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
 }
 
 function githubFullNameFromRepoRow(row: Pick<PrRow, "repo_org" | "repo_name" | "repo_remote_url">): string {
-  const parsed = row.repo_remote_url?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/);
-  if (parsed?.[1]) return parsed[1].replace(/\.git$/, "");
+  const identity = sanitizeRemoteIdentity(row.repo_remote_url);
+  if (identity?.startsWith("github.com/")) return identity.slice("github.com/".length);
   return `${row.repo_org ?? "unknown"}/${row.repo_name}`;
 }
 
@@ -1180,9 +1181,8 @@ function inferGithubRepo(repoPath: string, runner: CommandRunner, timeoutMs: num
 }
 
 function parseGithubRepo(remoteUrl: string): string | null {
-  const normalized = remoteUrl.trim().replace(/\.git$/, "");
-  const match = normalized.match(/github\.com[:/]([^/\s]+\/[^/\s]+)$/);
-  return match?.[1] ?? null;
+  const identity = sanitizeRemoteIdentity(remoteUrl);
+  return identity?.startsWith("github.com/") ? identity.slice("github.com/".length) : null;
 }
 
 function gitOutput(repoPath: string, runner: CommandRunner, timeoutMs: number, args: string[]): string | null {

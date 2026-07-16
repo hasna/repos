@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { buildServer, MCP_NAME } from "./server.js";
 import { handleMcpHttpRoutes, healthPayload, startMcpHttpServer } from "./http.js";
+import { closeDb, getDb } from "../db/database.js";
 
 let httpServer: Server;
 let port: number;
@@ -23,6 +24,7 @@ afterAll(async () => {
     httpServer.close((err) => (err ? reject(err) : resolve()));
   });
   delete process.env["REPOS_DB_PATH"];
+  closeDb();
 });
 
 describe("MCP HTTP transport", () => {
@@ -43,6 +45,33 @@ describe("MCP HTTP transport", () => {
     expect(result.isError).not.toBe(true);
     expect(result.content?.[0]?.type).toBe("text");
 
+    await client.close();
+  });
+
+  it("sanitizes contaminated repo and remote rows over MCP HTTP", async () => {
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
+    const db = getDb();
+    const repo = db.query("INSERT INTO repos (path, name, remote_url) VALUES ('/tmp/mcp-output', 'mcp-output', ?) RETURNING id")
+      .get(unsafe) as { id: number };
+    db.query("INSERT INTO remotes (repo_id, name, url, fetch_url) VALUES (?, 'origin', ?, ?)")
+      .run(repo.id, unsafe, unsafe);
+
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+    const client = new Client({ name: "repos-http-redaction-test", version: "1.0.0" });
+    await client.connect(transport);
+    for (const request of [
+      { name: "list_repos", arguments: { query: "mcp-output" } },
+      { name: "get_repo", arguments: { id: String(repo.id) } },
+      { name: "search_repos", arguments: { query: "mcp" } },
+      { name: "list_remotes", arguments: { repo_id: repo.id } },
+    ]) {
+      const result = await client.callTool(request);
+      const text = (result.content?.[0] as { type?: string; text?: string } | undefined)?.text ?? "";
+      expect(result.isError).not.toBe(true);
+      expect(text).toContain("git.example.test/team/tool");
+      expect(text).not.toContain(unsafe);
+      expect(text).not.toContain("phrase");
+    }
     await client.close();
   });
 

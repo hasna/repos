@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import cliProgress from "cli-progress";
 import { getDb } from "../db/database.js";
 import { getConfig, getWorkspaceRoots } from "./config.js";
+import { sanitizeRemoteIdentity } from "./remote-identity.js";
 import {
   upsertRepo,
   bulkInsertCommits,
@@ -70,12 +71,7 @@ export function discoverRepos(rootDirs: string[], maxDepth?: number): string[] {
 
 function extractOrg(remoteUrl: string | null): string | null {
   if (!remoteUrl) return null;
-  // https://github.com/org/repo.git or git@github.com:org/repo.git
-  const httpsMatch = remoteUrl.match(/github\.com\/([^/]+)\//);
-  if (httpsMatch) return httpsMatch[1] || null;
-  const sshMatch = remoteUrl.match(/github\.com:([^/]+)\//);
-  if (sshMatch) return sshMatch[1] || null;
-  return null;
+  return remoteUrl.split("/")[1] || null;
 }
 
 function indexRepo(repoPath: string, full = false): {
@@ -88,7 +84,7 @@ function indexRepo(repoPath: string, full = false): {
   const name = basename(repoPath);
 
   // Get remote URL and default branch
-  const remoteUrl = git(repoPath, ["remote", "get-url", "origin"]) || null;
+  const remoteUrl = sanitizeRemoteIdentity(git(repoPath, ["remote", "get-url", "origin"]));
   const defaultBranch = git(repoPath, ["symbolic-ref", "--short", "HEAD"]) || "main";
   const org = extractOrg(remoteUrl);
 
