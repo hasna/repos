@@ -39,7 +39,7 @@ class FakeRemoteSyncClient implements ReposRemoteSyncClient {
     const normalized = sql.replace(/\s+/g, " ").trim();
     if (
       normalized.startsWith("CREATE SCHEMA")
-      || normalized.startsWith("SET search_path")
+      || normalized.startsWith("SET LOCAL search_path")
       || normalized.startsWith("CREATE TABLE")
       || normalized.startsWith("ALTER TABLE")
       || normalized.startsWith("CREATE INDEX")
@@ -145,7 +145,7 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
       || normalized.startsWith("SELECT pg_advisory_xact_lock")
       || normalized === "LOCK TABLE repos, remotes IN SHARE ROW EXCLUSIVE MODE"
       || normalized.startsWith("CREATE SCHEMA IF NOT EXISTS")
-      || normalized.startsWith("SET search_path TO")
+      || normalized.startsWith("SET LOCAL search_path TO")
       || normalized.startsWith("CREATE TABLE IF NOT EXISTS repos_remote_identity_cleanup_audit")
       || normalized.startsWith("CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_remote_identity_cleanup_idempotency")
     ) {
@@ -464,7 +464,10 @@ describe("auto-index", () => {
     expect(indexOf("SELECT pg_advisory_xact_lock")).toBeLessThan(indexOf("SELECT version, mode, actor"));
     expect(indexOf("LOCK TABLE repos, remotes")).toBeLessThan(indexOf("SELECT id, name, org, description"));
     expect(indexOf("SELECT id, name, org, description")).toBeLessThan(indexOf("UPDATE repos SET remote_url"));
-    expect(indexOf("SELECT COUNT(*)::int AS count")).toBeLessThan(indexOf("INSERT INTO repos_remote_identity_cleanup_audit"));
+    expect(applyQueries.filter((query) => query.startsWith("SELECT id, name, org, description, remote_url,"))).toHaveLength(3);
+    expect(indexOf("SELECT id, name, org, description, remote_url,")).toBeLessThan(
+      indexOf("INSERT INTO repos_remote_identity_cleanup_audit"),
+    );
     expect(applyQueries.at(-2)).toBe("COMMIT");
     expect(applyQueries.at(-1)).toStartWith("SELECT pg_advisory_unlock");
 
@@ -584,6 +587,64 @@ describe("auto-index", () => {
     expect(removed.queries.at(-2)).toBe("ROLLBACK");
   });
 
+  it("rejects exact-value substitution and same-count row replacement before commit", async () => {
+    const substituted = new FakeRemoteCleanupClient();
+    substituted.repos.set(7, {
+      id: 7,
+      name: "canonical",
+      org: "hasna",
+      description: "unchanged",
+      remote_url: "github.com/hasna/canonical",
+      search_vector: "canonical:github.com/hasna/canonical",
+    });
+    const substitutedPlan = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "exact-value-plan",
+      remoteClient: substituted,
+    });
+    substituted.afterAuditInsert = () => {
+      // This remains a fully canonical row with unchanged cardinality. Only an
+      // exact ID-keyed post-state check can reject the trigger substitution.
+      substituted.repos.get(7)!.description = "trigger-substitution";
+    };
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "exact-value-apply",
+      apply: true,
+      expectedPlanHash: substitutedPlan.plan_hash,
+      remoteClient: substituted,
+    })).rejects.toThrow("remote identity cleanup verification failed");
+    expect(substituted.queries.at(-2)).toBe("ROLLBACK");
+
+    const replaced = new FakeRemoteCleanupClient();
+    replaced.remotes.set(9, {
+      id: 9,
+      url: "github.com/hasna/canonical",
+      fetch_url: "github.com/hasna/canonical",
+    });
+    const replacedPlan = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "same-count-plan",
+      remoteClient: replaced,
+    });
+    replaced.afterAuditInsert = () => {
+      replaced.remotes.delete(9);
+      replaced.remotes.set(10, {
+        id: 10,
+        url: "github.com/hasna/canonical",
+        fetch_url: "github.com/hasna/canonical",
+      });
+    };
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "same-count-apply",
+      apply: true,
+      expectedPlanHash: replacedPlan.plan_hash,
+      remoteClient: replaced,
+    })).rejects.toThrow("remote identity cleanup verification failed");
+    expect(replaced.queries.at(-2)).toBe("ROLLBACK");
+  });
+
   it("uses the configured schema fallback and replays same-key dry runs deterministically", async () => {
     process.env["HASNA_REPOS_DATABASE_SCHEMA"] = "repos_review";
     const remote = new FakeRemoteCleanupClient();
@@ -599,7 +660,7 @@ describe("auto-index", () => {
     });
     expect(replay).toEqual({ ...first, replayed: true });
     expect(remote.queries).toContain('CREATE SCHEMA IF NOT EXISTS "repos_review"');
-    expect(remote.queries).toContain('SET search_path TO "repos_review"');
+    expect(remote.queries).toContain('SET LOCAL search_path TO "repos_review"');
     expect(remote.queries.filter((query) => query.startsWith("INSERT INTO repos_remote_identity_cleanup_audit"))).toHaveLength(1);
   });
 
@@ -644,11 +705,33 @@ describe("auto-index", () => {
         throw new Error(marker);
       },
     });
+    const repoPath = join(TEST_DIR, "teardown-remote");
+    owned.seedRepo(repoPath, {
+      path: repoPath,
+      name: "teardown-remote",
+      org: "hasna",
+      remote_url: "github.com/hasna/teardown-remote",
+      default_branch: "main",
+      description: null,
+      last_scanned: null,
+      commit_count: 1,
+      branch_count: 1,
+      tag_count: 0,
+      created_at: "2026-07-15T00:00:00.000Z",
+      updated_at: "2026-07-15T00:01:00.000Z",
+      source_machine_id: "remote-machine",
+    });
     const teardown = await syncRepoCatalog("pull", undefined, {
       databaseUrl: "postgres://repos@example.invalid/repos",
       remoteClientFactory: () => owned,
     });
-    expect(teardown.errors).toEqual(["remote repository catalog synchronization failed"]);
+    expect(teardown).toMatchObject({
+      direction: "pull",
+      enabled: true,
+      rowsSynced: 1,
+      errors: [],
+      teardownStatus: "failed",
+    });
     expect(JSON.stringify(teardown)).not.toContain(marker);
 
     let injectedEndCalls = 0;
@@ -676,7 +759,7 @@ describe("auto-index", () => {
         if (normalized === "BEGIN" || normalized.startsWith("CREATE SCHEMA") || normalized === "ROLLBACK") {
           return { rows: [], rowCount: 0 };
         }
-        if (normalized.startsWith("SET search_path")) throw new Error(marker);
+        if (normalized.startsWith("SET LOCAL search_path")) throw new Error(marker);
         throw new Error(`unexpected query after setup failure: ${normalized}`);
       },
     };
@@ -691,7 +774,7 @@ describe("auto-index", () => {
     expect(queries).toEqual([
       "BEGIN",
       'CREATE SCHEMA IF NOT EXISTS "repos_review"',
-      'SET search_path TO "repos_review"',
+      'SET LOCAL search_path TO "repos_review"',
       "ROLLBACK",
     ]);
   });

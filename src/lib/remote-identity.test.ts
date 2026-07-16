@@ -63,7 +63,7 @@ describe("sanitizeRemoteOutput", () => {
       remote: { repo_id: 1, name: "origin", url: unsafe, fetch_url: unsafe },
     });
     expect(output).toEqual({
-      created_at: createdAt,
+      created_at: "2026-07-15T00:00:00.000Z",
       pull_request: { url: "https://github.com/team/tool/pull/1" },
       remote: {
         repo_id: 1,
@@ -91,7 +91,7 @@ describe("sanitizeRemoteOutput", () => {
     const output = sanitizeRemoteOutput({ ordinary, bytes, hostile }) as Record<string, unknown>;
 
     expect(output["ordinary"]).toEqual(ordinary);
-    expect(output["bytes"]).toBe(bytes);
+    expect(output["bytes"]).toEqual({ type: "Buffer", data: [1, 2, 3] });
     expect(output["hostile"]).toEqual({
       repo_id: 1,
       name: "origin",
@@ -169,7 +169,7 @@ describe("sanitizeRemoteOutput", () => {
     expect(JSON.stringify(output)).not.toContain(marker);
   });
 
-  it("projects built-ins with hostile own toJSON while preserving ordinary built-ins", () => {
+  it("projects built-ins with hostile own toJSON while preserving ordinary JSON values", () => {
     const marker = ["serializer", "phrase"].join(":");
     const hostileDate = new Date("2026-07-15T00:00:00.000Z");
     Object.defineProperty(hostileDate, "toJSON", { value: () => marker });
@@ -186,11 +186,56 @@ describe("sanitizeRemoteOutput", () => {
       ordinaryBytes,
       ordinaryTyped,
     }) as Record<string, unknown>;
-    expect(output["hostileDate"]).toEqual({});
-    expect(output["hostileBytes"]).toEqual({ 0: 9, 1: 8 });
-    expect(output["ordinaryDate"]).toBe(ordinaryDate);
-    expect(output["ordinaryBytes"]).toBe(ordinaryBytes);
-    expect(output["ordinaryTyped"]).toBe(ordinaryTyped);
+    expect(output["hostileDate"]).toBe("2026-07-15T00:00:00.000Z");
+    expect(output["hostileBytes"]).toEqual({ type: "Buffer", data: [9, 8] });
+    expect(output["ordinaryDate"]).toBe("2026-07-15T00:00:00.000Z");
+    expect(output["ordinaryBytes"]).toEqual({ type: "Buffer", data: [1, 2] });
+    expect(output["ordinaryTyped"]).toEqual({ 0: 3, 1: 4 });
     expect(JSON.stringify(output)).not.toContain(marker);
+  });
+
+  it("materializes prototype-free JSON without executing inherited serializers", () => {
+    const marker = ["inherited", "phrase"].join(":");
+    const prototypes = [
+      Object.prototype,
+      Array.prototype,
+      Date.prototype,
+      Buffer.prototype,
+      Uint8Array.prototype,
+    ];
+    const previous = prototypes.map((prototype) => Object.getOwnPropertyDescriptor(prototype, "toJSON"));
+    let text = "";
+    try {
+      for (const prototype of prototypes) {
+        Object.defineProperty(prototype, "toJSON", {
+          configurable: true,
+          value() {
+            return marker;
+          },
+        });
+      }
+      const output = sanitizeRemoteOutput({
+        object: { id: 1 },
+        array: [{ id: 2 }],
+        date: new Date("2026-07-15T00:00:00.000Z"),
+        bytes: Buffer.from([1, 2]),
+        typed: new Uint8Array([3, 4]),
+      });
+      text = JSON.stringify(output);
+    } finally {
+      for (let index = 0; index < prototypes.length; index++) {
+        const descriptor = previous[index];
+        if (descriptor) Object.defineProperty(prototypes[index]!, "toJSON", descriptor);
+        else delete (prototypes[index] as { toJSON?: unknown }).toJSON;
+      }
+    }
+    expect(text).not.toContain(marker);
+    expect(JSON.parse(text)).toEqual({
+      object: { id: 1 },
+      array: [{ id: 2 }],
+      date: "2026-07-15T00:00:00.000Z",
+      bytes: { type: "Buffer", data: [1, 2] },
+      typed: { 0: 3, 1: 4 },
+    });
   });
 });

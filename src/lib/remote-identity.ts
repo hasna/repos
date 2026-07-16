@@ -2,6 +2,28 @@ const SUPPORTED_SCHEMES = new Set(["http:", "https:", "ssh:", "git:"]);
 const CONTROL_OR_SPACE = /[\u0000-\u0020\u007f]/;
 const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const REPO_SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$/;
+const DATE_GET_TIME = Date.prototype.getTime;
+const DATE_TO_ISO_STRING = Date.prototype.toISOString;
+
+function nullPrototypeArray(length = 0): unknown[] {
+  const output = new Array<unknown>(length);
+  Object.setPrototypeOf(output, null);
+  return output;
+}
+
+function projectBytes(descriptors: PropertyDescriptorMap): unknown[] {
+  const entries: Array<[number, unknown]> = [];
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(key) || !("value" in descriptor)) continue;
+    entries.push([Number(key), descriptor.value]);
+  }
+  entries.sort((left, right) => left[0] - right[0]);
+  const output = nullPrototypeArray(entries.length);
+  for (let index = 0; index < entries.length; index++) {
+    output[index] = entries[index]![1];
+  }
+  return output;
+}
 
 function safeHost(value: string): string | null {
   const host = value.toLowerCase().replace(/\.$/, "");
@@ -100,20 +122,55 @@ export function sanitizeGitRemoteUrl(value: unknown): string {
 
 /** Final JSON-compatible output guard for repo and remote records. */
 export function sanitizeRemoteOutput(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sanitizeRemoteOutput);
   if (!value || typeof value !== "object") return value;
   const input = value as Record<string, unknown>;
   // Descriptor inspection is the trust boundary: reading a property directly
   // can execute an attacker-controlled getter before output redaction.
   const descriptors = Object.getOwnPropertyDescriptors(input);
-  const ownToJSON = descriptors["toJSON"];
-  const prototype = Object.getPrototypeOf(value);
-  if (!ownToJSON && value instanceof Date && prototype === Date.prototype) return value;
-  if (!ownToJSON && value instanceof Uint8Array
-    && (prototype === Uint8Array.prototype || prototype === Buffer.prototype)) return value;
-  const output = Object.fromEntries(Object.entries(descriptors)
-    .filter(([key, descriptor]) => key !== "toJSON" && descriptor.enumerable && "value" in descriptor)
-    .map(([key, descriptor]) => [key, sanitizeRemoteOutput(descriptor.value)]));
+
+  // Never hand JSON.stringify a prototype-bearing container or built-in.
+  // Inherited toJSON hooks on Object, Array, Date, Buffer or Uint8Array must
+  // not be able to replace the already-sanitized projection.
+  if (value instanceof Date) {
+    const timestamp = Reflect.apply(DATE_GET_TIME, value, []) as number;
+    return Number.isFinite(timestamp)
+      ? Reflect.apply(DATE_TO_ISO_STRING, value, [])
+      : null;
+  }
+  if (Buffer.isBuffer(value)) {
+    const output = Object.create(null) as Record<string, unknown>;
+    output["type"] = "Buffer";
+    output["data"] = projectBytes(descriptors);
+    return output;
+  }
+  if (value instanceof Uint8Array) {
+    const output = Object.create(null) as Record<string, unknown>;
+    const bytes = projectBytes(descriptors);
+    for (let index = 0; index < bytes.length; index++) output[String(index)] = bytes[index];
+    return output;
+  }
+  if (Array.isArray(value)) {
+    const lengthDescriptor = descriptors["length"];
+    const length = lengthDescriptor && "value" in lengthDescriptor
+      && Number.isSafeInteger(lengthDescriptor.value) && Number(lengthDescriptor.value) >= 0
+      ? Number(lengthDescriptor.value)
+      : 0;
+    const output = nullPrototypeArray(length);
+    for (let index = 0; index < length; index++) {
+      const descriptor = descriptors[String(index)];
+      if (descriptor && "value" in descriptor) {
+        output[index] = sanitizeRemoteOutput(descriptor.value);
+      }
+    }
+    return output;
+  }
+
+  const output = Object.create(null) as Record<string, unknown>;
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (key !== "toJSON" && descriptor.enumerable && "value" in descriptor) {
+      output[key] = sanitizeRemoteOutput(descriptor.value);
+    }
+  }
   const dataValue = (key: string): unknown => {
     const descriptor = descriptors[key];
     return descriptor && "value" in descriptor ? descriptor.value : null;
@@ -131,8 +188,5 @@ export function sanitizeRemoteOutput(value: unknown): unknown {
       output["fetch_url"] = sanitizeRemoteIdentity(dataValue("fetch_url"));
     }
   }
-  // Never return an unknown custom-prototype object: inherited/own toJSON
-  // hooks can otherwise replace the sanitized projection during JSON output.
-  if (prototype !== Object.prototype && prototype !== null) return output;
   return output;
 }
