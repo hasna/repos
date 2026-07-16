@@ -1,6 +1,8 @@
 export * from "./types/index.js";
 export { getDb, getDbPath, migrateDb, closeDb, openNonMigratingDb } from "./db/database.js";
 export type { DatabaseOpenOptions, NonMigratingDatabaseContext } from "./db/database.js";
+export { applyPostgresMigrations } from "./db/pg-migrations.js";
+export type { PostgresMigrationClient } from "./db/pg-migrations.js";
 export { sanitizeRemoteIdentity, sanitizeRemoteOutput } from "./lib/remote-identity.js";
 export {
   PrimaryRelocationError,

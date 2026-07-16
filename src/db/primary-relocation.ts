@@ -1221,10 +1221,11 @@ function branchPreservationCollision(
   source: Record<string, unknown>,
   target: Record<string, unknown>,
   rows: Array<Record<string, unknown>>,
+  plannedPreservedBranchKeys: ReadonlySet<string>,
   logicalKey: Record<string, unknown>,
   sourcePayload: Record<string, unknown>,
   targetPayload: Record<string, unknown>,
-): { collisions: CollisionDecision[]; decisions: InternalDecision[]; blocked: boolean } {
+): { collisions: CollisionDecision[]; decisions: InternalDecision[]; blocked: boolean; preservedKey?: string } {
   const namespace = request.preserveDivergentBranchesUnder;
   if (!namespace) {
     const blocked: CollisionDecision = {
@@ -1240,6 +1241,11 @@ function branchPreservationCollision(
   const sourceName = String(source.name ?? "");
   const targetName = String(target.name ?? "");
   const preservedName = `${namespace}/${sourceName}`;
+  const preservedKey = stable({
+    repo_id: request.legacyRepoId,
+    name: preservedName,
+    is_remote: 0,
+  });
   const sourceCommit = resolveStoredBranchCommit(request.targetPath, source.last_commit_sha);
   const targetCommit = resolveStoredBranchCommit(request.targetPath, target.last_commit_sha);
   const preservedRef = resolvePreservedBranchRef(request.targetPath, preservedName);
@@ -1252,7 +1258,7 @@ function branchPreservationCollision(
     Number(row.id) !== Number(source.id)
     && String(row.name ?? "") === preservedName
     && Number(row.is_remote) === 0
-  ));
+  )) || plannedPreservedBranchKeys.has(preservedKey);
   const evidence = {
     preserved_name: preservedName,
     stored_preserved_commit: sourceCommit.raw,
@@ -1322,6 +1328,7 @@ function branchPreservationCollision(
       { ...move, row_id: Number(target.id), resolved_last_commit_sha: targetCommit.resolved! },
     ],
     blocked: false,
+    preservedKey,
   };
 }
 
@@ -1336,6 +1343,7 @@ function buildChildPlan(request: ValidatedRequest): {
   const decisions: InternalDecision[] = [];
   const digests: Record<string, string> = {};
   let preservedDivergentBranchCount = 0;
+  const plannedPreservedBranchKeys = new Set<string>();
   for (const spec of CHILD_TABLES) {
     const rawRows = relocationDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
       request.legacyRepoId,
@@ -1396,6 +1404,7 @@ function buildChildPlan(request: ValidatedRequest): {
           source,
           target,
           rows,
+          plannedPreservedBranchKeys,
           logicalKey,
           sourcePayload,
           targetPayload,
@@ -1417,6 +1426,7 @@ function buildChildPlan(request: ValidatedRequest): {
             decisions.push({ ...blocked, row_id: Number(target.id) });
             continue;
           }
+          plannedPreservedBranchKeys.add(preservation.preservedKey!);
           tableCounts.move++;
         }
         collisions.push(...preservation.collisions);

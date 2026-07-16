@@ -1,6 +1,10 @@
 // PostgreSQL migrations for @hasna/repos app-owned remote storage
 // These mirror the SQLite schema but use PostgreSQL syntax
 
+export interface PostgresMigrationClient {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>;
+}
+
 export const PG_MIGRATIONS = [
   {
     version: 1,
@@ -220,3 +224,32 @@ export const PG_MIGRATIONS = [
     `,
   },
 ];
+
+/**
+ * Apply pending app-owned PostgreSQL migrations on a transaction-scoped client.
+ * The caller must begin a transaction and select the intended schema first.
+ */
+export async function applyPostgresMigrations(client: PostgresMigrationClient): Promise<number[]> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    "open-repos.postgres-migrations.v1",
+  ]);
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS migrations_log (
+      id SERIAL PRIMARY KEY,
+      version INTEGER NOT NULL UNIQUE,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  const result = await client.query("SELECT version FROM migrations_log ORDER BY version");
+  const applied = new Set(result.rows.map((row) => Number(row["version"])));
+  const newlyApplied: number[] = [];
+
+  for (const migration of PG_MIGRATIONS) {
+    if (applied.has(migration.version)) continue;
+    await client.query(migration.up);
+    await client.query("INSERT INTO migrations_log (version) VALUES ($1)", [migration.version]);
+    newlyApplied.push(migration.version);
+  }
+
+  return newlyApplied;
+}

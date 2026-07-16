@@ -19,6 +19,8 @@ const legacyRdsEnvNames = ["HOST", "PORT", "USERNAME", "USER", "PASSWORD", "DATA
 );
 
 class FakeRemoteSyncClient implements ReposRemoteSyncClient {
+  readonly queries: string[] = [];
+  readonly appliedMigrations = new Set([1, 2, 3]);
   records = new Map<string, { table_name: string; record_id: string; payload: Record<string, unknown>; updated_at: string }>();
   repos = new Map<string, Record<string, unknown>>();
 
@@ -37,17 +39,29 @@ class FakeRemoteSyncClient implements ReposRemoteSyncClient {
 
   async query(sql: string, params: unknown[] = []) {
     const normalized = sql.replace(/\s+/g, " ").trim();
+    this.queries.push(normalized);
     if (
       normalized.startsWith("CREATE SCHEMA")
       || normalized.startsWith("SET LOCAL search_path")
       || normalized.startsWith("CREATE TABLE")
       || normalized.startsWith("ALTER TABLE")
       || normalized.startsWith("CREATE INDEX")
+      || normalized.startsWith("SELECT pg_advisory_xact_lock")
       || normalized === "BEGIN"
       || normalized === "COMMIT"
       || normalized === "ROLLBACK"
     ) {
       return { rows: [], rowCount: 0 };
+    }
+    if (normalized === "SELECT version FROM migrations_log ORDER BY version") {
+      return {
+        rows: [...this.appliedMigrations].sort((left, right) => left - right).map((version) => ({ version })),
+        rowCount: this.appliedMigrations.size,
+      };
+    }
+    if (normalized === "INSERT INTO migrations_log (version) VALUES ($1)") {
+      this.appliedMigrations.add(Number(params[0]));
+      return { rows: [], rowCount: 1 };
     }
     if (normalized.startsWith("INSERT INTO repos (")) {
       const columns = [
@@ -330,6 +344,27 @@ describe("auto-index", () => {
       path: repoPath,
       name: "sync-option-url-repo",
     });
+  });
+
+  it("applies pending PostgreSQL branch identity migration during remote schema preparation", async () => {
+    process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "pg-migration-v3.db");
+    closeDb();
+    getDb();
+    const remote = new FakeRemoteSyncClient();
+    remote.appliedMigrations.delete(3);
+
+    const result = await syncRepoCatalog("pull", undefined, {
+      databaseUrl: "postgres://repos@example.invalid/repos",
+      remoteClient: remote,
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(remote.appliedMigrations.has(3)).toBe(true);
+    expect(remote.queries).toContain("INSERT INTO migrations_log (version) VALUES ($1)");
+    expect(remote.queries.some((query) => (
+      query.includes("DROP CONSTRAINT IF EXISTS branches_repo_id_name_key")
+      && query.includes("UNIQUE (repo_id, name, is_remote)")
+    ))).toBe(true);
   });
 
   it("pulls remote catalog records into the local database", async () => {

@@ -442,6 +442,46 @@ describe("primary relocation v2 reconciliation", () => {
     expect(getDb().query("SELECT id FROM repos WHERE id = ?").get(pair.targetId)).toBeNull();
   });
 
+  it("blocks local and remote preservation decisions that plan the same local branch key", () => {
+    const pair = seedPair({ name: "branch-preserve-planned-collision" });
+    const db = getDb();
+    const branchName = "origin/main";
+    const namespace = "legacy-preserved";
+
+    git(pair.path, "checkout", "-b", "legacy-planned-collision");
+    writeFileSync(join(pair.path, "legacy-planned-collision.txt"), "legacy planned collision\n");
+    git(pair.path, "add", "legacy-planned-collision.txt");
+    git(pair.path, "commit", "-m", "legacy planned collision");
+    const legacySha = git(pair.path, "rev-parse", "HEAD");
+    git(pair.path, "checkout", "main");
+    git(pair.path, "update-ref", `refs/heads/${namespace}/${branchName}`, legacySha);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, pair.head);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, pair.head);
+
+    for (const isRemote of [0, 1]) {
+      db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, ?, ?)")
+        .run(pair.legacyId, branchName, isRemote, legacySha);
+      db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, ?, ?)")
+        .run(pair.targetId, branchName, isRemote, pair.head);
+    }
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      preserved_name_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      preserved_name_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
   it("accepts unambiguous abbreviated preservation commits and applies exact branch SHAs", () => {
     const pair = seedPair({ name: "branch-preserve-abbrev" });
     const evidence = seedDivergentBranchCollision(pair);
