@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, afterAll } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "./database";
 import {
   BranchAdjudicationError,
   adjudicateBranches,
+  setBranchAdjudicationGitEnvironmentForTests,
   type BranchAdjudicationRequest,
 } from "./branch-adjudication";
 
@@ -16,10 +17,53 @@ let head = "";
 let legacyHead = "";
 
 function git(...args: string[]): string {
-  return execFileSync("git", ["-C", repoPath, ...args], {
+  return gitAt(repoPath, ...args);
+}
+
+function gitAt(path: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", path, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+}
+
+function seedUnrelatedRepo(name: string): { path: string; head: string } {
+  const path = join(root, name);
+  execFileSync("git", ["init", "-b", "main", path], { stdio: ["ignore", "pipe", "pipe"] });
+  gitAt(path, "config", "user.email", "repos-test@invalid.example");
+  gitAt(path, "config", "user.name", "Repos Test");
+  writeFileSync(join(path, "UNRELATED.md"), `${name}\n`);
+  gitAt(path, "add", "UNRELATED.md");
+  gitAt(path, "commit", "-m", name);
+  const unrelatedHead = gitAt(path, "rev-parse", "HEAD");
+  gitAt(path, "update-ref", "refs/heads/legacy-preserved/build/test", unrelatedHead);
+  return { path, head: unrelatedHead };
+}
+
+function writeLooseEvidenceRef(sha: string): void {
+  const refPath = join(repoPath, ".git", "refs", "heads", "legacy-preserved", "build", "test");
+  mkdirSync(join(refPath, ".."), { recursive: true });
+  writeFileSync(refPath, `${sha}\n`);
+}
+
+function externalEvidenceRequest(expectedHead: string): BranchAdjudicationRequest {
+  getDb(":memory:").query("UPDATE branches SET last_commit_sha = ? WHERE id = 101")
+    .run(expectedHead.slice(0, 9));
+  return request({
+    rows: [{
+      ...request().rows[0]!,
+      expectedLastCommitSha: expectedHead.slice(0, 9),
+    }],
+  });
+}
+
+function withGitEnvironment<T>(values: Record<string, string>, action: () => T): T {
+  setBranchAdjudicationGitEnvironmentForTests({ ...process.env, ...values });
+  try {
+    return action();
+  } finally {
+    setBranchAdjudicationGitEnvironmentForTests(null);
+  }
 }
 
 function seedGitRepo() {
@@ -108,6 +152,7 @@ beforeEach(() => {
 
 afterAll(() => {
   closeDb();
+  setBranchAdjudicationGitEnvironmentForTests(null);
   delete process.env["HASNA_REPOS_DB_PATH"];
 });
 
@@ -145,6 +190,85 @@ describe("branch adjudication", () => {
   it("rejects stored commit prefixes that do not disambiguate to the evidence ref", () => {
     const bad = request({ rows: [{ ...request().rows[0]!, expectedLastCommitSha: "dead" }] });
     expectCode(() => adjudicateBranches(bad), "ROW_MISMATCH");
+  });
+
+  it("does not let inherited GIT_DIR and GIT_WORK_TREE substitute an unrelated evidence repository", () => {
+    const unrelated = seedUnrelatedRepo("unrelated-git-dir");
+    const hostile = externalEvidenceRequest(unrelated.head);
+
+    expectCode(
+      () => withGitEnvironment({
+        GIT_DIR: join(unrelated.path, ".git"),
+        GIT_WORK_TREE: unrelated.path,
+      }, () => adjudicateBranches(hostile)),
+      "EVIDENCE_REF_MISMATCH",
+    );
+  });
+
+  it("does not resolve evidence through an inherited GIT_OBJECT_DIRECTORY", () => {
+    const unrelated = seedUnrelatedRepo("unrelated-object-directory");
+    writeLooseEvidenceRef(unrelated.head);
+    const hostile = externalEvidenceRequest(unrelated.head);
+
+    expectCode(
+      () => withGitEnvironment({
+        GIT_OBJECT_DIRECTORY: join(unrelated.path, ".git", "objects"),
+      }, () => adjudicateBranches(hostile)),
+      "EVIDENCE_REF_MISMATCH",
+    );
+  });
+
+  it("does not resolve evidence through inherited alternate object directories", () => {
+    const unrelated = seedUnrelatedRepo("unrelated-alternate-objects");
+    writeLooseEvidenceRef(unrelated.head);
+    const hostile = externalEvidenceRequest(unrelated.head);
+
+    expectCode(
+      () => withGitEnvironment({
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: join(unrelated.path, ".git", "objects"),
+      }, () => adjudicateBranches(hostile)),
+      "EVIDENCE_REF_MISMATCH",
+    );
+  });
+
+  it("does not accept a non-commit branch ref through replacement objects", () => {
+    const blobPath = join(root, "replacement-source.txt");
+    writeFileSync(blobPath, "not a commit\n");
+    const blob = git("hash-object", "-w", blobPath);
+    const replaceRef = join(repoPath, ".git", "refs", "replace", blob);
+    mkdirSync(join(replaceRef, ".."), { recursive: true });
+    writeFileSync(replaceRef, `${legacyHead}\n`);
+    writeLooseEvidenceRef(blob);
+    const hostile = externalEvidenceRequest(blob);
+
+    expectCode(() => adjudicateBranches(hostile), "EVIDENCE_REF_MISMATCH");
+  });
+
+  it("does not lazy-fetch unrelated evidence through inherited config injection", () => {
+    const unrelated = seedUnrelatedRepo("unrelated-lazy-fetch");
+    writeLooseEvidenceRef(unrelated.head);
+    const hostile = externalEvidenceRequest(unrelated.head);
+    expect(() => git("cat-file", "-e", unrelated.head)).toThrow();
+
+    expectCode(
+      () => withGitEnvironment({
+        GIT_CONFIG_COUNT: "6",
+        GIT_CONFIG_KEY_0: "core.repositoryFormatVersion",
+        GIT_CONFIG_VALUE_0: "1",
+        GIT_CONFIG_KEY_1: "extensions.partialClone",
+        GIT_CONFIG_VALUE_1: "origin",
+        GIT_CONFIG_KEY_2: "remote.origin.promisor",
+        GIT_CONFIG_VALUE_2: "true",
+        GIT_CONFIG_KEY_3: "remote.origin.partialCloneFilter",
+        GIT_CONFIG_VALUE_3: "blob:none",
+        GIT_CONFIG_KEY_4: "remote.origin.url",
+        GIT_CONFIG_VALUE_4: unrelated.path,
+        GIT_CONFIG_KEY_5: "protocol.file.allow",
+        GIT_CONFIG_VALUE_5: "always",
+      }, () => adjudicateBranches(hostile)),
+      "EVIDENCE_REF_MISMATCH",
+    );
+    expect(() => git("cat-file", "-e", unrelated.head)).toThrow();
   });
 
   it("requires the reviewed plan hash for apply", () => {
