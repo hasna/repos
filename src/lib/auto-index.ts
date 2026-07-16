@@ -425,6 +425,25 @@ function cleanupCountsEqual(
   return CLEANUP_COUNT_FIELDS.every((field) => left[field] === right[field]);
 }
 
+function cleanupAuditIntegrityHash(value: {
+  idempotencyKey: string;
+  version: number;
+  mode: "dry_run" | "apply";
+  actor: string;
+  planHash: string;
+  counts: RemoteIdentityCleanupCounts;
+}): string {
+  return cleanupPlanHash({
+    schema: REMOTE_IDENTITY_CLEANUP_SCHEMA,
+    idempotency_key: value.idempotencyKey,
+    version: value.version,
+    mode: value.mode,
+    actor: value.actor,
+    plan_hash: value.planHash,
+    counts: Object.fromEntries(CLEANUP_COUNT_FIELDS.map((field) => [field, value.counts[field]])),
+  });
+}
+
 function validateCleanupAuditRow(
   row: Record<string, unknown>,
   expected: {
@@ -438,13 +457,24 @@ function validateCleanupAuditRow(
 ): { planHash: string; counts: RemoteIdentityCleanupCounts } {
   try {
     const planHash = typeof row["plan_hash"] === "string" ? row["plan_hash"] : "";
+    const integrityHash = typeof row["integrity_hash"] === "string" ? row["integrity_hash"] : "";
     const counts = parseCleanupCounts(row["counts_json"]);
+    const expectedIntegrityHash = cleanupAuditIntegrityHash({
+      idempotencyKey: expected.idempotencyKey,
+      version: expected.version,
+      mode: expected.mode,
+      actor: expected.actor,
+      planHash,
+      counts,
+    });
     if (
       row["idempotency_key"] !== expected.idempotencyKey
       || row["version"] !== expected.version
       || row["mode"] !== expected.mode
       || row["actor"] !== expected.actor
       || !/^[0-9a-f]{64}$/.test(planHash)
+      || !/^[0-9a-f]{64}$/.test(integrityHash)
+      || integrityHash !== expectedIntegrityHash
       || (expected.planHash !== undefined && planHash !== expected.planHash)
       || (expected.counts !== undefined && !cleanupCountsEqual(counts, expected.counts))
     ) {
@@ -507,8 +537,13 @@ export async function cleanupRemoteIdentities(
         actor TEXT NOT NULL,
         plan_hash TEXT NOT NULL,
         counts_json JSONB NOT NULL,
+        integrity_hash TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+    await remote.query(`
+      ALTER TABLE repos_remote_identity_cleanup_audit
+      ADD COLUMN IF NOT EXISTS integrity_hash TEXT
     `);
     await remote.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_remote_identity_cleanup_idempotency
@@ -516,7 +551,7 @@ export async function cleanupRemoteIdentities(
     `);
     await remote.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [idempotencyKey]);
     const existing = await remote.query(`
-      SELECT idempotency_key, version, mode, actor, plan_hash, counts_json
+      SELECT idempotency_key, version, mode, actor, plan_hash, counts_json, integrity_hash
       FROM repos_remote_identity_cleanup_audit
       WHERE idempotency_key = $1
     `, [idempotencyKey]);
@@ -746,13 +781,21 @@ export async function cleanupRemoteIdentities(
       await verifyAppliedState();
     }
     const mode = options.apply ? "apply" : "dry_run";
+    const integrityHash = cleanupAuditIntegrityHash({
+      idempotencyKey,
+      version,
+      mode,
+      actor,
+      planHash,
+      counts,
+    });
     await remote.query(`
       INSERT INTO repos_remote_identity_cleanup_audit
-        (idempotency_key, version, mode, actor, plan_hash, counts_json)
-      VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-    `, [idempotencyKey, version, mode, actor, planHash, JSON.stringify(counts)]);
+        (idempotency_key, version, mode, actor, plan_hash, counts_json, integrity_hash)
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+    `, [idempotencyKey, version, mode, actor, planHash, JSON.stringify(counts), integrityHash]);
     const persistedAudit = await remote.query(`
-      SELECT idempotency_key, version, mode, actor, plan_hash, counts_json
+      SELECT idempotency_key, version, mode, actor, plan_hash, counts_json, integrity_hash
       FROM repos_remote_identity_cleanup_audit
       WHERE idempotency_key = $1
     `, [idempotencyKey]);

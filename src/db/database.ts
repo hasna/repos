@@ -88,6 +88,12 @@ export interface DatabaseOpenOptions {
   migrate?: boolean;
 }
 
+export interface NonMigratingDatabaseContext {
+  db: Database;
+  path: string;
+  close: () => void;
+}
+
 function normalizeDbPath(path: string): string {
   rejectSqliteMemoryUri(path);
   if (path === ":memory:" || path.startsWith("file:")) return path;
@@ -163,6 +169,41 @@ export function getDb(customPath?: string, options: DatabaseOpenOptions = {}): D
   return db;
 }
 
+/**
+ * Open an exact caller-selected registry for inspection without running schema
+ * migrations or changing the process-wide singleton. File-backed contexts are
+ * read-only, so a planning call cannot create a database, negotiate WAL, or
+ * persist a pending migration. An already-open in-memory context is reused
+ * because SQLite cannot reopen the same private in-memory database.
+ */
+export function openNonMigratingDb(customPath?: string): NonMigratingDatabaseContext {
+  if (_db) {
+    if (customPath !== undefined && normalizeDbPath(customPath) !== _dbPath) {
+      throw new Error("cannot switch Repos database paths while a database is open; call closeDb() first");
+    }
+    return { db: _db, path: _dbPath!, close: () => {} };
+  }
+  if (customPath === undefined) {
+    throw new Error("non-migrating Repos access requires an explicit database path");
+  }
+  const path = normalizeDbPath(customPath);
+  if (path === ":memory:") {
+    throw new Error("non-migrating in-memory Repos access requires an active database context");
+  }
+  if (!existsSync(path)) {
+    throw new Error("non-migrating Repos database does not exist");
+  }
+  const db = new Database(path, { readonly: true, create: false });
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec("PRAGMA foreign_keys = ON");
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+  return { db, path, close: () => db.close() };
+}
+
 /** Apply pending migrations to an already-open, caller-owned database. */
 export function migrateDb(db: Database): void {
   runMigrations(db);
@@ -204,13 +245,7 @@ function sanitizeRelocationSnapshot(value: string): string {
 interface V9RemoteIdentityTargetState {
   repos: Array<{ id: number; remote_url: string | null }>;
   remotes: Array<{ id: number; url: string; fetch_url: string | null }>;
-  audits: Array<{
-    id: string;
-    expected_remote: string;
-    source_json: string;
-    target_json: string;
-    after_json: string;
-  }>;
+  audits: Array<Record<string, unknown>>;
 }
 
 function stableMigrationState(value: unknown): string {
@@ -226,9 +261,11 @@ function readV9RemoteIdentityState(db: Database): V9RemoteIdentityTargetState {
       .sort((left, right) => left.id - right.id),
     remotes: (db.query("SELECT id, url, fetch_url FROM remotes").all() as V9RemoteIdentityTargetState["remotes"])
       .sort((left, right) => left.id - right.id),
-    audits: (db.query(`SELECT id, expected_remote, source_json, target_json, after_json
-      FROM repo_relocation_audit`).all() as V9RemoteIdentityTargetState["audits"])
-      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    // The complete durable receipt is part of the exact migration target.
+    // Selecting only the rewritten fields would let a marker-time trigger
+    // alter an actor, hash, count, revision, or timestamp without detection.
+    audits: (db.query("SELECT * FROM repo_relocation_audit").all() as V9RemoteIdentityTargetState["audits"])
+      .sort((left, right) => String(left["id"]) < String(right["id"]) ? -1 : String(left["id"]) > String(right["id"]) ? 1 : 0),
   };
 }
 
@@ -657,30 +694,23 @@ const MIGRATIONS: Migration[] = [
         updateRemote.run(url, sanitizeRemoteIdentity(row.fetch_url), row.id);
       }
 
-      const auditRows = db.query(`SELECT id, expected_remote, source_json, target_json, after_json
-        FROM repo_relocation_audit`).all() as Array<{
-        id: string;
-        expected_remote: string;
-        source_json: string;
-        target_json: string;
-        after_json: string;
-      }>;
-      const targetAudits = auditRows.map((row) => ({
-        id: row.id,
-        expected_remote: sanitizeRemoteIdentity(row.expected_remote) ?? "",
-        source_json: sanitizeRelocationSnapshot(row.source_json),
-        target_json: sanitizeRelocationSnapshot(row.target_json),
-        after_json: sanitizeRelocationSnapshot(row.after_json),
-      })).sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+      const auditRows = db.query("SELECT * FROM repo_relocation_audit").all() as Array<Record<string, unknown>>;
+      const targetAudits = auditRows.map<Record<string, unknown>>((row) => ({
+        ...row,
+        expected_remote: sanitizeRemoteIdentity(row["expected_remote"]) ?? "",
+        source_json: sanitizeRelocationSnapshot(String(row["source_json"])),
+        target_json: sanitizeRelocationSnapshot(String(row["target_json"])),
+        after_json: sanitizeRelocationSnapshot(String(row["after_json"])),
+      })).sort((left, right) => String(left["id"]) < String(right["id"]) ? -1 : String(left["id"]) > String(right["id"]) ? 1 : 0);
       const updateAudit = db.query(`UPDATE repo_relocation_audit SET
         expected_remote = ?, source_json = ?, target_json = ?, after_json = ? WHERE id = ?`);
       for (const row of targetAudits) {
         updateAudit.run(
-          row.expected_remote,
-          row.source_json,
-          row.target_json,
-          row.after_json,
-          row.id,
+          String(row["expected_remote"]),
+          String(row["source_json"]),
+          String(row["target_json"]),
+          String(row["after_json"]),
+          String(row["id"]),
         );
       }
 

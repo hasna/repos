@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -143,6 +144,21 @@ describe("registry relocate-primary CLI", () => {
     const db = getDb(dbPath);
     expect(db.query("SELECT path FROM repos WHERE id = 661").get()).toEqual({ path: "/dev/shm/accounts" });
     expect(db.query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
+  });
+
+  it("does not persist a pending migration during a dry run", () => {
+    const raw = new Database(dbPath);
+    raw.query("DELETE FROM migrations WHERE version = 9").run();
+    raw.close();
+
+    const result = runCli([]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.toString()).applied).toBe(false);
+
+    const after = new Database(dbPath, { readonly: true });
+    expect(after.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+    expect(after.query("SELECT count(*) AS count FROM repo_relocation_audit").get()).toEqual({ count: 0 });
+    after.close();
   });
 
   it("requires explicit --apply and persists one auditable receipt", () => {

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import type { Database } from "bun:sqlite";
 import {
   closeSync,
   constants as fsConstants,
@@ -16,7 +17,7 @@ import {
 import type { Stats } from "node:fs";
 import { userInfo } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { getDb } from "./database.js";
+import { getDb, openNonMigratingDb } from "./database.js";
 import { sanitizeGitRemoteUrl } from "../lib/remote-identity.js";
 import type { Repo } from "../types/index.js";
 
@@ -100,6 +101,8 @@ export interface PrimaryRelocationRequest {
   idempotencyKey: string;
   apply?: boolean;
   expectedPlanHash?: string;
+  /** Exact registry path used for a hermetic, read-only dry run. */
+  databasePath?: string;
 }
 
 export interface CollisionDecision {
@@ -197,6 +200,11 @@ interface ReconcilePlan {
 }
 
 let canonicalRootForTests: string | null = null;
+let relocationDbContext: Database | null = null;
+
+function relocationDb(): Database {
+  return relocationDbContext ?? getDb();
+}
 
 /** Test seam intentionally omitted from the package root export. */
 export function setPrimaryRelocationCanonicalRootForTests(root: string | null): void {
@@ -362,11 +370,11 @@ function quote(identifier: string): string {
 }
 
 function tableExists(table: string): boolean {
-  return Boolean(getDb().query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+  return Boolean(relocationDb().query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
 }
 
 function getRepo(id: number): Repo | null {
-  return getDb().query("SELECT * FROM repos WHERE id = ?").get(id) as Repo | null;
+  return relocationDb().query("SELECT * FROM repos WHERE id = ?").get(id) as Repo | null;
 }
 
 function safeRepo(repo: Repo): Repo {
@@ -913,7 +921,7 @@ function validateRows(request: ValidatedRequest, source: Repo, target: Repo): vo
 function validateNoThirdAlias(request: ValidatedRequest): void {
   let targetReal = "";
   try { targetReal = realpathSync(request.targetPath); } catch { return; }
-  const rows = getDb().query("SELECT id, path FROM repos WHERE id NOT IN (?, ?)").all(
+  const rows = relocationDb().query("SELECT id, path FROM repos WHERE id NOT IN (?, ?)").all(
     request.legacyRepoId,
     request.targetRepoId,
   ) as Array<{ id: number; path: string }>;
@@ -935,10 +943,10 @@ function validateNoThirdAlias(request: ValidatedRequest): void {
 }
 
 function unknownRepoForeignKeys(): string[] {
-  const tables = getDb().query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
+  const tables = relocationDb().query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
   const unknown: string[] = [];
   for (const { name } of tables) {
-    const fks = getDb().query(`PRAGMA foreign_key_list(${quote(name)})`).all() as Array<{ table: string }>;
+    const fks = relocationDb().query(`PRAGMA foreign_key_list(${quote(name)})`).all() as Array<{ table: string }>;
     if (fks.some((fk) => fk.table === "repos") && !KNOWN_REPO_FK_TABLES.has(name)) unknown.push(name);
   }
   return unknown.sort();
@@ -963,7 +971,7 @@ function buildChildPlan(request: ValidatedRequest): {
   const decisions: InternalDecision[] = [];
   const digests: Record<string, string> = {};
   for (const spec of CHILD_TABLES) {
-    const rawRows = getDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
+    const rawRows = relocationDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
       request.legacyRepoId,
       request.targetRepoId,
     ) as Array<Record<string, unknown>>;
@@ -1031,7 +1039,7 @@ function buildChildPlan(request: ValidatedRequest): {
 }
 
 function normalizeRelocationRemotes(request: ValidatedRequest): void {
-  const db = getDb();
+  const db = relocationDb();
   const rows = db.query("SELECT id, url, fetch_url FROM remotes WHERE repo_id IN (?, ?)").all(
     request.legacyRepoId,
     request.targetRepoId,
@@ -1052,7 +1060,7 @@ function buildEdgePlan(request: ValidatedRequest): {
 } {
   const legacy = String(request.legacyRepoId);
   const target = String(request.targetRepoId);
-  const rows = getDb().query(`SELECT * FROM edges
+  const rows = relocationDb().query(`SELECT * FROM edges
     WHERE (source_type = 'repo' AND source_id IN (?, ?))
        OR (target_type = 'repo' AND target_id IN (?, ?)) ORDER BY id`).all(
     legacy, target, legacy, target,
@@ -1136,11 +1144,11 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
   let leaseCount = 0;
   let leaseDigest = hash([]);
   if (tableExists("worktree_leases")) {
-    const columns = getDb().query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>;
+    const columns = relocationDb().query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>;
     if (!["lease_id", "repo_catalog_id", "repo_path"].every((column) => columns.some(({ name }) => name === column))) {
       fail("UNKNOWN_REPO_FOREIGN_KEY", "worktree_leases has an unsupported schema", { tables: ["worktree_leases"] });
     }
-    const leases = getDb().query(`SELECT * FROM worktree_leases
+    const leases = relocationDb().query(`SELECT * FROM worktree_leases
       WHERE repo_catalog_id IN (?, ?)
          OR repo_path IN (?, ?)
       ORDER BY lease_id`).all(
@@ -1172,7 +1180,7 @@ function buildPlan(request: ValidatedRequest): ReconcilePlan {
       row.repo_catalog_id !== request.legacyRepoId || row.repo_path !== request.targetPath).length;
     counts.worktree_leases = { legacy: legacyLeases, target: targetLeases, move: movedLeases, dedupe: 0, block: 0 };
   }
-  const audits = getDb().query("SELECT * FROM repo_relocation_audit WHERE repo_id IN (?, ?) ORDER BY id").all(
+  const audits = relocationDb().query("SELECT * FROM repo_relocation_audit WHERE repo_id IN (?, ?) ORDER BY id").all(
     request.legacyRepoId,
     request.targetRepoId,
   );
@@ -1276,7 +1284,7 @@ function resultFromReceipt(receipt: PrimaryRelocationReceipt): PrimaryRelocation
 }
 
 function existingIdempotentResult(request: ValidatedRequest): PrimaryRelocationResult | null {
-  const row = getDb().query("SELECT * FROM repo_relocation_audit WHERE idempotency_key = ?").get(
+  const row = relocationDb().query("SELECT * FROM repo_relocation_audit WHERE idempotency_key = ?").get(
     request.idempotencyKey,
   ) as Record<string, unknown> | null;
   if (!row) return null;
@@ -1293,7 +1301,7 @@ function existingIdempotentResult(request: ValidatedRequest): PrimaryRelocationR
 }
 
 function applyDecisions(request: ValidatedRequest, plan: ReconcilePlan): void {
-  const db = getDb();
+  const db = relocationDb();
   // Remove converged duplicates before moving their surviving row. This avoids
   // transient UNIQUE violations when multiple target-bearing edges map to the
   // same canonical post-relocation key.
@@ -1352,7 +1360,7 @@ function compareLeaseIds(left: Record<string, unknown>, right: Record<string, un
 }
 
 function captureRelocationExactState(request: ValidatedRequest): RelocationExactState {
-  const db = getDb();
+  const db = relocationDb();
   const children = Object.fromEntries(CHILD_TABLES.map(({ table }) => [
     table,
     db.query(`SELECT * FROM ${quote(table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
@@ -1534,7 +1542,15 @@ export function relocatePrimaryRepo(request: PrimaryRelocationRequest): PrimaryR
     const retry = existingIdempotentResult(validated);
     if (retry) return retry;
   }
-  const plan = buildPlan(validated);
+  const planningContext = validated.apply ? null : openNonMigratingDb(request.databasePath);
+  if (planningContext) relocationDbContext = planningContext.db;
+  let plan: ReconcilePlan;
+  try {
+    plan = buildPlan(validated);
+  } finally {
+    relocationDbContext = null;
+    planningContext?.close();
+  }
   const source = safeRepo(plan.sourceRow);
   const target = safeRepo(plan.targetRow);
   if (!validated.apply) {

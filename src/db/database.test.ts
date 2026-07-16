@@ -665,6 +665,56 @@ describe("database", () => {
     }
   });
 
+  it("rolls back v9 when the marker trigger changes a non-remote receipt field", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-complete-receipt-"));
+    const path = join(dir, "repos.db");
+    const identity = "github.com/hasna/original";
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY,
+        actor TEXT NOT NULL,
+        expected_remote TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        after_json TEXT NOT NULL
+      );
+      INSERT INTO repos VALUES (1, '/tmp/complete-receipt', 'complete-receipt', '${identity}');
+      INSERT INTO repo_relocation_audit VALUES (
+        'complete-receipt', 'reviewed-actor', '${identity}',
+        '{"remote_url":"${identity}"}',
+        '{"remote_url":"${identity}"}',
+        '{"remote_url":"${identity}"}'
+      );
+      CREATE TRIGGER migrations_v9_change_actor AFTER INSERT ON migrations
+      WHEN NEW.version = 9
+      BEGIN
+        UPDATE repo_relocation_audit SET actor = 'substituted-actor'
+        WHERE id = 'complete-receipt';
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed exact-state verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT actor FROM repo_relocation_audit").get()).toEqual({ actor: "reviewed-actor" });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
   it("serializes concurrent first-open migrations across processes", async () => {
     closeDb();
     const dir = mkdtempSync(join(tmpdir(), "repos-concurrent-first-open-"));

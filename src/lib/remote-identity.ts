@@ -178,12 +178,17 @@ export function sanitizeRemoteOutput(value: unknown): unknown {
   if (descriptors["remote_url"]) {
     output["remote_url"] = sanitizeRemoteIdentity(dataValue("remote_url"));
   }
-  const isRemoteRecord =
-    Boolean(descriptors["repo_id"])
-    && Boolean(descriptors["name"])
-    && Boolean(descriptors["url"]);
+  const prototype = Object.getPrototypeOf(value);
+  const hasCustomPrototype = prototype !== null && prototype !== Object.prototype;
+  // A transport record can be a partial SQL/SDK projection and can inherit
+  // metadata from a custom prototype. Require an own transport field, but do
+  // not require the exact repo_id/name/url tuple that complete rows expose.
+  // Plain application objects with only an ordinary URL remain untouched.
+  const isRemoteRecord = Boolean(descriptors["repo_id"])
+    || hasCustomPrototype
+    || (Boolean(descriptors["fetch_url"]) && !Boolean(descriptors["name"]));
   if (isRemoteRecord) {
-    output["url"] = sanitizeRemoteIdentity(dataValue("url"));
+    if (descriptors["url"]) output["url"] = sanitizeRemoteIdentity(dataValue("url"));
     if (descriptors["fetch_url"]) {
       output["fetch_url"] = sanitizeRemoteIdentity(dataValue("fetch_url"));
     }

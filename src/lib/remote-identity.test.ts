@@ -142,6 +142,32 @@ describe("sanitizeRemoteOutput", () => {
     expect(JSON.stringify(output)).not.toContain("phrase");
   });
 
+  it("sanitizes partial and custom-prototype transport projections", () => {
+    const transport = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
+    const custom = Object.assign(Object.create({ repo_id: 7, name: "origin" }), {
+      url: transport,
+    });
+    const output = sanitizeRemoteOutput({
+      urlAndFetch: { url: transport, fetch_url: transport },
+      idAndUrl: { repo_id: 7, url: transport },
+      fetchOnly: { fetch_url: transport },
+      custom,
+      ordinary: { url: "https://example.test/docs" },
+    });
+
+    expect(output).toEqual({
+      urlAndFetch: {
+        url: "git.example.test/team/tool",
+        fetch_url: "git.example.test/team/tool",
+      },
+      idAndUrl: { repo_id: 7, url: "git.example.test/team/tool" },
+      fetchOnly: { fetch_url: "git.example.test/team/tool" },
+      custom: { url: "git.example.test/team/tool" },
+      ordinary: { url: "https://example.test/docs" },
+    });
+    expect(JSON.stringify(output)).not.toContain("phrase");
+  });
+
   it("treats sensitive accessors as null without invoking them", () => {
     const marker = ["getter", "phrase"].join(":");
     const repo = { id: 1 } as Record<string, unknown>;

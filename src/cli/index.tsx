@@ -21,6 +21,7 @@ import {
   PrimaryRelocationError,
   relocatePrimaryRepo,
 } from "../db/primary-relocation.js";
+import { getDbPath } from "../db/database.js";
 import {
   ensureWorkspaceBootstrap,
   startAutoIndexWorker,
@@ -450,6 +451,7 @@ registry
         idempotencyKey: opts.idempotencyKey,
         expectedPlanHash: opts.expectedPlanHash,
         apply: Boolean(opts.apply),
+        databasePath: getDbPath(),
       });
       if (json) {
         console.log(JSON.stringify(result, null, 2));
