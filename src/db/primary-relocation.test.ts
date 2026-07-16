@@ -520,6 +520,26 @@ describe("primary relocation v2 reconciliation", () => {
     }));
   });
 
+  it("fails closed for a stale remote-marked row named after a configured remote", () => {
+    const pair = seedPair({ name: "stale-symbolic-remote-head" });
+    const branchName = "origin";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", "refs/heads/origin", evidence.targetSha);
+    git(pair.path, "update-ref", "refs/remotes/origin/main", evidence.legacySha);
+    git(pair.path, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
   it("applies a preserved remote slash branch with local branch semantics", () => {
     const pair = seedPair({ name: "preserved-remote-local-semantics" });
     const branchName = "origin/build/accounts-v1";
@@ -589,6 +609,25 @@ describe("primary relocation v2 reconciliation", () => {
     expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
       table: "branches",
       decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("allows same-commit local and remote-tracking target refs", () => {
+    const pair = seedPair({ name: "remote-target-same-commit" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
       target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
     }));
   });

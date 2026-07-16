@@ -95,6 +95,53 @@ describe("scanner", () => {
     }));
   });
 
+  it("skips symbolic remote HEAD refs", async () => {
+    const repoPath = createTestRepo("repo-with-symbolic-remote-head", 1);
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", head], { cwd: repoPath, stdio: "pipe" });
+    execFileSync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branches = listBranches({ repo_id: repo!.id });
+
+    expect(branches).toContainEqual(expect.objectContaining({ name: "origin/main", is_remote: 1 }));
+    expect(branches).not.toContainEqual(expect.objectContaining({ name: "origin", is_remote: 1 }));
+    expect(branches).not.toContainEqual(expect.objectContaining({ name: "origin/HEAD", is_remote: 1 }));
+  });
+
+  it("preserves apostrophes and pipe characters in branch names", async () => {
+    const repoPath = createTestRepo("repo-with-delimiter-branch", 1);
+    const branchName = "feature/o'hare|pipe";
+    execFileSync("git", ["checkout", "-b", branchName], { cwd: repoPath, stdio: "pipe" });
+    const sha = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      cwd: repoPath,
+      encoding: "utf8",
+    }).trim();
+    const date = execFileSync("git", ["show", "-s", "--format=%ci", "HEAD"], {
+      cwd: repoPath,
+      encoding: "utf8",
+    }).trim();
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branches = listBranches({ repo_id: repo!.id });
+
+    expect(branches).toContainEqual(expect.objectContaining({
+      name: branchName,
+      is_remote: 0,
+      last_commit_sha: sha,
+      last_commit_date: date,
+    }));
+  });
+
   it("should index tags", async () => {
     const repoPath = createTestRepo("repo-with-tag", 1);
     execSync(`git tag v1.0.0`, { cwd: repoPath, stdio: "pipe" });

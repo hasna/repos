@@ -160,9 +160,10 @@ function indexRepo(repoPath: string, full = false): {
 
   // Index branches
   const branchOutput = git(repoPath, [
-    "branch",
-    "-a",
-    "--format=%(refname)|%(refname:short)|%(objectname:short)|%(committerdate:iso8601)",
+    "for-each-ref",
+    "--format=%(refname)%00%(symref)%00%(objectname:short)%00%(committerdate:iso8601)",
+    "refs/heads",
+    "refs/remotes",
   ]);
   const branchEntries: Array<{
     name: string; is_remote: boolean; last_commit_sha: string | null;
@@ -170,16 +171,18 @@ function indexRepo(repoPath: string, full = false): {
   }> = [];
 
   if (branchOutput) {
-    for (const line of branchOutput.split("\n")) {
-      const parts = line.replace(/'/g, "").split("|");
-      if (!parts[0] || !parts[1]) continue;
-      const refName = parts[0];
-      const branchName = parts[1];
+    for (const line of branchOutput.split(/\r?\n/)) {
+      const [refName, symref, commitSha, commitDate] = line.split("\0");
+      if (!refName || symref) continue;
       const isRemote = refName.startsWith("refs/remotes/");
+      const prefix = isRemote ? "refs/remotes/" : "refs/heads/";
+      if (!refName.startsWith(prefix)) continue;
+      const branchName = refName.slice(prefix.length);
+      if (!branchName) continue;
       let ahead = 0;
       let behind = 0;
 
-      if (!isRemote && !branchName.startsWith("HEAD")) {
+      if (!isRemote) {
         const trackingBranch = branchName === defaultBranch
           ? `origin/${defaultBranch}`
           : null;
@@ -201,8 +204,8 @@ function indexRepo(repoPath: string, full = false): {
       branchEntries.push({
         name: branchName,
         is_remote: isRemote,
-        last_commit_sha: parts[2] || null,
-        last_commit_date: parts[3] || null,
+        last_commit_sha: commitSha || null,
+        last_commit_date: commitDate || null,
         ahead,
         behind,
       });

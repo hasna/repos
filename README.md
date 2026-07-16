@@ -170,7 +170,9 @@ name. Target branch evidence is also read from `refs/heads/<branch>` unless the
 branch begins with a configured remote name such as `origin/`; in that case the
 exact `refs/remotes/<branch>` ref is required. A same-name local head may coexist
 only when it resolves to the same commit; conflicting local and remote-tracking
-commits are ambiguous and block relocation. Apply never creates Git refs. Apply
+commits are ambiguous and block relocation. A remote-marked row named exactly
+like a configured remote is stale or ambiguous and also blocks relocation. Apply
+never creates Git refs. Apply
 revalidates the plan under one immediate SQLite
 transaction, reparents supported children and catalog- or path-bound worktree
 leases, converges graph edges by their final mapped identity, deletes only the

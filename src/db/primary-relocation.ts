@@ -1082,7 +1082,7 @@ function resolvePreservedBranchRef(path: string, branchName: string): BranchRefR
   };
 }
 
-function resolveTargetBranchRef(path: string, branchName: string): BranchRefResolution {
+function resolveTargetBranchRef(path: string, branchName: string, isRemoteRow: boolean): BranchRefResolution {
   if (!isValidHeadRefName(branchName)) return resolvePreservedBranchRef(path, branchName);
   const localRef = `refs/heads/${branchName}`;
   const localCommit = exactRefCommit(path, localRef);
@@ -1098,11 +1098,22 @@ function resolveTargetBranchRef(path: string, branchName: string): BranchRefReso
       remote_commit: null,
     };
   }
-  const configuredRemote = remoteOutput
+  const configuredRemotes = remoteOutput
     .split(/\r?\n/)
     .map((name) => name.trim())
-    .filter(Boolean)
-    .find((name) => branchName.startsWith(`${name}/`));
+    .filter(Boolean);
+  if (isRemoteRow && configuredRemotes.includes(branchName)) {
+    return {
+      ref: null,
+      commit: null,
+      status: "invalid",
+      local_ref: localRef,
+      local_commit: localCommit,
+      remote_ref: null,
+      remote_commit: null,
+    };
+  }
+  const configuredRemote = configuredRemotes.find((name) => branchName.startsWith(`${name}/`));
   if (!configuredRemote) {
     return {
       ref: localRef,
@@ -1221,7 +1232,11 @@ function branchPreservationCollision(
   const sourceCommit = resolveStoredBranchCommit(request.targetPath, source.last_commit_sha);
   const targetCommit = resolveStoredBranchCommit(request.targetPath, target.last_commit_sha);
   const preservedRef = resolvePreservedBranchRef(request.targetPath, preservedName);
-  const targetRef = resolveTargetBranchRef(request.targetPath, targetName);
+  const targetRef = resolveTargetBranchRef(
+    request.targetPath,
+    targetName,
+    Number(target.is_remote) === 1,
+  );
   const preservedNameCollision = rows.some((row) => (
     Number(row.id) !== Number(source.id) && String(row.name ?? "") === preservedName
   ));
