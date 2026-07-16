@@ -102,26 +102,33 @@ export function sanitizeGitRemoteUrl(value: unknown): string {
 export function sanitizeRemoteOutput(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sanitizeRemoteOutput);
   if (!value || typeof value !== "object") return value;
-  const prototype = Object.getPrototypeOf(value);
-  if (value instanceof Date && prototype === Date.prototype) return value;
-  if (value instanceof Uint8Array
-    && (prototype === Uint8Array.prototype || prototype === Buffer.prototype)) return value;
   const input = value as Record<string, unknown>;
+  // Descriptor inspection is the trust boundary: reading a property directly
+  // can execute an attacker-controlled getter before output redaction.
   const descriptors = Object.getOwnPropertyDescriptors(input);
+  const ownToJSON = descriptors["toJSON"];
+  const prototype = Object.getPrototypeOf(value);
+  if (!ownToJSON && value instanceof Date && prototype === Date.prototype) return value;
+  if (!ownToJSON && value instanceof Uint8Array
+    && (prototype === Uint8Array.prototype || prototype === Buffer.prototype)) return value;
   const output = Object.fromEntries(Object.entries(descriptors)
     .filter(([key, descriptor]) => key !== "toJSON" && descriptor.enumerable && "value" in descriptor)
     .map(([key, descriptor]) => [key, sanitizeRemoteOutput(descriptor.value)]));
-  if (Object.prototype.hasOwnProperty.call(input, "remote_url")) {
-    output["remote_url"] = sanitizeRemoteIdentity(input["remote_url"]);
+  const dataValue = (key: string): unknown => {
+    const descriptor = descriptors[key];
+    return descriptor && "value" in descriptor ? descriptor.value : null;
+  };
+  if (descriptors["remote_url"]) {
+    output["remote_url"] = sanitizeRemoteIdentity(dataValue("remote_url"));
   }
   const isRemoteRecord =
-    Object.prototype.hasOwnProperty.call(input, "repo_id")
-    && Object.prototype.hasOwnProperty.call(input, "name")
-    && Object.prototype.hasOwnProperty.call(input, "url");
+    Boolean(descriptors["repo_id"])
+    && Boolean(descriptors["name"])
+    && Boolean(descriptors["url"]);
   if (isRemoteRecord) {
-    output["url"] = sanitizeRemoteIdentity(input["url"]);
-    if (Object.prototype.hasOwnProperty.call(input, "fetch_url")) {
-      output["fetch_url"] = sanitizeRemoteIdentity(input["fetch_url"]);
+    output["url"] = sanitizeRemoteIdentity(dataValue("url"));
+    if (descriptors["fetch_url"]) {
+      output["fetch_url"] = sanitizeRemoteIdentity(dataValue("fetch_url"));
     }
   }
   // Never return an unknown custom-prototype object: inherited/own toJSON

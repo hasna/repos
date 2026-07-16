@@ -181,6 +181,7 @@ interface Migration {
   version: number;
   sql?: string;
   run?: (db: Database) => void;
+  verifyAfterMarker?: (db: Database) => void;
 }
 
 function sanitizeRelocationSnapshot(value: string): string {
@@ -200,6 +201,37 @@ function sanitizeRelocationSnapshot(value: string): string {
   return JSON.stringify(snapshot);
 }
 
+function verifyV9RemoteIdentityState(db: Database): void {
+  const reposCanonical = (db.query("SELECT remote_url FROM repos").all() as Array<{ remote_url: unknown }>).every(
+    (row) => row.remote_url === sanitizeRemoteIdentity(row.remote_url),
+  );
+  const remotesCanonical = (db.query("SELECT url, fetch_url FROM remotes").all() as Array<{
+    url: unknown;
+    fetch_url: unknown;
+  }>).every((row) => {
+    const url = sanitizeRemoteIdentity(row.url);
+    return url !== null
+      && row.url === url
+      && row.fetch_url === sanitizeRemoteIdentity(row.fetch_url);
+  });
+  const auditsCanonical = (db.query(`SELECT expected_remote, source_json, target_json, after_json
+    FROM repo_relocation_audit`).all() as Array<{
+    expected_remote: string;
+    source_json: string;
+    target_json: string;
+    after_json: string;
+  }>).every((row) => row.expected_remote === (sanitizeRemoteIdentity(row.expected_remote) ?? "")
+    && row.source_json === sanitizeRelocationSnapshot(row.source_json)
+    && row.target_json === sanitizeRelocationSnapshot(row.target_json)
+    && row.after_json === sanitizeRelocationSnapshot(row.after_json));
+  if (!reposCanonical || !remotesCanonical || !auditsCanonical) {
+    throw new Error("remote identity successor migration failed canonical verification");
+  }
+  if (db.query("PRAGMA foreign_key_check").all().length > 0) {
+    throw new Error("remote identity successor migration failed foreign-key verification");
+  }
+}
+
 function runMigrations(db: Database): void {
   db.exec(`CREATE TABLE IF NOT EXISTS migrations (
     id INTEGER PRIMARY KEY,
@@ -217,6 +249,7 @@ function runMigrations(db: Database): void {
         if (migration.sql) db.exec(migration.sql);
         migration.run?.(db);
         db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
+        migration.verifyAfterMarker?.(db);
       }
       db.exec("COMMIT");
     } catch (error) {
@@ -624,34 +657,8 @@ const MIGRATIONS: Migration[] = [
       if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'fts_repos'").get()) {
         db.exec("INSERT INTO fts_repos(fts_repos) VALUES ('rebuild')");
       }
-      const reposCanonical = (db.query("SELECT remote_url FROM repos").all() as Array<{ remote_url: unknown }>).every(
-        (row) => row.remote_url === sanitizeRemoteIdentity(row.remote_url),
-      );
-      const remotesCanonical = (db.query("SELECT url, fetch_url FROM remotes").all() as Array<{
-        url: unknown;
-        fetch_url: unknown;
-      }>).every((row) => {
-        const url = sanitizeRemoteIdentity(row.url);
-        return url !== null
-          && row.url === url
-          && row.fetch_url === sanitizeRemoteIdentity(row.fetch_url);
-      });
-      const auditsCanonical = (db.query(`SELECT expected_remote, source_json, target_json, after_json
-        FROM repo_relocation_audit`).all() as Array<{
-        expected_remote: string;
-        source_json: string;
-        target_json: string;
-        after_json: string;
-      }>).every((row) => row.expected_remote === (sanitizeRemoteIdentity(row.expected_remote) ?? "")
-        && row.source_json === sanitizeRelocationSnapshot(row.source_json)
-        && row.target_json === sanitizeRelocationSnapshot(row.target_json)
-        && row.after_json === sanitizeRelocationSnapshot(row.after_json));
-      if (!reposCanonical || !remotesCanonical || !auditsCanonical) {
-        throw new Error("remote identity successor migration failed canonical verification");
-      }
-      if (db.query("PRAGMA foreign_key_check").all().length > 0) {
-        throw new Error("remote identity successor migration failed foreign-key verification");
-      }
+      verifyV9RemoteIdentityState(db);
     },
+    verifyAfterMarker: verifyV9RemoteIdentityState,
   },
 ];

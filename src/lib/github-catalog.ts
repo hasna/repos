@@ -216,6 +216,9 @@ export function loadGithubRepoCatalog(cachePath = getDefaultGithubCatalogCachePa
     if (!Array.isArray(parsed.repositories)) return null;
     return {
       ...parsed,
+      accounts: Array.isArray(parsed.accounts)
+        ? parsed.accounts.map(sanitizeCatalogAccount)
+        : [],
       repositories: parsed.repositories.map(sanitizeCatalogRecord),
     };
   } catch {
@@ -930,6 +933,14 @@ function sanitizeCatalogRecord(record: GithubRepoCatalogRecord): GithubRepoCatal
       https: sanitizeCloneUrl(record.clone_urls?.https ?? null),
       ssh: sanitizeCloneUrl(record.clone_urls?.ssh ?? null),
     },
+  };
+}
+
+function sanitizeCatalogAccount(account: GithubCatalogAccount): GithubCatalogAccount {
+  return {
+    login: stringOrNull(account?.login) ?? "",
+    type: stringOrNull(account?.type) ?? "User",
+    url: sanitizePublicWebUrl(stringOrNull(account?.url)),
   };
 }
 

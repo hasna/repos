@@ -141,4 +141,56 @@ describe("sanitizeRemoteOutput", () => {
     expect(output["hostileBytes"]).toEqual({ 0: 1, 1: 2 });
     expect(JSON.stringify(output)).not.toContain("phrase");
   });
+
+  it("treats sensitive accessors as null without invoking them", () => {
+    const marker = ["getter", "phrase"].join(":");
+    const repo = { id: 1 } as Record<string, unknown>;
+    Object.defineProperty(repo, "remote_url", {
+      enumerable: true,
+      get() {
+        throw new Error(marker);
+      },
+    });
+    const remote = { repo_id: 1, name: "origin" } as Record<string, unknown>;
+    for (const key of ["url", "fetch_url"]) {
+      Object.defineProperty(remote, key, {
+        enumerable: true,
+        get() {
+          throw new Error(marker);
+        },
+      });
+    }
+
+    const output = sanitizeRemoteOutput({ repo, remote });
+    expect(output).toEqual({
+      repo: { id: 1, remote_url: null },
+      remote: { repo_id: 1, name: "origin", url: null, fetch_url: null },
+    });
+    expect(JSON.stringify(output)).not.toContain(marker);
+  });
+
+  it("projects built-ins with hostile own toJSON while preserving ordinary built-ins", () => {
+    const marker = ["serializer", "phrase"].join(":");
+    const hostileDate = new Date("2026-07-15T00:00:00.000Z");
+    Object.defineProperty(hostileDate, "toJSON", { value: () => marker });
+    const hostileBytes = Buffer.from([9, 8]);
+    Object.defineProperty(hostileBytes, "toJSON", { value: () => ({ marker }) });
+    const ordinaryDate = new Date("2026-07-15T00:00:00.000Z");
+    const ordinaryBytes = Buffer.from([1, 2]);
+    const ordinaryTyped = new Uint8Array([3, 4]);
+
+    const output = sanitizeRemoteOutput({
+      hostileDate,
+      hostileBytes,
+      ordinaryDate,
+      ordinaryBytes,
+      ordinaryTyped,
+    }) as Record<string, unknown>;
+    expect(output["hostileDate"]).toEqual({});
+    expect(output["hostileBytes"]).toEqual({ 0: 9, 1: 8 });
+    expect(output["ordinaryDate"]).toBe(ordinaryDate);
+    expect(output["ordinaryBytes"]).toBe(ordinaryBytes);
+    expect(output["ordinaryTyped"]).toBe(ordinaryTyped);
+    expect(JSON.stringify(output)).not.toContain(marker);
+  });
 });

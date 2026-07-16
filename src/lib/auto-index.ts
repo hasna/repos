@@ -49,6 +49,7 @@ export interface SyncRepoCatalogOptions {
   databaseSchema?: string | null;
   databaseUrl?: string | null;
   remoteClient?: ReposRemoteSyncClient;
+  remoteClientFactory?: (databaseUrl: string) => ReposRemoteSyncClient;
   storageMode?: "local" | "remote" | "hybrid";
 }
 
@@ -401,9 +402,9 @@ export async function cleanupRemoteIdentities(
       "open-repos.remote-identity-cleanup.schema.v1",
     ]);
     schemaLockHeld = true;
-    await prepareRemoteSearchPath(remote, getReposDatabaseSchema(options));
     await remote.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
     transactionOpen = true;
+    await prepareRemoteSearchPath(remote, getReposDatabaseSchema(options));
     await remote.query(`
       CREATE TABLE IF NOT EXISTS repos_remote_identity_cleanup_audit (
         id BIGSERIAL PRIMARY KEY,
@@ -483,6 +484,7 @@ export async function cleanupRemoteIdentities(
       const target = sanitizeRemoteIdentity(row["remote_url"]);
       return target === row["remote_url"] ? [] : [{ id: Number(row["id"]), before: row["remote_url"], target }];
     });
+    const remotePlanRows: Array<Record<string, unknown>> = [];
     const remoteChanges: RemoteCleanupChange[] = [];
     for (const row of remotes.rows) {
       const id = Number(row["id"]);
@@ -491,6 +493,16 @@ export async function cleanupRemoteIdentities(
       }
       const url = sanitizeRemoteIdentity(row["url"]);
       const fetchUrl = sanitizeRemoteIdentity(row["fetch_url"]);
+      remotePlanRows.push({
+        id,
+        before_digest: cleanupValueDigest({
+          url: row["url"] ?? null,
+          fetch_url: row["fetch_url"] ?? null,
+        }),
+        target_url: url,
+        target_fetch_url: fetchUrl,
+        action: url ? (url === row["url"] && fetchUrl === row["fetch_url"] ? "keep" : "update") : "delete",
+      });
       if (!url) {
         remoteChanges.push({
           id,
@@ -510,6 +522,7 @@ export async function cleanupRemoteIdentities(
       }
     }
     const searchVectorChanges: RemoteCleanupSearchVectorChange[] = [];
+    const repoPlanRows: Array<Record<string, unknown>> = [];
     for (const row of repos.rows) {
       const id = Number(row["id"]);
       if (!Number.isSafeInteger(id) || id < 1) {
@@ -529,41 +542,22 @@ export async function cleanupRemoteIdentities(
         throw cleanupFailure("remote identity cleanup search planning failed");
       }
       const target = rawTarget;
+      repoPlanRows.push({
+        id,
+        before_digest: cleanupValueDigest({
+          name: row["name"] ?? null,
+          org: row["org"] ?? null,
+          description: row["description"] ?? null,
+          remote_url: row["remote_url"] ?? null,
+          search_vector: row["search_vector"] ?? null,
+        }),
+        target_remote_url: targetRemote,
+        target_search_vector_digest: cleanupValueDigest(target),
+      });
       if (row["search_vector"] !== target) {
         searchVectorChanges.push({ id, before: row["search_vector"], target });
       }
     }
-    const planHash = cleanupPlanHash({
-      version,
-      repos: repoChanges.map(({ id, before, target }) => ({
-        id,
-        before_digest: cleanupValueDigest(before),
-        target,
-      })),
-      remotes: remoteChanges.map((change) => change.delete
-        ? {
-            id: change.id,
-            before_url_digest: cleanupValueDigest(change.beforeUrl),
-            before_fetch_url_digest: cleanupValueDigest(change.beforeFetchUrl),
-            delete: true,
-          }
-        : {
-            id: change.id,
-            before_url_digest: cleanupValueDigest(change.beforeUrl),
-            before_fetch_url_digest: cleanupValueDigest(change.beforeFetchUrl),
-            url: change.url,
-            fetch_url: change.fetchUrl,
-          }),
-      search_vectors: searchVectorChanges.map((change) => ({
-        id: change.id,
-        before_digest: cleanupValueDigest(change.before),
-        target_digest: cleanupValueDigest(change.target),
-      })),
-    });
-    if (options.apply && options.expectedPlanHash !== planHash) {
-      throw cleanupFailure("remote identity cleanup plan mismatch");
-    }
-
     const counts: RemoteIdentityCleanupCounts = {
       repos_scanned: repos.rows.length,
       repos_update: repoChanges.length,
@@ -571,6 +565,48 @@ export async function cleanupRemoteIdentities(
       remotes_update: remoteChanges.filter((change) => !change.delete).length,
       remotes_delete: remoteChanges.filter((change) => change.delete).length,
       search_vectors_repaired: searchVectorChanges.length,
+    };
+    const planHash = cleanupPlanHash({
+      version,
+      counts,
+      repos: repoPlanRows,
+      remotes: remotePlanRows,
+    });
+    if (options.apply && options.expectedPlanHash !== planHash) {
+      throw cleanupFailure("remote identity cleanup plan mismatch");
+    }
+
+    const verifyAppliedState = async (): Promise<void> => {
+      const invalid = await remote.query(`
+        SELECT COUNT(*)::int AS count
+        FROM repos
+        WHERE search_vector IS DISTINCT FROM to_tsvector('english',
+          coalesce(name, '') || ' ' || coalesce(org, '') || ' ' ||
+          coalesce(description, '') || ' ' || coalesce(remote_url, ''))
+      `);
+      if (Number(invalid.rows[0]?.["count"] ?? -1) !== 0) {
+        throw cleanupFailure("remote identity cleanup search verification failed");
+      }
+      const verifiedRepos = await remote.query("SELECT id, remote_url FROM repos ORDER BY id");
+      const verifiedRemotes = await remote.query("SELECT id, url, fetch_url FROM remotes ORDER BY id");
+      if (
+        verifiedRepos.rows.length !== counts.repos_scanned
+        || verifiedRemotes.rows.length !== counts.remotes_scanned - counts.remotes_delete
+      ) {
+        throw cleanupFailure("remote identity cleanup count verification failed");
+      }
+      const reposVerified = verifiedRepos.rows.every(
+        (row) => row["remote_url"] === sanitizeRemoteIdentity(row["remote_url"]),
+      );
+      const remotesVerified = verifiedRemotes.rows.every((row) => {
+        const url = sanitizeRemoteIdentity(row["url"]);
+        return url !== null
+          && row["url"] === url
+          && row["fetch_url"] === sanitizeRemoteIdentity(row["fetch_url"]);
+      });
+      if (!reposVerified || !remotesVerified) {
+        throw cleanupFailure("remote identity cleanup verification failed");
+      }
     };
     if (options.apply) {
       for (const change of repoChanges) {
@@ -611,30 +647,7 @@ export async function cleanupRemoteIdentities(
           throw cleanupFailure("remote identity cleanup concurrent change detected");
         }
       }
-      const invalid = await remote.query(`
-        SELECT COUNT(*)::int AS count
-        FROM repos
-        WHERE search_vector IS DISTINCT FROM to_tsvector('english',
-          coalesce(name, '') || ' ' || coalesce(org, '') || ' ' ||
-          coalesce(description, '') || ' ' || coalesce(remote_url, ''))
-      `);
-      if (Number(invalid.rows[0]?.["count"] ?? -1) !== 0) {
-        throw cleanupFailure("remote identity cleanup search verification failed");
-      }
-      const verifiedRepos = await remote.query("SELECT id, remote_url FROM repos ORDER BY id");
-      const verifiedRemotes = await remote.query("SELECT id, url, fetch_url FROM remotes ORDER BY id");
-      const reposVerified = verifiedRepos.rows.every(
-        (row) => row["remote_url"] === sanitizeRemoteIdentity(row["remote_url"]),
-      );
-      const remotesVerified = verifiedRemotes.rows.every((row) => {
-        const url = sanitizeRemoteIdentity(row["url"]);
-        return url !== null
-          && row["url"] === url
-          && row["fetch_url"] === sanitizeRemoteIdentity(row["fetch_url"]);
-      });
-      if (!reposVerified || !remotesVerified) {
-        throw cleanupFailure("remote identity cleanup verification failed");
-      }
+      await verifyAppliedState();
     }
     const mode = options.apply ? "apply" : "dry_run";
     await remote.query(`
@@ -642,6 +655,12 @@ export async function cleanupRemoteIdentities(
         (idempotency_key, version, mode, actor, plan_hash, counts_json)
       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
     `, [idempotencyKey, version, mode, actor, planHash, JSON.stringify(counts)]);
+    if (options.apply) {
+      // The audit insert is still inside the serializable transaction. Verify
+      // the complete post-state again so triggers cannot contaminate or change
+      // row cardinality between the first verification and COMMIT.
+      await verifyAppliedState();
+    }
     await remote.query("COMMIT");
     transactionOpen = false;
     return {
@@ -846,32 +865,55 @@ export async function syncRepoCatalog(
     };
   }
 
-  const remote = options.remoteClient ?? createRemoteSyncClient(databaseUrl!);
   const ownsRemote = !options.remoteClient;
+  let remote: ReposRemoteSyncClient | null = options.remoteClient ?? null;
+  let transactionOpen = false;
+  let result: RemoteSyncSummary;
   try {
+    // Construct app-owned clients inside the closed error boundary. Some
+    // connection-string parsers fail synchronously before connect().
+    remote = remote ?? (options.remoteClientFactory ?? createRemoteSyncClient)(databaseUrl!);
     if (ownsRemote) await remote.connect?.();
+    await remote.query("BEGIN");
+    transactionOpen = true;
     await prepareRemoteSearchPath(remote, getReposDatabaseSchema(options));
     await ensureRemoteSyncSchema(remote);
     onProgress?.(`[sync] ${direction} repo catalog`);
     const rowsSynced = direction === "push"
       ? await pushLocalSyncRecords(remote)
       : await pullRemoteSyncRecords(remote);
-    return {
+    await remote.query("COMMIT");
+    transactionOpen = false;
+    result = {
       direction,
       enabled: true,
       rowsSynced,
       errors: [],
     };
-  } catch (error) {
-    return {
+  } catch {
+    if (transactionOpen && remote) {
+      try { await remote.query("ROLLBACK"); } catch { /* preserve closed output */ }
+    }
+    result = {
       direction,
       enabled: true,
       rowsSynced: 0,
-      errors: [redactErrorMessage(error, databaseUrl)],
+      errors: [redactErrorMessage(null, databaseUrl)],
     };
-  } finally {
-    if (ownsRemote) await remote.end?.();
   }
+  if (ownsRemote && remote) {
+    try {
+      await remote.end?.();
+    } catch {
+      result = {
+        direction,
+        enabled: true,
+        rowsSynced: 0,
+        errors: [redactErrorMessage(null, databaseUrl)],
+      };
+    }
+  }
+  return result;
 }
 
 export async function ensureWorkspaceBootstrap(

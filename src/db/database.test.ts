@@ -565,6 +565,45 @@ describe("database", () => {
     }
   });
 
+  it("rolls back v9 when the real migration marker insert triggers recontamination", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v9-marker-trigger-"));
+    const path = join(dir, "repos.db");
+    const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, path TEXT, name TEXT, remote_url TEXT);
+      CREATE TABLE remotes (id INTEGER PRIMARY KEY, url TEXT, fetch_url TEXT);
+      CREATE TABLE repo_relocation_audit (
+        id TEXT PRIMARY KEY, expected_remote TEXT, source_json TEXT, target_json TEXT, after_json TEXT
+      );
+      INSERT INTO repos (id, path, name, remote_url)
+        VALUES (1, '/tmp/marker-trigger', 'marker-trigger', '${unsafe}');
+      CREATE TRIGGER migrations_v9_recontaminate AFTER INSERT ON migrations
+      WHEN NEW.version = 9
+      BEGIN
+        UPDATE repos SET remote_url = '${unsafe}' WHERE id = 1;
+      END;
+    `);
+    seed.close();
+
+    try {
+      expect(() => getDb(path)).toThrow("remote identity successor migration failed canonical verification");
+      closeDb();
+      const raw = new Database(path);
+      expect(raw.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({ remote_url: unsafe });
+      expect(raw.query("SELECT version FROM migrations WHERE version = 9").get()).toBeNull();
+      raw.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
   it("serializes concurrent first-open migrations across processes", async () => {
     closeDb();
     const dir = mkdtempSync(join(tmpdir(), "repos-concurrent-first-open-"));

@@ -131,6 +131,7 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
   readonly repos = new Map<number, Record<string, unknown>>();
   readonly remotes = new Map<number, Record<string, unknown>>();
   searchVectorsValid = false;
+  afterAuditInsert?: () => void;
 
   async query(sql: string, params: unknown[] = []) {
     const normalized = sql.replace(/\s+/g, " ").trim();
@@ -213,6 +214,7 @@ class FakeRemoteCleanupClient implements ReposRemoteSyncClient {
         plan_hash: params[4],
         counts_json: params[5],
       });
+      this.afterAuditInsert?.();
       return { rows: [], rowCount: 1 };
     }
     throw new Error(`unexpected cleanup query: ${normalized}`);
@@ -477,6 +479,111 @@ describe("auto-index", () => {
     expect(remote.audits.size).toBe(2);
   });
 
+  it("binds every scanned canonical row and exact counts into the cleanup plan hash", async () => {
+    const canonicalRepo = {
+      id: 7,
+      name: "canonical",
+      org: "hasna",
+      description: null,
+      remote_url: "github.com/hasna/canonical",
+      search_vector: "canonical:github.com/hasna/canonical",
+    };
+    const canonicalRemote = {
+      id: 9,
+      url: "github.com/hasna/canonical",
+      fetch_url: "github.com/hasna/canonical",
+    };
+
+    const added = new FakeRemoteCleanupClient();
+    const emptyPlan = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "all-rows-empty",
+      remoteClient: added,
+    });
+    added.repos.set(7, { ...canonicalRepo });
+    added.remotes.set(9, { ...canonicalRemote });
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "all-rows-added",
+      apply: true,
+      expectedPlanHash: emptyPlan.plan_hash,
+      remoteClient: added,
+    })).rejects.toThrow("remote identity cleanup plan mismatch");
+
+    const removed = new FakeRemoteCleanupClient();
+    removed.repos.set(7, { ...canonicalRepo });
+    removed.remotes.set(9, { ...canonicalRemote });
+    const populatedPlan = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "all-rows-populated",
+      remoteClient: removed,
+    });
+    removed.repos.clear();
+    removed.remotes.clear();
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "all-rows-removed",
+      apply: true,
+      expectedPlanHash: populatedPlan.plan_hash,
+      remoteClient: removed,
+    })).rejects.toThrow("remote identity cleanup plan mismatch");
+  });
+
+  it("reverifies canonical values and exact row counts after the audit insert", async () => {
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const contaminated = new FakeRemoteCleanupClient();
+    contaminated.repos.set(1, {
+      id: 1,
+      name: "tool",
+      org: "team",
+      description: null,
+      remote_url: unsafe,
+      search_vector: null,
+    });
+    const contaminatedPlan = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "post-audit-contaminate-plan",
+      remoteClient: contaminated,
+    });
+    contaminated.afterAuditInsert = () => {
+      contaminated.repos.get(1)!.remote_url = unsafe;
+    };
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "post-audit-contaminate-apply",
+      apply: true,
+      expectedPlanHash: contaminatedPlan.plan_hash,
+      remoteClient: contaminated,
+    })).rejects.toThrow("remote identity cleanup verification failed");
+    expect(contaminated.queries.at(-2)).toBe("ROLLBACK");
+
+    const removed = new FakeRemoteCleanupClient();
+    removed.repos.set(2, {
+      id: 2,
+      name: "tool",
+      org: "team",
+      description: null,
+      remote_url: unsafe,
+      search_vector: null,
+    });
+    const removedPlan = await cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "post-audit-count-plan",
+      remoteClient: removed,
+    });
+    removed.afterAuditInsert = () => {
+      removed.repos.delete(2);
+    };
+    await expect(cleanupRemoteIdentities({
+      actor: "review-remediator",
+      idempotencyKey: "post-audit-count-apply",
+      apply: true,
+      expectedPlanHash: removedPlan.plan_hash,
+      remoteClient: removed,
+    })).rejects.toThrow("remote identity cleanup count verification failed");
+    expect(removed.queries.at(-2)).toBe("ROLLBACK");
+  });
+
   it("uses the configured schema fallback and replays same-key dry runs deterministically", async () => {
     process.env["HASNA_REPOS_DATABASE_SCHEMA"] = "repos_review";
     const remote = new FakeRemoteCleanupClient();
@@ -518,6 +625,75 @@ describe("auto-index", () => {
       idempotencyKey: "cleanup-failure",
       remoteClient: failing,
     })).rejects.toThrow("remote identity cleanup failed");
+  });
+
+  it("closes owned client construction and teardown failures while leaving injected clients caller-owned", async () => {
+    process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "owned-client.db");
+    const marker = ["driver", "phrase"].join(":");
+    const constructed = await syncRepoCatalog("pull", undefined, {
+      databaseUrl: "postgres://repos@example.invalid/repos",
+      remoteClientFactory() {
+        throw new Error(marker);
+      },
+    });
+    expect(constructed.errors).toEqual(["remote repository catalog synchronization failed"]);
+    expect(JSON.stringify(constructed)).not.toContain(marker);
+
+    const owned = Object.assign(new FakeRemoteSyncClient(), {
+      async end() {
+        throw new Error(marker);
+      },
+    });
+    const teardown = await syncRepoCatalog("pull", undefined, {
+      databaseUrl: "postgres://repos@example.invalid/repos",
+      remoteClientFactory: () => owned,
+    });
+    expect(teardown.errors).toEqual(["remote repository catalog synchronization failed"]);
+    expect(JSON.stringify(teardown)).not.toContain(marker);
+
+    let injectedEndCalls = 0;
+    const injected = Object.assign(new FakeRemoteSyncClient(), {
+      async end() {
+        injectedEndCalls++;
+      },
+    });
+    const injectedResult = await syncRepoCatalog("pull", undefined, {
+      databaseUrl: "postgres://repos@example.invalid/repos",
+      remoteClient: injected,
+    });
+    expect(injectedResult.errors).toEqual([]);
+    expect(injectedEndCalls).toBe(0);
+  });
+
+  it("starts a transaction before schema setup and rolls back setup failures", async () => {
+    process.env["HASNA_REPOS_DB_PATH"] = join(TEST_DIR, "schema-setup.db");
+    const marker = ["schema", "phrase"].join(":");
+    const queries: string[] = [];
+    const remote: ReposRemoteSyncClient = {
+      async query(sql: string) {
+        const normalized = sql.replace(/\s+/g, " ").trim();
+        queries.push(normalized);
+        if (normalized === "BEGIN" || normalized.startsWith("CREATE SCHEMA") || normalized === "ROLLBACK") {
+          return { rows: [], rowCount: 0 };
+        }
+        if (normalized.startsWith("SET search_path")) throw new Error(marker);
+        throw new Error(`unexpected query after setup failure: ${normalized}`);
+      },
+    };
+
+    const result = await syncRepoCatalog("pull", undefined, {
+      databaseUrl: "postgres://repos@example.invalid/repos",
+      databaseSchema: "repos_review",
+      remoteClient: remote,
+    });
+    expect(result.errors).toEqual(["remote repository catalog synchronization failed"]);
+    expect(JSON.stringify(result)).not.toContain(marker);
+    expect(queries).toEqual([
+      "BEGIN",
+      'CREATE SCHEMA IF NOT EXISTS "repos_review"',
+      'SET search_path TO "repos_review"',
+      "ROLLBACK",
+    ]);
   });
 
   it("rolls back and unlocks when the apply fence fails without exposing driver output", async () => {
