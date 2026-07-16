@@ -31,6 +31,8 @@ const OPERATION = "primary_relocation" as const;
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const SAFE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$/;
+const BRANCH_PRESERVATION_NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,99}$/;
+const MAX_PRESERVED_DIVERGENT_BRANCHES = 100;
 const DEFAULT_GIT_COMMAND_TIMEOUT_MS = 10_000;
 export const FULL_OBJECT_GRAPH_GIT_TIMEOUT_MS = 120_000;
 
@@ -103,6 +105,13 @@ export interface PrimaryRelocationRequest {
   idempotencyKey: string;
   apply?: boolean;
   expectedPlanHash?: string;
+  /**
+   * Explicit operator-supplied namespace for preserving divergent legacy
+   * branches as `<namespace>/<branch>` while moving the canonical target branch
+   * under its original name. The target checkout must already contain exact
+   * refs for both names; relocation never creates Git refs.
+   */
+  preserveDivergentBranchesUnder?: string;
   /** Exact registry path used for a hermetic, read-only dry run. */
   databasePath?: string;
 }
@@ -112,7 +121,10 @@ export interface CollisionDecision {
   key_hash: string;
   source_hash: string | null;
   target_hash: string;
-  decision: "move" | "dedupe" | "block";
+  decision: "move" | "dedupe" | "block" | "preserve";
+  preserved_name_hash?: string;
+  preserved_ref_hash?: string;
+  target_ref_hash?: string;
 }
 
 export interface TableReconcileCounts {
@@ -179,6 +191,7 @@ interface ValidatedRequest {
   actor: string;
   idempotencyKey: string;
   expectedPlanHash?: string;
+  preserveDivergentBranchesUnder?: string;
   apply: boolean;
   canonicalRoot: string;
   requestHash: string;
@@ -186,6 +199,7 @@ interface ValidatedRequest {
 
 interface InternalDecision extends CollisionDecision {
   row_id: number;
+  preserved_name?: string;
 }
 
 interface ReconcilePlan {
@@ -275,6 +289,34 @@ function canonicalRoot(): string {
   );
 }
 
+function isValidHeadRefName(name: string): boolean {
+  if (!name || name.includes("\0") || name.startsWith("/") || name.endsWith("/")) return false;
+  try {
+    execFileSync("git", ["check-ref-format", `refs/heads/${name}`], {
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 5_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validateBranchPreservationNamespace(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const namespace = value.trim();
+  if (
+    !BRANCH_PRESERVATION_NAMESPACE_PATTERN.test(namespace)
+    || namespace.startsWith("refs/")
+    || namespace.includes("//")
+    || namespace.endsWith("/")
+    || !isValidHeadRefName(`${namespace}/__repos_preservation_probe__`)
+  ) {
+    fail("INVALID_REQUEST", "branch preservation namespace is not a safe Git branch namespace");
+  }
+  return namespace;
+}
+
 function trustedAccountHome(): string {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (uid !== null && process.platform !== "win32") {
@@ -344,6 +386,9 @@ function validateRequest(request: PrimaryRelocationRequest): ValidatedRequest {
   if (request.apply && (!expectedPlanHash || !HASH_PATTERN.test(expectedPlanHash))) {
     fail("PLAN_HASH_REQUIRED", "apply requires the exact reviewed dry-run plan hash");
   }
+  const preserveDivergentBranchesUnder = validateBranchPreservationNamespace(
+    request.preserveDivergentBranchesUnder,
+  );
   const base = {
     legacyRepoId: request.repoId,
     legacyPath: normalizeAbsolutePath(request.expectedCurrentPath, "expected legacy path"),
@@ -356,14 +401,18 @@ function validateRequest(request: PrimaryRelocationRequest): ValidatedRequest {
     actor,
     idempotencyKey,
   };
+  const requestEnvelope = preserveDivergentBranchesUnder
+    ? { ...base, branch_preservation: { namespace: preserveDivergentBranchesUnder } }
+    : base;
   if (!base.legacyRevision || !base.targetRevision) fail("INVALID_REQUEST", "both row revisions are required");
   if (base.legacyPath === base.targetPath) fail("INVALID_REQUEST", "legacy and target paths must differ");
   return {
     ...base,
     expectedPlanHash,
+    preserveDivergentBranchesUnder,
     apply: Boolean(request.apply),
     canonicalRoot: canonicalRoot(),
-    requestHash: hash(base),
+    requestHash: hash(requestEnvelope),
   };
 }
 
@@ -387,13 +436,13 @@ function safeRepo(repo: Repo): Repo {
   };
 }
 
-function runGitRaw(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND_TIMEOUT_MS): Buffer {
-  try {
-    const env = Object.fromEntries(
-      Object.entries(process.env).filter(([key, value]) => !/^GIT_/i.test(key) && value !== undefined),
-    );
-    const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
-    return execFileSync("git", [
+function gitExecutionOptions(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND_TIMEOUT_MS) {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key, value]) => !/^GIT_/i.test(key) && value !== undefined),
+  ) as Record<string, string>;
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+  return {
+    cmd: [
       "-c", "core.fsmonitor=false",
       // Repository-local core.ignoreCase must not fold distinct filesystem
       // entries while inventorying a target. On case-insensitive filesystems
@@ -406,8 +455,8 @@ function runGitRaw(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND
       "-c", `core.hooksPath=${nullDevice}`,
       "-C", path,
       ...args,
-    ], {
-      stdio: ["ignore", "pipe", "pipe"],
+    ],
+    options: {
       timeout: timeoutMs,
       maxBuffer: 128 * 1024 * 1024,
       env: {
@@ -420,9 +469,31 @@ function runGitRaw(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND
         GIT_OPTIONAL_LOCKS: "0",
         GIT_TERMINAL_PROMPT: "0",
       },
+    },
+  };
+}
+
+function runGitRaw(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND_TIMEOUT_MS): Buffer {
+  try {
+    const { cmd, options } = gitExecutionOptions(path, args, timeoutMs);
+    return execFileSync("git", cmd, {
+      stdio: ["ignore", "pipe", "pipe"],
+      ...options,
     });
   } catch (cause) {
     fail("TARGET_NOT_GIT_CHECKOUT", "target is not a readable Git checkout", undefined, cause);
+  }
+}
+
+function tryRunGit(path: string, args: string[], timeoutMs = DEFAULT_GIT_COMMAND_TIMEOUT_MS): string | null {
+  try {
+    const { cmd, options } = gitExecutionOptions(path, args, timeoutMs);
+    return execFileSync("git", cmd, {
+      stdio: ["ignore", "pipe", "ignore"],
+      ...options,
+    }).toString("utf8").trim();
+  } catch {
+    return null;
   }
 }
 
@@ -962,6 +1033,102 @@ function keyFor(row: Record<string, unknown>, columns: readonly string[]): Recor
   return Object.fromEntries(columns.map((column) => [column, row[column]]));
 }
 
+function branchRefCommit(path: string, branchName: string): string | null {
+  if (!isValidHeadRefName(branchName)) return null;
+  const commit = tryRunGit(path, ["rev-parse", "--verify", `refs/heads/${branchName}^{commit}`]);
+  return commit && SHA_PATTERN.test(commit) ? commit : null;
+}
+
+function branchPreservationCollision(
+  request: ValidatedRequest,
+  source: Record<string, unknown>,
+  target: Record<string, unknown>,
+  rows: Array<Record<string, unknown>>,
+  logicalKey: Record<string, unknown>,
+  sourcePayload: Record<string, unknown>,
+  targetPayload: Record<string, unknown>,
+): { collisions: CollisionDecision[]; decisions: InternalDecision[]; blocked: boolean } {
+  const namespace = request.preserveDivergentBranchesUnder;
+  if (!namespace) {
+    const blocked: CollisionDecision = {
+      table: "branches",
+      key_hash: hash(logicalKey),
+      source_hash: hash(sourcePayload),
+      target_hash: hash(targetPayload),
+      decision: "block",
+    };
+    return { collisions: [blocked], decisions: [{ ...blocked, row_id: Number(target.id) }], blocked: true };
+  }
+
+  const sourceName = String(source.name ?? "");
+  const targetName = String(target.name ?? "");
+  const preservedName = `${namespace}/${sourceName}`;
+  const sourceSha = String(source.last_commit_sha ?? "");
+  const targetSha = String(target.last_commit_sha ?? "");
+  const preservedCommit = branchRefCommit(request.targetPath, preservedName);
+  const targetCommit = branchRefCommit(request.targetPath, targetName);
+  const preservedNameCollision = rows.some((row) => (
+    Number(row.id) !== Number(source.id) && String(row.name ?? "") === preservedName
+  ));
+  const evidence = {
+    preserved_name: preservedName,
+    expected_preserved_commit: sourceSha,
+    actual_preserved_commit: preservedCommit,
+    expected_target_commit: targetSha,
+    actual_target_commit: targetCommit,
+    preserved_name_collision: preservedNameCollision,
+  };
+  const evidenceOk = !preservedNameCollision
+    && SHA_PATTERN.test(sourceSha)
+    && SHA_PATTERN.test(targetSha)
+    && isValidHeadRefName(preservedName)
+    && preservedCommit === sourceSha
+    && targetCommit === targetSha;
+
+  if (!evidenceOk) {
+    const blocked: CollisionDecision = {
+      table: "branches",
+      key_hash: hash(logicalKey),
+      source_hash: hash(sourcePayload),
+      target_hash: hash(targetPayload),
+      decision: "block",
+      preserved_name_hash: hash(preservedName),
+      preserved_ref_hash: hash(evidence),
+      target_ref_hash: hash({ branch: targetName, expected_commit: targetSha, actual_commit: targetCommit }),
+    };
+    return { collisions: [blocked], decisions: [{ ...blocked, row_id: Number(target.id) }], blocked: true };
+  }
+
+  const preserved: CollisionDecision = {
+    table: "branches",
+    key_hash: hash(logicalKey),
+    source_hash: hash(sourcePayload),
+    target_hash: hash(targetPayload),
+    decision: "preserve",
+    preserved_name_hash: hash(preservedName),
+    preserved_ref_hash: hash(evidence),
+    target_ref_hash: hash({ branch: targetName, expected_commit: targetSha, actual_commit: targetCommit }),
+  };
+  const move: CollisionDecision = {
+    table: "branches",
+    key_hash: hash(logicalKey),
+    source_hash: hash(sourcePayload),
+    target_hash: hash(targetPayload),
+    decision: "move",
+    preserved_name_hash: hash(preservedName),
+    preserved_ref_hash: hash(evidence),
+    target_ref_hash: hash({ branch: targetName, expected_commit: targetSha, actual_commit: targetCommit }),
+  };
+  return {
+    collisions: [preserved, move],
+    decisions: [
+      { ...preserved, row_id: Number(source.id), preserved_name: preservedName },
+      { ...move, row_id: Number(target.id) },
+    ],
+    blocked: false,
+  };
+}
+
 function buildChildPlan(request: ValidatedRequest): {
   counts: Record<string, TableReconcileCounts>;
   collisions: CollisionDecision[];
@@ -972,6 +1139,7 @@ function buildChildPlan(request: ValidatedRequest): {
   const collisions: CollisionDecision[] = [];
   const decisions: InternalDecision[] = [];
   const digests: Record<string, string> = {};
+  let preservedDivergentBranchCount = 0;
   for (const spec of CHILD_TABLES) {
     const rawRows = relocationDb().query(`SELECT * FROM ${quote(spec.table)} WHERE repo_id IN (?, ?) ORDER BY id`).all(
       request.legacyRepoId,
@@ -1021,6 +1189,44 @@ function buildChildPlan(request: ValidatedRequest): {
       if (source && invalidRemoteIds.has(Number(source.id))) continue;
       const targetPayload = rowWithout(target, ["id", "repo_id"]);
       const sourcePayload = source ? rowWithout(source, ["id", "repo_id"]) : null;
+      if (
+        spec.table === "branches"
+        && source
+        && sourcePayload
+        && stable(sourcePayload) !== stable(targetPayload)
+      ) {
+        const preservation = branchPreservationCollision(
+          request,
+          source,
+          target,
+          rows,
+          logicalKey,
+          sourcePayload,
+          targetPayload,
+        );
+        if (preservation.blocked) {
+          tableCounts.block++;
+        } else {
+          preservedDivergentBranchCount++;
+          if (preservedDivergentBranchCount > MAX_PRESERVED_DIVERGENT_BRANCHES) {
+            const blocked: CollisionDecision = {
+              table: spec.table,
+              key_hash: hash(logicalKey),
+              source_hash: hash(sourcePayload),
+              target_hash: hash(targetPayload),
+              decision: "block",
+            };
+            tableCounts.block++;
+            collisions.push(blocked);
+            decisions.push({ ...blocked, row_id: Number(target.id) });
+            continue;
+          }
+          tableCounts.move++;
+        }
+        collisions.push(...preservation.collisions);
+        decisions.push(...preservation.decisions);
+        continue;
+      }
       const decision: CollisionDecision["decision"] = !source
         ? "move"
         : stable(sourcePayload) === stable(targetPayload) ? "dedupe" : "block";
@@ -1308,7 +1514,11 @@ function applyDecisions(request: ValidatedRequest, plan: ReconcilePlan): void {
   // transient UNIQUE violations when multiple target-bearing edges map to the
   // same canonical post-relocation key.
   const ordered = [...plan.decisions].sort((left, right) => {
-    const rank = (decision: InternalDecision) => decision.decision === "dedupe" ? 0 : 1;
+    const rank = (decision: InternalDecision) => {
+      if (decision.decision === "dedupe") return 0;
+      if (decision.decision === "preserve") return 1;
+      return 2;
+    };
     return rank(left) - rank(right) || left.row_id - right.row_id;
   });
   for (const decision of ordered) {
@@ -1321,6 +1531,16 @@ function applyDecisions(request: ValidatedRequest, plan: ReconcilePlan): void {
           request.targetRepoId,
         );
       }
+    } else if (decision.decision === "preserve") {
+      if (decision.table !== "branches" || !decision.preserved_name) {
+        fail("TRANSACTION_CONFLICT", "invalid branch preservation decision");
+      }
+      const updated = db.query("UPDATE branches SET name = ? WHERE id = ? AND repo_id = ?").run(
+        decision.preserved_name,
+        decision.row_id,
+        request.legacyRepoId,
+      );
+      if (updated.changes !== 1) fail("TRANSACTION_CONFLICT", "branch preservation row changed during reconciliation");
     } else if (decision.decision === "move") {
       if (decision.table === "edges") {
         db.query(`UPDATE edges SET
@@ -1455,6 +1675,10 @@ function expectedRelocationExactState(
     for (const decision of decisionsByTable.get(table) ?? []) {
       if (decision.decision === "dedupe") {
         projected = projected.filter((row) => Number(row.id) !== decision.row_id);
+      } else if (decision.decision === "preserve") {
+        projected = projected.map((row) => Number(row.id) === decision.row_id
+          ? { ...row, name: decision.preserved_name }
+          : row);
       } else if (decision.decision === "move") {
         projected = projected.map((row) => Number(row.id) === decision.row_id
           ? { ...row, repo_id: request.legacyRepoId }

@@ -116,7 +116,7 @@ afterEach(() => {
 describe("registry relocate-primary CLI", () => {
   it("does not expose remote identity cleanup on the installed CLI", () => {
     const result = Bun.spawnSync({
-      cmd: ["bun", "run", "src/cli/index.tsx", "registry", "--help"],
+      cmd: ["bun", "run", "src/cli/index.tsx", "registry", "relocate-primary", "--help"],
       cwd: join(import.meta.dir, "../.."),
       env: {
         ...process.env,
@@ -130,6 +130,7 @@ describe("registry relocate-primary CLI", () => {
     const stdout = new TextDecoder().decode(result.stdout);
     expect(result.exitCode).toBe(0);
     expect(stdout).not.toContain("cleanup-remote-identities");
+    expect(stdout).toContain("--preserve-divergent-branches-under");
   });
   it("is a dry run by default and performs no registry write", () => {
     const result = runCli([]);

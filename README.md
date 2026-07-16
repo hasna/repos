@@ -122,6 +122,7 @@ repos registry relocate-primary \
   --expected-head <exact-lowercase-sha> \
   --actor operator:<identity> \
   --idempotency-key sandboxes-primary-cutover-v1 \
+  --preserve-divergent-branches-under legacy-preserved \
   --json
 
 # Apply only after reviewing the dry-run envelope
@@ -136,6 +137,7 @@ repos registry relocate-primary \
   --expected-head <exact-lowercase-sha> \
   --actor operator:<identity> \
   --idempotency-key sandboxes-primary-cutover-v1 \
+  --preserve-divergent-branches-under legacy-preserved \
   --expected-plan-hash <sha256-from-dry-run> \
   --apply \
   --json
@@ -157,8 +159,13 @@ HEAD tree, stage-0 index, raw regular-file or symlink bytes, executable modes,
 and non-ignored untracked inventory, and rejects conflicts or unsupported
 entries. Dry run emits a request hash, plan hash, per-table counts, and hashed
 collision decisions. Exact duplicate children may be deduplicated; divergent
-commit, branch, tag, remote, PR, edge, or unknown foreign-key state blocks apply
-without choosing a winner. Apply revalidates the plan under one immediate SQLite
+commit, tag, remote, PR, edge, or unknown foreign-key state blocks apply without
+choosing a winner. Divergent branch rows still block by default. With an explicit
+`--preserve-divergent-branches-under <namespace>` review option, only divergent
+legacy branch rows may be preserved as deterministic `<namespace>/<branch>` rows;
+the target checkout must already contain exact `refs/heads/<namespace>/<branch>`
+and `refs/heads/<branch>` evidence at the reviewed SHAs, and apply never creates
+Git refs. Apply revalidates the plan under one immediate SQLite
 transaction, reparents supported children and catalog- or path-bound worktree
 leases, converges graph edges by their final mapped identity, deletes only the
 absorbed target row, absorbs the target's operational metadata while retaining
