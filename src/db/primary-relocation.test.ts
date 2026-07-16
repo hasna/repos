@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -149,6 +150,40 @@ function seedDivergentBranchCollision(
   db.query("INSERT INTO branches (repo_id, name, last_commit_sha) VALUES (?, 'main', ?)").run(pair.legacyId, legacySha);
   db.query("INSERT INTO branches (repo_id, name, last_commit_sha) VALUES (?, 'main', ?)").run(pair.targetId, pair.head);
   return { namespace, legacySha, preservedName, targetSha: pair.head };
+}
+
+function missingObjectPrefix(path: string): string {
+  for (const prefix of ["0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999"]) {
+    if (!git(path, "rev-parse", `--disambiguate=${prefix}`)) return prefix;
+  }
+  throw new Error("could not find a missing object prefix");
+}
+
+function ambiguousObjectPrefix(path: string): string {
+  const dir = join(root, "ambiguous-object-prefixes");
+  mkdirSync(dir, { recursive: true });
+  const algorithm = git(path, "rev-parse", "--show-object-format") === "sha256" ? "sha256" : "sha1";
+  const objectId = (content: string) => {
+    const bytes = Buffer.from(content);
+    return createHash(algorithm).update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+  };
+  const seen = new Map<string, { sha: string; content: string }>();
+  for (let i = 0; i < 4096; i++) {
+    const content = `candidate ${i}\n`;
+    const sha = objectId(content);
+    const prefix = sha.slice(0, 4);
+    const prior = seen.get(prefix);
+    if (prior && prior.sha !== sha) {
+      for (const [index, item] of [prior, { sha, content }].entries()) {
+        const candidate = join(dir, `candidate-${index}.txt`);
+        writeFileSync(candidate, item.content);
+        expect(git(path, "hash-object", "-w", candidate)).toBe(item.sha);
+      }
+      return prefix;
+    }
+    seen.set(prefix, { sha, content });
+  }
+  throw new Error("could not create an ambiguous object prefix");
 }
 
 beforeEach(() => {
@@ -382,6 +417,70 @@ describe("primary relocation v2 reconciliation", () => {
       { repo_id: pair.legacyId, name: "main", last_commit_sha: evidence.targetSha },
     ]);
     expect(getDb().query("SELECT id FROM repos WHERE id = ?").get(pair.targetId)).toBeNull();
+  });
+
+  it("accepts unambiguous abbreviated preservation commits and applies exact branch SHAs", () => {
+    const pair = seedPair({ name: "branch-preserve-abbrev" });
+    const evidence = seedDivergentBranchCollision(pair);
+    const db = getDb();
+    db.query("UPDATE branches SET last_commit_sha = ? WHERE repo_id = ? AND name = 'main'")
+      .run(evidence.legacySha.slice(0, 7), pair.legacyId);
+    db.query("UPDATE branches SET last_commit_sha = ? WHERE repo_id = ? AND name = 'main'")
+      .run(evidence.targetSha.slice(0, 9), pair.targetId);
+    const request = requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+      idempotencyKey: "branch-preserve-abbrev-v1",
+    });
+
+    const dry = relocatePrimaryRepo(request);
+    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      preserved_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+
+    relocatePrimaryRepo({ ...request, apply: true, expectedPlanHash: dry.plan.plan_hash });
+    expect(db.query("SELECT repo_id, name, last_commit_sha FROM branches ORDER BY name").all()).toEqual([
+      { repo_id: pair.legacyId, name: evidence.preservedName, last_commit_sha: evidence.legacySha },
+      { repo_id: pair.legacyId, name: "main", last_commit_sha: evidence.targetSha },
+    ]);
+  });
+
+  it("fails closed when preserved branch metadata names a missing object", () => {
+    const pair = seedPair({ name: "branch-preserve-missing-object" });
+    const evidence = seedDivergentBranchCollision(pair);
+    getDb().query("UPDATE branches SET last_commit_sha = ? WHERE repo_id = ? AND name = 'main'")
+      .run(missingObjectPrefix(pair.path), pair.legacyId);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, { preserveDivergentBranchesUnder: evidence.namespace }));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "branches", decision: "block" }));
+  });
+
+  it("fails closed when preserved branch metadata resolves to a non-commit object", () => {
+    const pair = seedPair({ name: "branch-preserve-non-commit-object" });
+    const evidence = seedDivergentBranchCollision(pair);
+    const blob = join(root, "non-commit-object.txt");
+    writeFileSync(blob, "not a commit\n");
+    getDb().query("UPDATE branches SET last_commit_sha = ? WHERE repo_id = ? AND name = 'main'")
+      .run(git(pair.path, "hash-object", "-w", blob).slice(0, 9), pair.legacyId);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, { preserveDivergentBranchesUnder: evidence.namespace }));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "branches", decision: "block" }));
+  });
+
+  it("fails closed when preserved branch metadata is an ambiguous object abbreviation", () => {
+    const pair = seedPair({ name: "branch-preserve-ambiguous-object" });
+    const evidence = seedDivergentBranchCollision(pair);
+    getDb().query("UPDATE branches SET last_commit_sha = ? WHERE repo_id = ? AND name = 'main'")
+      .run(ambiguousObjectPrefix(pair.path), pair.legacyId);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, { preserveDivergentBranchesUnder: evidence.namespace }));
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({ table: "branches", decision: "block" }));
   });
 
   it("does not let branch preservation mask non-branch divergence", () => {
