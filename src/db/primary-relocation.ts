@@ -1042,9 +1042,15 @@ function keyFor(row: Record<string, unknown>, columns: readonly string[]): Recor
   return Object.fromEntries(columns.map((column) => [column, row[column]]));
 }
 
-function branchRefCommit(path: string, branchName: string): string | null {
+function branchRefName(branchName: string, isRemote: boolean): string | null {
   if (!isValidHeadRefName(branchName)) return null;
-  const commit = tryRunGit(path, ["rev-parse", "--verify", `refs/heads/${branchName}^{commit}`]);
+  return `${isRemote ? "refs/remotes" : "refs/heads"}/${branchName}`;
+}
+
+function branchRefCommit(path: string, branchName: string, isRemote = false): string | null {
+  const ref = branchRefName(branchName, isRemote);
+  if (!ref) return null;
+  const commit = tryRunGit(path, ["rev-parse", "--verify", `${ref}^{commit}`]);
   return commit && SHA_PATTERN.test(commit) ? commit : null;
 }
 
@@ -1094,11 +1100,13 @@ function resolveStoredBranchCommit(path: string, value: unknown): StoredBranchCo
 
 function targetRefEvidence(
   branch: string,
+  isRemote: boolean,
   stored: StoredBranchCommitResolution,
   actualCommit: string | null,
 ): Record<string, unknown> {
   return {
     branch,
+    ref: branchRefName(branch, isRemote),
     stored_commit: stored.raw,
     resolved_commit: stored.resolved,
     resolution: stored.status,
@@ -1134,7 +1142,8 @@ function branchPreservationCollision(
   const sourceCommit = resolveStoredBranchCommit(request.targetPath, source.last_commit_sha);
   const targetCommit = resolveStoredBranchCommit(request.targetPath, target.last_commit_sha);
   const preservedCommit = branchRefCommit(request.targetPath, preservedName);
-  const targetBranchCommit = branchRefCommit(request.targetPath, targetName);
+  const targetIsRemote = target.is_remote === true || target.is_remote === 1;
+  const targetBranchCommit = branchRefCommit(request.targetPath, targetName, targetIsRemote);
   const preservedNameCollision = rows.some((row) => (
     Number(row.id) !== Number(source.id) && String(row.name ?? "") === preservedName
   ));
@@ -1149,6 +1158,7 @@ function branchPreservationCollision(
     resolved_target_commit: targetCommit.resolved,
     target_commit_resolution: targetCommit.status,
     target_commit_candidate_count: targetCommit.candidate_count,
+    target_ref: branchRefName(targetName, targetIsRemote),
     actual_target_commit: targetBranchCommit,
     preserved_name_collision: preservedNameCollision,
   };
@@ -1158,7 +1168,7 @@ function branchPreservationCollision(
     && targetCommit.status === "ok"
     && preservedCommit === sourceCommit.resolved
     && targetBranchCommit === targetCommit.resolved;
-  const targetEvidence = targetRefEvidence(targetName, targetCommit, targetBranchCommit);
+  const targetEvidence = targetRefEvidence(targetName, targetIsRemote, targetCommit, targetBranchCommit);
 
   if (!evidenceOk) {
     const blocked: CollisionDecision = {

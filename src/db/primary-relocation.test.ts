@@ -152,6 +152,29 @@ function seedDivergentBranchCollision(
   return { namespace, legacySha, preservedName, targetSha: pair.head };
 }
 
+function seedDivergentRemoteBranchCollisions(
+  pair: ReturnType<typeof seedPair>,
+  branchNames: string[],
+  namespace = "legacy-preserved",
+) {
+  const db = getDb();
+  git(pair.path, "checkout", "-b", "legacy-remote-source");
+  writeFileSync(join(pair.path, "legacy-remote-branch.txt"), "legacy remote branch\n");
+  git(pair.path, "add", "legacy-remote-branch.txt");
+  git(pair.path, "commit", "-m", "legacy remote branch");
+  const legacySha = git(pair.path, "rev-parse", "HEAD");
+  git(pair.path, "checkout", "main");
+
+  for (const branchName of branchNames) {
+    git(pair.path, "update-ref", `refs/heads/${namespace}/${branchName}`, legacySha);
+    db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, 1, ?)")
+      .run(pair.legacyId, branchName, legacySha.slice(0, 7));
+    db.query("INSERT INTO branches (repo_id, name, is_remote, last_commit_sha) VALUES (?, ?, 1, ?)")
+      .run(pair.targetId, branchName, pair.head.slice(0, 7));
+  }
+  return { namespace, legacySha, targetSha: pair.head };
+}
+
 function missingObjectPrefix(path: string): string {
   for (const prefix of ["0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999"]) {
     if (!git(path, "rev-parse", `--disambiguate=${prefix}`)) return prefix;
@@ -446,6 +469,73 @@ describe("primary relocation v2 reconciliation", () => {
       { repo_id: pair.legacyId, name: evidence.preservedName, last_commit_sha: evidence.legacySha },
       { repo_id: pair.legacyId, name: "main", last_commit_sha: evidence.targetSha },
     ]);
+  });
+
+  for (const fixture of [
+    { repo: "accounts", branches: ["origin/build/accounts-v1"] },
+    { repo: "sandboxes", branches: ["origin/build/managed-adapters-v1"] },
+    {
+      repo: "infinity",
+      branches: [
+        "origin/build/checkpoint-broker-v1",
+        "origin/build/infinity-v1",
+        "origin/build/portable-api-broker-v1",
+      ],
+    },
+  ]) {
+    it(`validates ${fixture.repo} remote branch rows against remote-tracking refs`, () => {
+      const pair = seedPair({ name: `remote-${fixture.repo}` });
+      const evidence = seedDivergentRemoteBranchCollisions(pair, fixture.branches);
+      for (const branchName of fixture.branches) {
+        git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+      }
+
+      const dry = relocatePrimaryRepo(requestFor(pair, {
+        preserveDivergentBranchesUnder: evidence.namespace,
+      }));
+
+      expect(dry.plan.can_apply).toBe(true);
+      expect(dry.plan.collisions.filter(({ table, decision }) => (
+        table === "branches" && decision === "preserve"
+      ))).toHaveLength(fixture.branches.length);
+    });
+  }
+
+  it("fails closed when a remote target branch ref is missing", () => {
+    const pair = seedPair({ name: "remote-branch-missing" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("fails closed when a remote target branch ref resolves to another commit", () => {
+    const pair = seedPair({ name: "remote-branch-mismatch" });
+    const branchName = "origin/build/managed-adapters-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.legacySha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(false);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "block",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
   });
 
   it("fails closed when preserved branch metadata names a missing object", () => {
