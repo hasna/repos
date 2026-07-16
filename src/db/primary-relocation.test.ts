@@ -501,6 +501,53 @@ describe("primary relocation v2 reconciliation", () => {
     });
   }
 
+  it("validates a stale remote-marked local slash branch against its local head", () => {
+    const pair = seedPair({ name: "stale-remote-local-slash" });
+    const branchName = "build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/heads/${branchName}`, evidence.targetSha);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.legacySha);
+
+    const dry = relocatePrimaryRepo(requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+    }));
+
+    expect(dry.plan.can_apply).toBe(true);
+    expect(dry.plan.collisions).toContainEqual(expect.objectContaining({
+      table: "branches",
+      decision: "preserve",
+      target_ref_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
+  });
+
+  it("applies a preserved remote slash branch with local branch semantics", () => {
+    const pair = seedPair({ name: "preserved-remote-local-semantics" });
+    const branchName = "origin/build/accounts-v1";
+    const evidence = seedDivergentRemoteBranchCollisions(pair, [branchName]);
+    git(pair.path, "update-ref", `refs/remotes/${branchName}`, evidence.targetSha);
+    getDb().query("UPDATE branches SET ahead = 7, behind = 11 WHERE repo_id = ? AND name = ?")
+      .run(pair.legacyId, branchName);
+    const request = requestFor(pair, {
+      preserveDivergentBranchesUnder: evidence.namespace,
+      idempotencyKey: "preserved-remote-local-semantics-v1",
+    });
+    const dry = relocatePrimaryRepo(request);
+
+    expect(dry.plan.can_apply).toBe(true);
+    relocatePrimaryRepo({ ...request, apply: true, expectedPlanHash: dry.plan.plan_hash });
+
+    expect(getDb().query(
+      "SELECT repo_id, name, is_remote, last_commit_sha, ahead, behind FROM branches WHERE name = ?",
+    ).get(`${evidence.namespace}/${branchName}`)).toEqual({
+      repo_id: pair.legacyId,
+      name: `${evidence.namespace}/${branchName}`,
+      is_remote: 0,
+      last_commit_sha: evidence.legacySha,
+      ahead: 0,
+      behind: 0,
+    });
+  });
+
   it("fails closed when a remote target branch ref is missing", () => {
     const pair = seedPair({ name: "remote-branch-missing" });
     const branchName = "origin/build/accounts-v1";

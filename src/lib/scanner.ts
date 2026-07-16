@@ -162,7 +162,7 @@ function indexRepo(repoPath: string, full = false): {
   const branchOutput = git(repoPath, [
     "branch",
     "-a",
-    "--format=%(refname:short)|%(objectname:short)|%(committerdate:iso8601)",
+    "--format=%(refname)|%(refname:short)|%(objectname:short)|%(committerdate:iso8601)",
   ]);
   const branchEntries: Array<{
     name: string; is_remote: boolean; last_commit_sha: string | null;
@@ -172,9 +172,10 @@ function indexRepo(repoPath: string, full = false): {
   if (branchOutput) {
     for (const line of branchOutput.split("\n")) {
       const parts = line.replace(/'/g, "").split("|");
-      if (!parts[0]) continue;
-      const branchName = parts[0];
-      const isRemote = branchName.startsWith("origin/") || branchName.includes("/");
+      if (!parts[0] || !parts[1]) continue;
+      const refName = parts[0];
+      const branchName = parts[1];
+      const isRemote = refName.startsWith("refs/remotes/");
       let ahead = 0;
       let behind = 0;
 
@@ -200,8 +201,8 @@ function indexRepo(repoPath: string, full = false): {
       branchEntries.push({
         name: branchName,
         is_remote: isRemote,
-        last_commit_sha: parts[1] || null,
-        last_commit_date: parts[2] || null,
+        last_commit_sha: parts[2] || null,
+        last_commit_date: parts[3] || null,
         ahead,
         behind,
       });

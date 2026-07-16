@@ -68,6 +68,33 @@ describe("scanner", () => {
     expect(branches.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("classifies slash branches from their full ref namespace", async () => {
+    const repoPath = createTestRepo("repo-with-local-and-remote-slash-branches", 1);
+    execFileSync("git", ["checkout", "-b", "build/accounts-v1"], { cwd: repoPath, stdio: "pipe" });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/hasna/accounts.git"], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoPath, encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/remotes/origin/build/accounts-v1", head], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+
+    await scanRepos([TEST_DIR]);
+    const [repo] = listRepos();
+    const branches = listBranches({ repo_id: repo!.id });
+
+    expect(branches).toContainEqual(expect.objectContaining({
+      name: "build/accounts-v1",
+      is_remote: 0,
+    }));
+    expect(branches).toContainEqual(expect.objectContaining({
+      name: "origin/build/accounts-v1",
+      is_remote: 1,
+    }));
+  });
+
   it("should index tags", async () => {
     const repoPath = createTestRepo("repo-with-tag", 1);
     execSync(`git tag v1.0.0`, { cwd: repoPath, stdio: "pipe" });
