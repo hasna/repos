@@ -182,9 +182,15 @@ interface BranchAdjudicationPlan {
 }
 
 let adjudicationDbContext: Database | null = null;
+let gitEnvironmentForTests: Record<string, string | undefined> | null = null;
 
 function adjudicationDb(): Database {
   return adjudicationDbContext ?? getDb();
+}
+
+/** Test seam intentionally omitted from the package root export. */
+export function setBranchAdjudicationGitEnvironmentForTests(env: Record<string, string | undefined> | null): void {
+  gitEnvironmentForTests = env;
 }
 
 function fail(
@@ -330,15 +336,32 @@ function runGit(
   message = "evidence repo path is not a readable Git checkout",
   details?: Record<string, unknown>,
 ): string {
+  const env = Object.fromEntries(
+    Object.entries(gitEnvironmentForTests ?? process.env)
+      .filter(([key, value]) => !/^GIT_/i.test(key) && value !== undefined),
+  ) as Record<string, string>;
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
   try {
-    return execFileSync("git", ["-C", path, ...args], {
+    return execFileSync("git", [
+      "-c", "core.fsmonitor=false",
+      "-c", "core.untrackedCache=false",
+      "-c", `core.excludesFile=${nullDevice}`,
+      "-c", `core.hooksPath=${nullDevice}`,
+      "-c", "protocol.allow=never",
+      "-C", path,
+      ...args,
+    ], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
       env: {
-        ...process.env,
+        ...env,
+        GIT_ATTR_NOSYSTEM: "1",
         GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+        GIT_CONFIG_GLOBAL: nullDevice,
+        GIT_NO_LAZY_FETCH: "1",
+        GIT_NO_REPLACE_OBJECTS: "1",
+        GIT_OPTIONAL_LOCKS: "0",
         GIT_TERMINAL_PROMPT: "0",
       },
     }).trim();
