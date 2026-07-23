@@ -121,7 +121,9 @@ when the resolved branch names coincide, while derived-base retries retain their
 persisted safe base across a later default-branch change. Rows without that
 provenance fail closed. Required import identities and paths must be nonempty
 before path resolution or persistence, and imported leases record import
-provenance.
+provenance. Direct SDK calls enforce the same positive safe-integer contract as
+CLI and MCP inputs for TTLs, generations, inventory limits, and every other
+numeric worktree option.
 
 Release and cleanup are fenced operations. `release` requires the current
 generation and fencing token, refuses dirty/staged/untracked/detached,
@@ -158,7 +160,10 @@ Plain release uses the same pattern through a reserved `releasing` state and a
 reserved `release_committing` state, with complete local/origin proof after the
 commit-state CAS and before the terminal `released` transition. Quarantine uses
 the equivalent `quarantine_committing` proof phase. Both final proof/CAS
-sections hold Git index and branch-ref mutation locks and verify again before
+sections hold Git index, common config, branch-ref, and—when
+`extensions.worktreeConfig` applies—the resolved `config.worktree` mutation
+locks. Repository identity and transport configuration are revalidated after
+those locks are acquired and before any remote proof, then verified again before
 returning success. Provisional terminal rows remain ownership-reserving until
 their post-CAS proof atomically marks the corresponding finalized metadata flag;
 retries resume that locked proof after a crash. Control-plane lock files carry

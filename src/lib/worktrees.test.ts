@@ -90,11 +90,45 @@ function publishBranch(path: string, branch: string) {
   git(["config", `branch.${branch}.merge`, `refs/heads/${branch}`], path);
 }
 
+function armWorktreeConfigRace(path: string, at: number, name: string) {
+  const counter = join(tempDir, `${name}-worktree-config-counter`);
+  const result = join(tempDir, `${name}-worktree-config-result`);
+  const invoked = join(tempDir, `${name}-hostile-transport-invoked`);
+  const hostileTransport = join(tempDir, `${name}-hostile-transport`);
+  writeFileSync(hostileTransport, `#!/bin/sh
+printf 'invoked\n' > "${invoked}"
+exit 99
+`);
+  chmodSync(hostileTransport, 0o755);
+  git(["config", "extensions.worktreeConfig", "true"], path);
+  process.env["HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_COUNTER"] = counter;
+  process.env["HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_AT"] = String(at);
+  process.env["HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_RESULT"] = result;
+  process.env["HASNA_REPOS_TEST_HOSTILE_TRANSPORT"] = hostileTransport;
+  return { counter, result, invoked };
+}
+
 function installGitTestShim() {
   const bin = join(tempDir, "bin");
   const shim = join(bin, "git");
   mkdirSync(bin, { recursive: true });
   writeFileSync(shim, `#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "--includes" ] && [ "$3" = "--get-regexp" ] && [ -n "\${HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_COUNTER:-}" ]; then
+  count=0
+  if [ -f "$HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_COUNTER" ]; then
+    count="$(cat "$HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_COUNTER")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_COUNTER"
+  if [ "$count" = "\${HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_AT:-0}" ]; then
+    if "${realGit}" config --worktree remote.origin.url git@github.com:hasna/other.git >/dev/null 2>&1 \
+      && "${realGit}" config --worktree core.sshCommand "$HASNA_REPOS_TEST_HOSTILE_TRANSPORT" >/dev/null 2>&1; then
+      printf 'changed\n' > "$HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_RESULT"
+    else
+      printf 'blocked\n' > "$HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_RESULT"
+    fi
+  fi
+fi
 if [ "$1" = "ls-remote" ] && [ "$2" = "--symref" ] && [ "$4" = "HEAD" ]; then
   if [ "\${HASNA_REPOS_TEST_LS_REMOTE_FAIL:-}" = "1" ]; then
     echo "simulated remote default probe failure" >&2
@@ -350,6 +384,10 @@ afterEach(() => {
   delete process.env["HASNA_REPOS_TEST_BACKUP_LOCK_RESULT"];
   delete process.env["HASNA_REPOS_TEST_POST_VALIDATION_ORIGIN_URL"];
   delete process.env["HASNA_REPOS_TEST_POST_VALIDATION_ORIGIN_RESULT"];
+  delete process.env["HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_COUNTER"];
+  delete process.env["HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_AT"];
+  delete process.env["HASNA_REPOS_TEST_WORKTREE_CONFIG_RACE_RESULT"];
+  delete process.env["HASNA_REPOS_TEST_HOSTILE_TRANSPORT"];
   delete process.env["HASNA_REPOS_TEST_ROLLBACK_CLAIM_RESULT"];
   delete process.env["HASNA_REPOS_TEST_ROLLBACK_CLAIM_SOURCE"];
   delete process.env["HASNA_REPOS_TEST_ROLLBACK_CLAIM_BRANCH"];
@@ -915,6 +953,18 @@ describe("worktree control plane", () => {
       .toBe("https://github.com/hasna/repos.git");
   });
 
+  it("locks per-worktree configuration through claim activation", () => {
+    const race = armWorktreeConfigRace(source, 2, "claim");
+    const result = claim("task/worktree-config-activation-lock");
+
+    expect(result.ok).toBe(true);
+    expect(result.lease?.status).toBe("active");
+    expect(readFileSync(race.result, "utf8").trim()).toBe("blocked");
+    expect(existsSync(race.invoked)).toBe(false);
+    expect(() => git(["config", "--worktree", "--get", "remote.origin.url"], result.lease!.canonical_path))
+      .toThrow();
+  });
+
   it("rejects hostile source hosts and reads origin without insteadOf rewriting", () => {
     for (const [index, remote] of [
       "https://evil.example/hasna/repos.git",
@@ -1121,6 +1171,97 @@ describe("worktree control plane", () => {
     expect(collision.ok).toBe(false);
     expect(collision.code).toBe("owner_collision");
     expect(collision.lease?.lease_id).toBe(first.lease?.lease_id);
+  });
+
+  it("treats null and non-canonical terminal proofs as ownership-reserving at runtime", () => {
+    const valid40 = "a".repeat(40);
+    for (const [name, status, headSha, metadata] of [
+      ["null-head", "released", null, {
+        release_finalized: true,
+        release_verified_head_sha: valid40,
+        release_finalized_at_ms: 1,
+      }],
+      ["intermediate-head", "released", "b".repeat(48), {
+        release_finalized: true,
+        release_verified_head_sha: "b".repeat(48),
+        release_finalized_at_ms: 1,
+      }],
+      ["uppercase-head", "released", "C".repeat(40), {
+        release_finalized: true,
+        release_verified_head_sha: "C".repeat(40),
+        release_finalized_at_ms: 1,
+      }],
+      ["quarantined-missing-path", "quarantined", valid40, {
+        quarantine_finalized: true,
+        verified_head_sha: valid40,
+        backup_ref: "refs/hasna/worktrees/wt_runtime_quarantined_missing_path/1",
+        quarantine_finalized_at_ms: 1,
+      }],
+    ] as const) {
+      const branch = `task/runtime-terminal-${name}`;
+      getDb().query(`INSERT INTO worktree_leases (
+        lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+        branch, owner, status, generation, fencing_token, head_sha,
+        expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+      ) VALUES (?, 'hasna/repos', ?, ?, 'machine-1', ?, ?, 'previous', ?, 1, ?, ?,
+        9999999999999, 1, 1, 1, ?)`).run(
+        `wt_runtime_${name.replaceAll("-", "_")}`,
+        `task-${name}`,
+        `run-${name}`,
+        join(root, `previous-${name}`),
+        branch,
+        status,
+        `fence-${name}`,
+        headSha,
+        JSON.stringify(metadata),
+      );
+
+      const collision = claimWorktree({
+        repo: "hasna/repos",
+        source,
+        taskId: `task-${name}-competitor`,
+        runId: `run-${name}-competitor`,
+        machineId: "machine-1",
+        branch,
+        owner: "competitor",
+        root,
+        idempotencyKey: `runtime-terminal-${name}-competitor`,
+      });
+      expect(collision.ok).toBe(false);
+      expect(collision.code).toBe("owner_collision");
+      expect(collision.lease?.lease_id).toBe(`wt_runtime_${name.replaceAll("-", "_")}`);
+    }
+
+    const valid64 = "d".repeat(64);
+    const validBranch = "task/runtime-terminal-valid-sha256";
+    getDb().query(`INSERT INTO worktree_leases (
+      lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+      branch, owner, status, generation, fencing_token, head_sha,
+      expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+    ) VALUES ('wt_runtime_valid_sha256', 'hasna/repos', 'task-valid', 'run-valid',
+      'machine-1', ?, ?, 'previous', 'released', 1, 'fence-valid', ?,
+      1, 1, 1, 1, ?)`).run(
+      join(root, "previous-valid-sha256"),
+      validBranch,
+      valid64,
+      JSON.stringify({
+        release_finalized: true,
+        release_verified_head_sha: valid64,
+        release_finalized_at_ms: 1,
+      }),
+    );
+    const successor = claimWorktree({
+      repo: "hasna/repos",
+      source,
+      taskId: "task-valid-successor",
+      runId: "run-valid-successor",
+      machineId: "machine-1",
+      branch: validBranch,
+      owner: "successor",
+      root,
+      idempotencyKey: "runtime-terminal-valid-successor",
+    });
+    expect(successor.ok).toBe(true);
   });
 
   it("blocks collisions while an existing lease is still preparing", () => {
@@ -1511,6 +1652,85 @@ describe("worktree control plane", () => {
     expect(staleRelease.code).toBe("stale_generation");
   });
 
+  it("rejects every non-positive or non-safe SDK numeric option at runtime", () => {
+    const invalidValues = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+    for (const [index, value] of invalidValues.entries()) {
+      const claimed = claimWorktree({
+        repo: "hasna/repos",
+        source,
+        taskId: `task-invalid-ttl-${index}`,
+        runId: `run-invalid-ttl-${index}`,
+        machineId: "machine-1",
+        branch: `task/invalid-ttl-${index}`,
+        owner: "pacuvius",
+        root,
+        ttlSeconds: value,
+        idempotencyKey: `invalid-ttl-${index}`,
+      });
+      expect(claimed).toMatchObject({
+        ok: false,
+        action: "claim",
+        code: "invalid_ttl_seconds",
+        message: "ttlSeconds must be a positive safe integer",
+      });
+    }
+    expect(getDb().query("SELECT COUNT(*) AS count FROM worktree_leases").get()).toEqual({ count: 0 });
+
+    const imported = importWorktree({
+      repo: "hasna/repos",
+      taskId: "task-invalid-import-ttl",
+      runId: "run-invalid-import-ttl",
+      machineId: "machine-1",
+      branch: "task/invalid-import-ttl",
+      owner: "pacuvius",
+      path: source,
+      root: tempDir,
+      ttlSeconds: Number.MAX_SAFE_INTEGER + 1,
+    });
+    expect(imported).toMatchObject({
+      ok: false,
+      action: "import",
+      code: "invalid_ttl_seconds",
+      message: "ttlSeconds must be a positive safe integer",
+    });
+
+    expect(renewWorktreeLease({
+      leaseId: "missing",
+      generation: 0,
+      fencingToken: "token",
+    })).toMatchObject({
+      ok: false,
+      action: "renew",
+      code: "invalid_generation",
+      message: "generation must be a positive safe integer",
+    });
+    expect(renewWorktreeLease({
+      leaseId: "missing",
+      generation: 1,
+      fencingToken: "token",
+      ttlSeconds: Number.NaN,
+    })).toMatchObject({
+      ok: false,
+      action: "renew",
+      code: "invalid_ttl_seconds",
+      message: "ttlSeconds must be a positive safe integer",
+    });
+    expect(releaseWorktree({
+      leaseId: "missing",
+      generation: Number.MAX_SAFE_INTEGER + 1,
+      fencingToken: "token",
+    })).toMatchObject({
+      ok: false,
+      action: "release",
+      code: "invalid_generation",
+      message: "generation must be a positive safe integer",
+    });
+    for (const value of invalidValues) {
+      expect(() => inventoryWorktrees({ root, limit: value }))
+        .toThrow("limit must be a positive safe integer");
+    }
+  });
+
   it("does not release when HEAD changes during the initial remote proof", () => {
     const result = claim("task/release-head-race");
     expect(result.ok).toBe(true);
@@ -1641,6 +1861,25 @@ describe("worktree control plane", () => {
     expect(released.lease?.status).toBe("released");
     expect(readFileSync(process.env["HASNA_REPOS_TEST_RELEASE_LOCK_RESULT"], "utf8").trim()).toBe("blocked");
     expect(git(["rev-parse", "HEAD"], lease.canonical_path)).toBe(head);
+  });
+
+  it("locks per-worktree configuration through terminal release", () => {
+    const result = claim("task/release-worktree-config-lock");
+    expect(result.ok).toBe(true);
+    const lease = result.lease!;
+    publishBranch(lease.canonical_path, lease.branch);
+    const race = armWorktreeConfigRace(lease.canonical_path, 5, "release");
+
+    const released = releaseWorktree({
+      leaseId: lease.lease_id,
+      generation: lease.generation,
+      fencingToken: lease.fencing_token,
+    });
+
+    expect(released.ok).toBe(true);
+    expect(released.lease?.status).toBe("released");
+    expect(readFileSync(race.result, "utf8").trim()).toBe("blocked");
+    expect(existsSync(race.invoked)).toBe(false);
   });
 
   it("keeps release ownership reserved when a terminal Git lock is busy", () => {
@@ -2266,6 +2505,32 @@ describe("worktree control plane", () => {
     expect(recovered.lease?.lease_id).toBe(imported.lease?.lease_id);
   });
 
+  it("locks per-worktree configuration through import activation", () => {
+    const importedPath = join(root, "worktree-config-race-import");
+    const branch = "task/import-worktree-config-lock";
+    git(["clone", source, importedPath], tempDir);
+    git(["checkout", "-b", branch, "--track", "origin/main"], importedPath);
+    git(["remote", "set-url", "origin", "https://github.com/hasna/repos.git"], importedPath);
+    const race = armWorktreeConfigRace(importedPath, 2, "import");
+
+    const imported = importWorktree({
+      repo: "hasna/repos",
+      taskId: "task-import-worktree-config-lock",
+      runId: "run-import-worktree-config-lock",
+      machineId: "machine-1",
+      branch,
+      owner: "pacuvius",
+      path: importedPath,
+      root,
+      idempotencyKey: "import-worktree-config-lock",
+    });
+
+    expect(imported.ok).toBe(true);
+    expect(imported.lease?.status).toBe("active");
+    expect(readFileSync(race.result, "utf8").trim()).toBe("blocked");
+    expect(existsSync(race.invoked)).toBe(false);
+  });
+
   it("imports an existing safe worktree idempotently and includes it in inventory", () => {
     const importedPath = join(root, "imported-main");
     git(["clone", source, importedPath], tempDir);
@@ -2406,6 +2671,26 @@ describe("worktree control plane", () => {
     expect(readFileSync(process.env["HASNA_REPOS_TEST_BACKUP_LOCK_RESULT"], "utf8").trim()).toBe("blocked");
     expect(git(["rev-parse", String(released.lease!.metadata["backup_ref"])], source))
       .toBe(released.lease?.head_sha);
+  });
+
+  it("locks per-worktree configuration through terminal quarantine", () => {
+    const result = claim("task/quarantine-worktree-config-lock");
+    expect(result.ok).toBe(true);
+    const lease = result.lease!;
+    publishBranch(lease.canonical_path, lease.branch);
+    const race = armWorktreeConfigRace(lease.canonical_path, 6, "quarantine");
+
+    const released = releaseWorktree({
+      leaseId: lease.lease_id,
+      generation: lease.generation,
+      fencingToken: lease.fencing_token,
+      cleanup: "quarantine",
+    });
+
+    expect(released.ok).toBe(true);
+    expect(released.lease?.status).toBe("quarantined");
+    expect(readFileSync(race.result, "utf8").trim()).toBe("blocked");
+    expect(existsSync(race.invoked)).toBe(false);
   });
 
   it("compensates when the remote branch moves during post-terminal quarantine proof", () => {

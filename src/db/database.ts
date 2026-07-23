@@ -1428,36 +1428,51 @@ function worktreeLeaseTableSql(): string {
 }
 
 function gitObjectIdSql(value: string): string {
-  return `(length(${value}) IN (40, 64)
-    AND ${value} NOT GLOB '*[^0-9a-f]*')`;
+  return `COALESCE((
+    typeof(${value}) = 'text'
+    AND length(${value}) IN (40, 64)
+    AND ${value} NOT GLOB '*[^0-9a-f]*'
+  ), 0)`;
 }
 
 function releaseTerminalProofSql(): string {
   const verifiedHead = "json_extract(metadata_json, '$.release_verified_head_sha')";
-  return `(COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
+  return `COALESCE((
+    COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
     AND COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
     AND ${gitObjectIdSql(verifiedHead)}
-    AND ${verifiedHead} = head_sha
+    AND ${gitObjectIdSql("head_sha")}
+    AND COALESCE(${verifiedHead} = head_sha, 0)
     AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
-    AND json_extract(metadata_json, '$.release_finalized_at_ms') >= 0)`;
+    AND COALESCE(json_extract(metadata_json, '$.release_finalized_at_ms') >= 0, 0)
+  ), 0)`;
 }
 
 function quarantineTerminalProofSql(): string {
   const verifiedHead = "json_extract(metadata_json, '$.verified_head_sha')";
-  return `(COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
+  const quarantinePath = "json_extract(metadata_json, '$.quarantine_path')";
+  const backupRef = "json_extract(metadata_json, '$.backup_ref')";
+  return `COALESCE((
+    COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
     AND COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
     AND ${gitObjectIdSql(verifiedHead)}
-    AND ${verifiedHead} = head_sha
-    AND json_extract(metadata_json, '$.quarantine_path') = canonical_path
-    AND json_extract(metadata_json, '$.backup_ref') = 'refs/hasna/worktrees/' || lease_id || '/' || generation
+    AND ${gitObjectIdSql("head_sha")}
+    AND COALESCE(${verifiedHead} = head_sha, 0)
+    AND COALESCE(json_type(metadata_json, '$.quarantine_path'), '') = 'text'
+    AND COALESCE(${quarantinePath} = canonical_path, 0)
+    AND COALESCE(json_type(metadata_json, '$.backup_ref'), '') = 'text'
+    AND COALESCE(${backupRef} = 'refs/hasna/worktrees/' || lease_id || '/' || generation, 0)
     AND COALESCE(json_type(metadata_json, '$.quarantine_finalized_at_ms'), '') = 'integer'
-    AND json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0)`;
+    AND COALESCE(json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0, 0)
+  ), 0)`;
 }
 
 function worktreeOwnershipPredicateSql(): string {
-  return `(status NOT IN ('released', 'failed', 'quarantined')
-    OR (status = 'released' AND NOT ${releaseTerminalProofSql()})
-    OR (status = 'quarantined' AND NOT ${quarantineTerminalProofSql()}))`;
+  return `COALESCE((
+    status NOT IN ('released', 'failed', 'quarantined')
+    OR (status = 'released' AND COALESCE(NOT ${releaseTerminalProofSql()}, 1))
+    OR (status = 'quarantined' AND COALESCE(NOT ${quarantineTerminalProofSql()}, 1))
+  ), 1)`;
 }
 
 function worktreeLeaseIndexStatements(): Record<string, string> {
@@ -1512,11 +1527,11 @@ function validateWorktreeLeaseSchema(db: Database, requireIndexes = true): void 
     ) OR (
       status = 'released'
       AND COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
-      AND NOT ${releaseTerminalProofSql()}
+      AND COALESCE(NOT ${releaseTerminalProofSql()}, 1)
     ) OR (
       status = 'quarantined'
       AND COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
-      AND NOT ${quarantineTerminalProofSql()}
+      AND COALESCE(NOT ${quarantineTerminalProofSql()}, 1)
     ) LIMIT 1`).get();
   if (invalidTerminalProof) throw new Error("worktree lease terminal proof payload is missing or invalid");
   const canonicalColumns = db.query("PRAGMA table_info(worktree_leases)").all() as Array<{

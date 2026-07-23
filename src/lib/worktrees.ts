@@ -145,8 +145,8 @@ export interface InventoryOptions {
   limit?: number;
 }
 
-const OWNERSHIP_PREDICATE = `(status NOT IN ('released', 'failed', 'quarantined')
-  OR (status = 'released' AND NOT (
+const OWNERSHIP_PREDICATE = `(COALESCE(status, '') NOT IN ('released', 'failed', 'quarantined')
+  OR (status = 'released' AND COALESCE((
     COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
     AND COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
     AND length(json_extract(metadata_json, '$.release_verified_head_sha')) IN (40, 64)
@@ -154,8 +154,8 @@ const OWNERSHIP_PREDICATE = `(status NOT IN ('released', 'failed', 'quarantined'
     AND json_extract(metadata_json, '$.release_verified_head_sha') = head_sha
     AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
     AND json_extract(metadata_json, '$.release_finalized_at_ms') >= 0
-  ))
-  OR (status = 'quarantined' AND NOT (
+  ), 0) != 1)
+  OR (status = 'quarantined' AND COALESCE((
     COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
     AND COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
     AND length(json_extract(metadata_json, '$.verified_head_sha')) IN (40, 64)
@@ -165,7 +165,7 @@ const OWNERSHIP_PREDICATE = `(status NOT IN ('released', 'failed', 'quarantined'
     AND json_extract(metadata_json, '$.backup_ref') = 'refs/hasna/worktrees/' || lease_id || '/' || generation
     AND COALESCE(json_type(metadata_json, '$.quarantine_finalized_at_ms'), '') = 'integer'
     AND json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0
-  )))`;
+  ), 0) != 1))`;
 const DEFAULT_TTL_SECONDS = 60 * 60 * 6;
 const PREPARING_COMPLETION_TIMEOUT_MS = 2 * 60 * 1000;
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
@@ -483,6 +483,24 @@ function nonEmpty(value: string | undefined): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function positiveSafeIntegerError(
+  action: string,
+  field: "ttlSeconds" | "generation",
+  value: number | undefined,
+): WorktreeResult | undefined {
+  if (isPositiveSafeInteger(value)) return undefined;
+  return {
+    ok: false,
+    action,
+    code: field === "ttlSeconds" ? "invalid_ttl_seconds" : "invalid_generation",
+    message: `${field} must be a positive safe integer`,
+  };
+}
+
 function assertSafePath(path: string, root = DEFAULT_ROOT()): string {
   const rootAbs = resolve(root);
   mkdirSync(rootAbs, { recursive: true });
@@ -641,6 +659,7 @@ function gitCommonDir(path: string): string | null {
 function withGitMutationLocks<T>(
   path: string,
   branch: string,
+  expectedRepo: string,
   operation: () => T,
   extraRefs: string[] = [],
 ): T {
@@ -650,24 +669,34 @@ function withGitMutationLocks<T>(
   const indexPath = isAbsolute(indexResult.stdout.trim())
     ? indexResult.stdout.trim()
     : resolve(path, indexResult.stdout.trim());
-  const lockPaths = [
+  const initialLockPaths = [
     `${indexPath}.lock`,
     join(commonDir, "config.lock"),
+  ];
+  const refLockPaths = [
     join(commonDir, "refs", "heads", `${branch}.lock`),
     ...extraRefs.map((ref) => gitRefLockPath(commonDir, ref)),
   ];
   const locks: Array<{ path: string; fd: number }> = [];
-  try {
-    for (const lockPath of lockPaths) {
-      mkdirSync(dirname(lockPath), { recursive: true });
-      try {
-        locks.push({ path: lockPath, fd: acquireGitMutationLock(lockPath) });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-          throw new GitMutationLockBusyError(lockPath);
-        }
-        throw error;
+  const lock = (lockPath: string): void => {
+    if (locks.some((held) => held.path === lockPath)) return;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    try {
+      locks.push({ path: lockPath, fd: acquireGitMutationLock(lockPath) });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new GitMutationLockBusyError(lockPath);
       }
+      throw error;
+    }
+  };
+  try {
+    for (const lockPath of initialLockPaths) lock(lockPath);
+    const worktreeConfigLock = gitWorktreeConfigLockPath(path, commonDir);
+    if (worktreeConfigLock) lock(worktreeConfigLock);
+    for (const lockPath of refLockPaths) lock(lockPath);
+    if (rawOriginRepoIdentity(path) !== expectedRepo) {
+      throw new Error("validated origin identity or transport changed while acquiring mutation locks");
     }
     return operation();
   } finally {
@@ -676,6 +705,37 @@ function withGitMutationLocks<T>(
       try { unlinkSync(lock.path); } catch {}
     }
   }
+}
+
+function gitWorktreeConfigLockPath(path: string, commonDir: string): string | null {
+  const enabled = runGit([
+    "config",
+    "--local",
+    "--no-includes",
+    "--type=bool",
+    "--get",
+    "extensions.worktreeConfig",
+  ], path);
+  if (!enabled.ok) {
+    if (enabled.exitCode === 1) return null;
+    throw new Error("could not resolve extensions.worktreeConfig");
+  }
+  if (enabled.stdout.trim() === "false") return null;
+  if (enabled.stdout.trim() !== "true") {
+    throw new Error("extensions.worktreeConfig is not a canonical boolean");
+  }
+  const resolved = runGit(["rev-parse", "--git-path", "config.worktree"], path);
+  if (!resolved.ok || !resolved.stdout.trim()) {
+    throw new Error("could not resolve per-worktree Git config path");
+  }
+  const configPath = isAbsolute(resolved.stdout.trim())
+    ? resolve(resolved.stdout.trim())
+    : resolve(path, resolved.stdout.trim());
+  const rel = relative(resolve(commonDir), configPath);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error("per-worktree Git config path escapes the common Git directory");
+  }
+  return `${configPath}.lock`;
 }
 
 function withLeaseOperationLock<T>(
@@ -1010,7 +1070,7 @@ function insertPreparingLease(
   const db = getDb();
   const now = nowMs();
   const token = randomUUID();
-  const ttl = Math.max(1, options.ttlSeconds || DEFAULT_TTL_SECONDS);
+  const ttl = options.ttlSeconds ?? DEFAULT_TTL_SECONDS;
   db.query(`INSERT INTO worktree_leases (
     lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path, branch,
     owner, status, generation, fencing_token, idempotency_key, source, base_ref,
@@ -1068,6 +1128,10 @@ export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
   try {
     if (![options.repo, options.taskId, options.runId, options.machineId, options.owner].every(nonEmpty)) {
       return { ok: false, action: "claim", code: "missing_required_key", message: "repo, taskId, runId, machineId, and owner must be nonempty" };
+    }
+    if (options.ttlSeconds !== undefined) {
+      const invalidTtl = positiveSafeIntegerError("claim", "ttlSeconds", options.ttlSeconds);
+      if (invalidTtl) return invalidTtl;
     }
     const source = gitSourceFor(options);
     const canonicalRepo = canonicalizeRepo(options.repo);
@@ -1178,7 +1242,7 @@ function completePreparingLease(lease: WorktreeLease, options: ResolvedClaimWork
   if ("result" in claimed) return claimed.result;
   try {
     const head = createGitWorktree(options, claimed.lease.canonical_path);
-    return withGitMutationLocks(claimed.lease.canonical_path, claimed.lease.branch, () => {
+    return withGitMutationLocks(claimed.lease.canonical_path, claimed.lease.branch, claimed.lease.canonical_repo, () => {
       validateUrlTargetAgainstRemoteBase(options, claimed.lease.canonical_path, head);
       const git = inspectGitWorktree(claimed.lease.canonical_path);
       assertStableDefaultBranch(claimed.lease.canonical_path, options);
@@ -1333,6 +1397,10 @@ export function importWorktree(options: ImportWorktreeOptions): WorktreeResult {
         message: "path must be nonempty",
       };
     }
+    if (options.ttlSeconds !== undefined) {
+      const invalidTtl = positiveSafeIntegerError("import", "ttlSeconds", options.ttlSeconds);
+      if (invalidTtl) return invalidTtl;
+    }
     const canonicalRepo = canonicalizeRepo(options.repo);
     if (protectedBranch(options.branch)) {
       return { ok: false, action: "import", code: "protected_branch", message: `refusing protected branch import: ${options.branch}` };
@@ -1413,7 +1481,7 @@ function completePreparingImportLease(
   const claimed = claimPreparingCompletion(lease, "import", idempotent);
   if ("result" in claimed) return claimed.result;
   try {
-    return withGitMutationLocks(claimed.lease.canonical_path, claimed.lease.branch, () => {
+    return withGitMutationLocks(claimed.lease.canonical_path, claimed.lease.branch, canonicalRepo, () => {
       const git = inspectGitWorktree(claimed.lease.canonical_path);
       const blocking = safetyRefusals(git, undefined).filter((issue) => issue.code !== "unknown_owner");
       if (blocking.length > 0) throw new Error(`unsafe import: ${blocking.map((issue) => issue.code).join(",")}`);
@@ -1438,6 +1506,12 @@ function completePreparingImportLease(
 }
 
 export function renewWorktreeLease(options: FencedLeaseOptions & { ttlSeconds?: number }): WorktreeResult {
+  const invalidGeneration = positiveSafeIntegerError("renew", "generation", options.generation);
+  if (invalidGeneration) return invalidGeneration;
+  if (options.ttlSeconds !== undefined) {
+    const invalidTtl = positiveSafeIntegerError("renew", "ttlSeconds", options.ttlSeconds);
+    if (invalidTtl) return invalidTtl;
+  }
   const selector = conflictingSelector(options, "renew");
   if (selector) return selector;
   const lease = queryLeaseByIdOrPath(options);
@@ -1445,7 +1519,7 @@ export function renewWorktreeLease(options: FencedLeaseOptions & { ttlSeconds?: 
   const fence = checkFence(lease, options);
   if (fence) return { ok: false, action: "renew", code: fence.code, message: fence.message, lease };
   const now = nowMs();
-  const ttl = Math.max(1, options.ttlSeconds || DEFAULT_TTL_SECONDS);
+  const ttl = options.ttlSeconds ?? DEFAULT_TTL_SECONDS;
   const expiresAt = Math.max(lease.expires_at_ms + 1, now + ttl * 1000);
   const token = randomUUID();
   const result = getDb().query(`UPDATE worktree_leases SET generation = generation + 1, fencing_token = ?, expires_at_ms = ?, heartbeat_at_ms = ?, updated_at_ms = ?
@@ -1487,6 +1561,8 @@ export function verifyWorktree(options: { leaseId?: string; path?: string }): Wo
 }
 
 export function releaseWorktree(options: FencedLeaseOptions & { cleanup?: "none" | "quarantine" }): WorktreeResult {
+  const invalidGeneration = positiveSafeIntegerError("release", "generation", options.generation);
+  if (invalidGeneration) return invalidGeneration;
   const selector = conflictingSelector(options, "release");
   if (selector) return selector;
   const lease = queryLeaseByIdOrPath(options);
@@ -1775,7 +1851,7 @@ function completeReleaseCommit(locked: WorktreeLease, originalGit?: GitInspectio
     return { ok: false, action: "release", code: "release_plan_missing", message, lease: failed || locked };
   }
   try {
-    return withGitMutationLocks(locked.canonical_path, locked.branch, () => {
+    return withGitMutationLocks(locked.canonical_path, locked.branch, locked.canonical_repo, () => {
       const git = inspectGitWorktree(locked.canonical_path);
       const issues = safetyRefusals(git, locked, true);
       if (git.head_sha !== expectedHead) {
@@ -1891,7 +1967,7 @@ function finalizedReleaseProofMatches(lease: WorktreeLease): boolean {
 
 function resumeProvisionalRelease(lease: WorktreeLease): WorktreeResult {
   try {
-    return withGitMutationLocks(lease.canonical_path, lease.branch, () => {
+    return withGitMutationLocks(lease.canonical_path, lease.branch, lease.canonical_repo, () => {
       const git = inspectGitWorktree(lease.canonical_path);
       const expectedHead = lease.metadata["release_verified_head_sha"];
       if (!isGitObjectId(expectedHead)
@@ -2125,7 +2201,7 @@ function completeQuarantineCommit(
       throw new Error("quarantine commit proof is missing");
     }
     const safePath = assertQuarantineTarget(locked, path);
-    return withGitMutationLocks(safePath, locked.branch, () => {
+    return withGitMutationLocks(safePath, locked.branch, locked.canonical_repo, () => {
       const git = inspectGitWorktree(safePath);
       const issues = safetyRefusals(git, locked, true);
       if (git.head_sha !== expectedHead || !quarantineProofMatches(safePath, backupRef, expectedHead)) {
@@ -2442,7 +2518,7 @@ function resumeProvisionalQuarantine(lease: WorktreeLease): WorktreeResult {
   }
   const extraRefs = [canonicalBackupRef];
   try {
-    return withGitMutationLocks(lease.canonical_path, lease.branch, () => {
+    return withGitMutationLocks(lease.canonical_path, lease.branch, lease.canonical_repo, () => {
       const git = inspectGitWorktree(lease.canonical_path);
       const expectedHead = lease.metadata["verified_head_sha"];
       if (!isGitObjectId(expectedHead)
@@ -2766,8 +2842,11 @@ function remoteBranchIssues(git: GitInspection, lease: WorktreeLease): WorktreeI
 }
 
 export function inventoryWorktrees(options: InventoryOptions = {}) {
+  if (options.limit !== undefined && !isPositiveSafeInteger(options.limit)) {
+    throw new RangeError("limit must be a positive safe integer");
+  }
   const root = resolve(options.root || DEFAULT_ROOT());
-  const limit = Math.max(1, options.limit || 500);
+  const limit = options.limit ?? 500;
   const discovered = discoverGitWorktrees(root, limit).map((path) => {
     const lease = queryLeaseByIdOrPath({ path });
     return { path, lease, git: inspectGitWorktree(path) };

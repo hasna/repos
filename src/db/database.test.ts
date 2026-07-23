@@ -331,6 +331,160 @@ describe("database", () => {
     }
   });
 
+  it("keeps null or missing terminal proofs ownership-reserving and rejects them on reopen", () => {
+    const objectId = "a".repeat(40);
+    for (const scenario of [
+      {
+        name: "released-null-head",
+        status: "released",
+        headSha: null,
+        metadata: JSON.stringify({
+          release_finalized: true,
+          release_verified_head_sha: objectId,
+          release_finalized_at_ms: 1,
+        }),
+      },
+      {
+        name: "quarantined-missing-path",
+        status: "quarantined",
+        headSha: objectId,
+        metadata: JSON.stringify({
+          quarantine_finalized: true,
+          verified_head_sha: objectId,
+          backup_ref: "refs/hasna/worktrees/wt_invalid_terminal/1",
+          quarantine_finalized_at_ms: 1,
+        }),
+      },
+    ] as const) {
+      closeDb();
+      const dir = mkdtempSync(join(tmpdir(), `repos-terminal-null-${scenario.name}-`));
+      const path = join(dir, "repos.db");
+      const canonicalPath = `/tmp/${scenario.name}`;
+      const branch = `task/${scenario.name}`;
+      try {
+        const initial = getDb(path);
+        initial.query(`
+          INSERT INTO worktree_leases (
+            lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+            branch, owner, status, generation, fencing_token, head_sha,
+            expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+          ) VALUES (
+            'wt_invalid_terminal', 'hasna/repos', 'task-invalid', 'run-invalid',
+            'station01', ?, ?, 'owner', ?, 1, 'token-invalid', ?,
+            1, 1, 1, 1, ?
+          )
+        `).run(canonicalPath, branch, scenario.status, scenario.headSha, scenario.metadata);
+        closeDb();
+
+        expect(() => getDb(path)).toThrow("worktree lease terminal proof payload is missing or invalid");
+        closeDb();
+
+        const check = new Database(path);
+        const insertSuccessor = (
+          leaseId: string,
+          successorPath: string,
+          successorBranch: string,
+        ) => check.query(`
+          INSERT INTO worktree_leases (
+            lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+            branch, owner, status, generation, fencing_token,
+            expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+          ) VALUES (
+            ?, 'hasna/repos', 'task-successor', 'run-successor',
+            'station02', ?, ?, 'successor', 'active', 1, ?,
+            2, 2, 2, 2, '{}'
+          )
+        `).run(leaseId, successorPath, successorBranch, `${leaseId}:1`);
+
+        expect(() => insertSuccessor(
+          "wt_path_successor",
+          canonicalPath,
+          `${branch}-different`,
+        )).toThrow("UNIQUE constraint failed: worktree_leases.canonical_path");
+        expect(() => insertSuccessor(
+          "wt_branch_successor",
+          `${canonicalPath}-different`,
+          branch,
+        )).toThrow("UNIQUE constraint failed: worktree_leases.canonical_repo, worktree_leases.branch");
+        expect(check.query("SELECT lease_id FROM worktree_leases WHERE owner = 'successor'").all()).toEqual([]);
+        check.close();
+      } finally {
+        closeDb();
+        rmSync(dir, { recursive: true, force: true });
+        process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+        getDb(":memory:");
+      }
+    }
+  });
+
+  it("reopens provisional terminal rows without releasing their ownership", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-provisional-terminal-reopen-"));
+    const path = join(dir, "repos.db");
+    try {
+      const initial = getDb(path);
+      initial.exec(`
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token,
+          expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES
+          (
+            'wt_provisional_released', 'hasna/repos', 'task-release', 'run-release',
+            'station01', '/tmp/provisional-released', 'task/provisional-released',
+            'owner', 'released', 1, 'token-release',
+            1, 1, 1, 1, '{"release_finalized":false}'
+          ),
+          (
+            'wt_provisional_quarantined', 'hasna/repos', 'task-quarantine', 'run-quarantine',
+            'station01', '/tmp/provisional-quarantined', 'task/provisional-quarantined',
+            'owner', 'quarantined', 1, 'token-quarantine',
+            1, 1, 1, 1, '{}'
+          );
+      `);
+      closeDb();
+
+      const reopened = getDb(path);
+      expect(reopened.query(`
+        SELECT lease_id, status FROM worktree_leases
+        WHERE owner = 'owner' ORDER BY lease_id
+      `).all()).toEqual([
+        { lease_id: "wt_provisional_quarantined", status: "quarantined" },
+        { lease_id: "wt_provisional_released", status: "released" },
+      ]);
+      expect(() => reopened.query(`
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token,
+          expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES (
+          'wt_provisional_path_successor', 'hasna/repos', 'task-next', 'run-next',
+          'station02', '/tmp/provisional-released', 'task/different',
+          'successor', 'active', 1, 'token-next',
+          2, 2, 2, 2, '{}'
+        );
+      `).run()).toThrow("UNIQUE constraint failed: worktree_leases.canonical_path");
+      expect(() => reopened.query(`
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token,
+          expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES (
+          'wt_provisional_branch_successor', 'hasna/repos', 'task-next', 'run-next',
+          'station02', '/tmp/different', 'task/provisional-quarantined',
+          'successor', 'active', 1, 'token-next',
+          2, 2, 2, 2, '{}'
+        );
+      `).run()).toThrow("UNIQUE constraint failed: worktree_leases.canonical_repo, worktree_leases.branch");
+      expect(reopened.query("SELECT lease_id FROM worktree_leases WHERE owner = 'successor'").all()).toEqual([]);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
   it("rolls back version 21 when its marker trigger mutates any integrated row set", () => {
     for (const scenario of ["repo", "remote", "branch", "branch-audit", "worktree-lease"] as const) {
       closeDb();
