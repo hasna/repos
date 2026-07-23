@@ -940,14 +940,24 @@ const MIGRATIONS: Migration[] = [
         );
       }
 
-      const leases = db.query(`SELECT
-        lease_id, writer_generation, attempt, machine_id, status, created_at, updated_at
-        FROM task_worktree_leases ORDER BY lease_id`).all() as Array<{
+      const leases = db.query("SELECT * FROM task_worktree_leases ORDER BY lease_id").all() as Array<{
           lease_id: string;
+          repository: string;
+          repo_catalog_id: number;
+          task_id: string;
+          pr_group: string | null;
+          leaf: string | null;
+          branch: string;
+          worktree_path: string;
           writer_generation: string;
           attempt: string;
           machine_id: string;
           status: string;
+          head_sha: string | null;
+          cleanup_policy: string;
+          heartbeat_at: string | null;
+          lease_expires_at: string | null;
+          receipt_sequence: number;
           created_at: string;
           updated_at: string;
         }>;
@@ -1007,6 +1017,9 @@ const MIGRATIONS: Migration[] = [
       const insert = db.query(`INSERT INTO task_worktree_generations
         (lease_id, generation_sequence, writer_generation, attempt, machine_id, transition, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      const insertLegacyReuseReceipt = db.query(`INSERT INTO task_worktree_receipts
+        (receipt_id, lease_id, sequence, operation, outcome, ok, payload_json, created_at)
+        VALUES (?, ?, ?, 'recover', 'failed', 0, ?, ?)`);
       for (const lease of leases) {
         const candidates = histories.get(lease.lease_id) ?? [];
         if (["active", "cleanup_pending", "cleanup_blocked", "cleanup_failed", "cleaned"].includes(lease.status)) {
@@ -1019,10 +1032,18 @@ const MIGRATIONS: Migration[] = [
           });
         }
         const seen = new Set<string>();
+        let previousGeneration: string | null = null;
+        let legacyReuse = false;
         let sequence = 0;
         for (const candidate of candidates) {
-          if (seen.has(candidate.writer_generation)) continue;
+          if (candidate.writer_generation === previousGeneration) continue;
+          if (seen.has(candidate.writer_generation)) {
+            legacyReuse = true;
+            previousGeneration = candidate.writer_generation;
+            continue;
+          }
           seen.add(candidate.writer_generation);
+          previousGeneration = candidate.writer_generation;
           sequence += 1;
           insert.run(
             lease.lease_id,
@@ -1034,6 +1055,69 @@ const MIGRATIONS: Migration[] = [
             candidate.created_at,
           );
         }
+        if (!legacyReuse) continue;
+
+        const receiptMax = db.query(`SELECT COALESCE(MAX(sequence), 0) AS sequence
+          FROM task_worktree_receipts WHERE lease_id = ?`).get(lease.lease_id) as {
+          sequence: number;
+        };
+        const failureSequence = Math.max(lease.receipt_sequence, receiptMax.sequence) + 1;
+        db.query(`UPDATE task_worktree_leases SET
+          status = 'failed', lease_expires_at = NULL, receipt_sequence = ?, updated_at = ?
+          WHERE lease_id = ?`)
+          .run(failureSequence, lease.updated_at, lease.lease_id);
+        let policy: { pullRequest: "none" | "closed-or-merged" | "merged" } = {
+          pullRequest: "merged",
+        };
+        try {
+          const parsed = JSON.parse(lease.cleanup_policy) as { pullRequest?: string };
+          if (["none", "closed-or-merged", "merged"].includes(parsed.pullRequest ?? "none")) {
+            policy = {
+              pullRequest: (parsed.pullRequest ?? "none") as
+                "none" | "closed-or-merged" | "merged",
+            };
+          }
+        } catch {
+          // Preserve fail-closed cleanup semantics for corrupt legacy policy.
+        }
+        const receiptId = randomUUID();
+        const payload = {
+          schema: "repos.task-worktrees.receipt.v1",
+          capability: "repos.task-worktrees.v1",
+          available: true,
+          ok: false,
+          receipt_id: receiptId,
+          sequence: failureSequence,
+          operation: "recover",
+          outcome: "failed",
+          at: lease.updated_at,
+          migration_reason: "legacy_generation_reuse",
+          lease: {
+            lease_id: lease.lease_id,
+            repository: lease.repository,
+            repo_catalog_id: lease.repo_catalog_id,
+            task_id: lease.task_id,
+            pr_group: lease.pr_group,
+            leaf: lease.leaf,
+            branch: lease.branch,
+            worktree_path: lease.worktree_path,
+            machine_id: lease.machine_id,
+            writer_generation: lease.writer_generation,
+            attempt: lease.attempt,
+            status: "failed",
+            head_sha: lease.head_sha,
+            cleanup_policy: policy,
+            heartbeat_at: lease.heartbeat_at,
+            lease_expires_at: null,
+          },
+        };
+        insertLegacyReuseReceipt.run(
+          receiptId,
+          lease.lease_id,
+          failureSequence,
+          JSON.stringify(payload),
+          lease.updated_at,
+        );
       }
     },
   },

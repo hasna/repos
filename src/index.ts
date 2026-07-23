@@ -93,6 +93,7 @@ export type {
   TaskWorktreeIdentity,
   TaskWorktreeOperation,
   TaskWorktreeOutcome,
+  TaskWorktreePullRequestResult,
   TaskWorktreeReceipt,
   TaskWorktreeSelector,
   TaskWorktreeServiceOptions,

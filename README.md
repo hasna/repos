@@ -92,9 +92,14 @@ Create-or-adopt is idempotent only for the complete identity, including its
 cleanup/PR policy. A conflicting repository, task, branch, path, policy, or
 active writer emits a stable collision receipt. A durable reservation receipt
 is committed before filesystem provisioning, so receipt failure cannot strand
-an unreceipted provisioning lease. Heartbeat, transfer, recovery, and cleanup
-require exact generation, attempt, and machine fencing; an expired writer must
-use recovery, and a transferred or recovered generation can never be reused.
+an unreceipted provisioning lease. An interrupted provisioning reservation can
+be resumed by the exact writer, or explicitly recovered with a fresh generation;
+an occupied path is adopted only when its repository and branch identity still
+match. Heartbeat, transfer, recovery, and cleanup require exact generation,
+attempt, and machine fencing; an expired writer must use recovery, and a
+transferred or recovered generation can never be reused. Legacy databases with
+non-consecutive writer-generation reuse are migrated to a durable failed state
+instead of silently reauthorizing an ABA generation.
 
 Lease-ID operations accept optional `--task-id`, `--path`, `--repo`, and
 `--branch` assertions. Every supplied selector must match the authoritative
@@ -107,8 +112,13 @@ reports `available: true`, every operational failure is a
 
 Cleanup first retires the exact fenced writer, then verifies path containment,
 a clean worktree/index, an exact pushed `origin/<branch>`, provider reachability
-of the same commit, and any configured pull-request policy. Every failed gate
-is returned explicitly and the worktree remains in a recoverable blocked state.
+of the same commit, and any configured pull-request policy. Configured PR policy
+requires the authoritative PR result to name that exact commit; missing,
+ambiguous, stale, or mismatched PR-head evidence blocks cleanup. Successful gate
+evidence is committed before filesystem removal, and final deletion is committed
+after the path is absent, so interruption or receipt failure has one exact retry
+route without a receipt falsely claiming deletion. Every failed gate is returned
+explicitly and the worktree remains in a recoverable blocked or failed state.
 
 ### Primary registry relocation
 

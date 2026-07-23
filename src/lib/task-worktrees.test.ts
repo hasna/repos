@@ -29,9 +29,15 @@ class FakeGit implements TaskWorktreeGitAdapter {
   readonly states = new Map<string, TaskWorktreeGitState>();
   readonly provider = new Map<string, string>();
   prState: "open" | "closed" | "merged" | "absent" | "unreachable" = "absent";
+  prHead: string | null = null;
+  readonly prResults: Array<{
+    state: "open" | "closed" | "merged" | "absent" | "unreachable";
+    head_sha: string | null;
+  }> = [];
   providerFailure = false;
   dirtyAfterInspectCount: number | null = null;
   beforeCreate: (() => void) | null = null;
+  cleanupFailure = false;
   private readonly inspectCounts = new Map<string, number>();
   createCount = 0;
   cleanupCount = 0;
@@ -85,8 +91,18 @@ class FakeGit implements TaskWorktreeGitAdapter {
     return this.prState;
   }
 
+  pullRequestResult() {
+    const queued = this.prResults.shift();
+    if (queued) return queued;
+    return {
+      state: this.prState,
+      head_sha: this.prHead,
+    };
+  }
+
   cleanup(path: string): void {
     this.cleanupCount += 1;
+    if (this.cleanupFailure) throw new Error("injected filesystem cleanup failure");
     this.states.delete(path);
     rmSync(path, { recursive: true, force: false });
   }
@@ -150,6 +166,143 @@ describe("task worktree lifecycle", () => {
       ttlSeconds: 30,
     };
   });
+
+  function seedProvisioning(options: {
+    pathPresent?: boolean;
+    receiptPresent?: boolean;
+    repository?: string;
+    branch?: string;
+  } = {}): { leaseId: string; path: string } {
+    const repository = options.repository ?? "hasna/repos";
+    const branch = options.branch ?? "feat/task-one";
+    const leaseId = "lease-provisioning";
+    const path = join(root, "repos", "task-one");
+    mkdirSync(join(root, "repos"), { recursive: true });
+    if (options.pathPresent) {
+      mkdirSync(path);
+      git.states.set(path, {
+        root: realpathSync(path),
+        repository,
+        branch,
+        head: HEAD,
+        clean: true,
+        upstream: null,
+        upstreamHead: null,
+      });
+    }
+    const receiptSequence = options.receiptPresent === false ? 0 : 1;
+    db.query(`INSERT INTO task_worktree_leases (
+      lease_id, repository, repo_catalog_id, task_id, pr_group, leaf, branch,
+      worktree_path, machine_id, writer_generation, attempt, status, head_sha,
+      cleanup_policy, heartbeat_at, lease_expires_at, receipt_sequence, created_at, updated_at
+    ) VALUES (?, 'hasna/repos', 1, 'task-1', 'pr-group-1', 'leaf-1', 'feat/task-one',
+      ?, 'machine-a', 'generation-1', 'attempt-1', 'provisioning', NULL,
+      '{"pullRequest":"none"}', ?, ?, ?, ?, ?)`)
+      .run(
+        leaseId,
+        path,
+        now.toISOString(),
+        new Date(now.getTime() + 30_000).toISOString(),
+        receiptSequence,
+        now.toISOString(),
+        now.toISOString(),
+      );
+    if (receiptSequence === 1) {
+      const payload = {
+        schema: TASK_WORKTREE_RECEIPT_SCHEMA,
+        capability: TASK_WORKTREE_CAPABILITY,
+        available: true,
+        ok: true,
+        receipt_id: "receipt-reserved",
+        sequence: 1,
+        operation: "create_or_adopt",
+        outcome: "reserved",
+        at: now.toISOString(),
+        lease: {
+          lease_id: leaseId,
+          repository: "hasna/repos",
+          repo_catalog_id: 1,
+          task_id: "task-1",
+          pr_group: "pr-group-1",
+          leaf: "leaf-1",
+          branch: "feat/task-one",
+          worktree_path: path,
+          machine_id: "machine-a",
+          writer_generation: "generation-1",
+          attempt: "attempt-1",
+          status: "provisioning",
+          head_sha: null,
+          cleanup_policy: { pullRequest: "none" },
+          heartbeat_at: now.toISOString(),
+          lease_expires_at: new Date(now.getTime() + 30_000).toISOString(),
+        },
+      };
+      db.query(`INSERT INTO task_worktree_receipts
+        (receipt_id, lease_id, sequence, operation, outcome, ok, payload_json, created_at)
+        VALUES ('receipt-reserved', ?, 1, 'create_or_adopt', 'reserved', 1, ?, ?)`)
+        .run(leaseId, JSON.stringify(payload), now.toISOString());
+    }
+    return { leaseId, path };
+  }
+
+  function prepareCleanupCrash(
+    leaseId: string,
+    path: string,
+    includePreparedReceipt: boolean,
+  ): void {
+    db.query(`UPDATE task_worktree_leases SET
+      status = 'cleanup_pending', lease_expires_at = NULL, updated_at = ?
+      WHERE lease_id = ?`)
+      .run(now.toISOString(), leaseId);
+    if (!includePreparedReceipt) return;
+    const row = db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?")
+      .get(leaseId) as Record<string, unknown>;
+    const sequence = Number(row["receipt_sequence"]) + 1;
+    db.query("UPDATE task_worktree_leases SET receipt_sequence = ? WHERE lease_id = ?")
+      .run(sequence, leaseId);
+    const payload = {
+      schema: TASK_WORKTREE_RECEIPT_SCHEMA,
+      capability: TASK_WORKTREE_CAPABILITY,
+      available: true,
+      ok: true,
+      receipt_id: "receipt-cleanup-prepared",
+      sequence,
+      operation: "cleanup",
+      outcome: "eligible",
+      at: now.toISOString(),
+      lease: {
+        lease_id: leaseId,
+        repository: "hasna/repos",
+        repo_catalog_id: 1,
+        task_id: "task-1",
+        pr_group: "pr-group-1",
+        leaf: "leaf-1",
+        branch: "feat/task-one",
+        worktree_path: path,
+        machine_id: "machine-a",
+        writer_generation: "generation-1",
+        attempt: "attempt-1",
+        status: "cleanup_pending",
+        head_sha: HEAD,
+        cleanup_policy: { pullRequest: "none" },
+        heartbeat_at: now.toISOString(),
+        lease_expires_at: null,
+      },
+      gates: [
+        { id: "path_contained", passed: true, detail: "canonical path verified" },
+        { id: "writer_retired", passed: true, detail: "writer retired" },
+        { id: "worktree_clean", passed: true, detail: "worktree clean" },
+        { id: "branch_pushed", passed: true, detail: "branch pushed" },
+        { id: "provider_reachable", passed: true, detail: "head reachable" },
+        { id: "pull_request_policy", passed: true, detail: "policy none" },
+      ],
+      pull_request: { state: "absent", head_sha: null },
+    };
+    db.query(`INSERT INTO task_worktree_receipts
+      (receipt_id, lease_id, sequence, operation, outcome, ok, payload_json, created_at)
+      VALUES ('receipt-cleanup-prepared', ?, ?, 'cleanup', 'eligible', 1, ?, ?)`)
+      .run(leaseId, sequence, JSON.stringify(payload), now.toISOString());
+  }
 
   afterEach(() => {
     db.close();
@@ -381,6 +534,108 @@ describe("task worktree lifecycle", () => {
     });
     expect(git.createCount).toBe(1);
     expect(db.query("SELECT count(*) AS count FROM task_worktree_generations").get()).toEqual({ count: 1 });
+  });
+
+  it.each([
+    { name: "reservation-only with its receipt", pathPresent: false, receiptPresent: true },
+    { name: "reservation-only without its receipt", pathPresent: false, receiptPresent: false },
+    { name: "filesystem-present with its receipt", pathPresent: true, receiptPresent: true },
+    { name: "filesystem-present without its receipt", pathPresent: true, receiptPresent: false },
+  ])("reconciles an exact $name provisioning retry idempotently", ({ pathPresent, receiptPresent }) => {
+    const seeded = seedProvisioning({ pathPresent, receiptPresent });
+
+    const reconciled = service.createOrAdopt(base);
+
+    expect(reconciled).toMatchObject({
+      ok: true,
+      outcome: pathPresent ? "adopted" : "created",
+      lease: {
+        lease_id: seeded.leaseId,
+        status: "active",
+        writer_generation: "generation-1",
+        attempt: "attempt-1",
+      },
+    });
+    expect(git.createCount).toBe(pathPresent ? 0 : 1);
+    expect(db.query(`SELECT count(*) AS count FROM task_worktree_receipts
+      WHERE lease_id = ? AND outcome = 'reserved'`).get(seeded.leaseId)).toEqual({ count: 1 });
+    expect(db.query(`SELECT writer_generation FROM task_worktree_generations
+      WHERE lease_id = ?`).get(seeded.leaseId)).toEqual({ writer_generation: "generation-1" });
+  });
+
+  it("fails a provisioning retry closed with a durable receipt and preserves mismatched work", () => {
+    const seeded = seedProvisioning({
+      pathPresent: true,
+      receiptPresent: true,
+      branch: "feat/not-the-lease",
+    });
+
+    const collision = expectCode(() => service.createOrAdopt(base), "WORKTREE_COLLISION");
+
+    expect(collision.receipt).toMatchObject({
+      ok: false,
+      operation: "create_or_adopt",
+      outcome: "collision",
+      lease: { status: "failed" },
+    });
+    expect(db.query("SELECT status FROM task_worktree_leases WHERE lease_id = ?")
+      .get(seeded.leaseId)).toEqual({ status: "failed" });
+    expect(git.states.has(seeded.path)).toBe(true);
+    expect(git.cleanupCount).toBe(0);
+  });
+
+  it.each([
+    { name: "reservation-only", pathPresent: false, expectedStatus: "provisioning" },
+    { name: "filesystem-present", pathPresent: true, expectedStatus: "active" },
+  ])("explicitly recovers a $name provisioning interruption with a fresh generation", ({
+    pathPresent,
+    expectedStatus,
+  }) => {
+    const seeded = seedProvisioning({ pathPresent, receiptPresent: true });
+
+    const recovered = service.recover({
+      leaseId: seeded.leaseId,
+      observedWriterGeneration: "generation-1",
+      observedAttempt: "attempt-1",
+      newWriterGeneration: "generation-2",
+      newAttempt: "attempt-2",
+      newMachineId: "machine-b",
+      ttlSeconds: 30,
+    });
+
+    expect(recovered).toMatchObject({
+      ok: true,
+      operation: "recover",
+      outcome: "recovered",
+      lease: {
+        status: expectedStatus,
+        writer_generation: "generation-2",
+        attempt: "attempt-2",
+        machine_id: "machine-b",
+      },
+      transition: {
+        from_generation: "generation-1",
+        to_generation: "generation-2",
+      },
+    });
+    expectCode(() => service.heartbeat({
+      leaseId: seeded.leaseId,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    }), "STALE_WRITER");
+    if (!pathPresent) {
+      expect(service.createOrAdopt({
+        ...base,
+        writerGeneration: "generation-2",
+        attempt: "attempt-2",
+        machineId: "machine-b",
+      })).toMatchObject({
+        ok: true,
+        outcome: "created",
+        lease: { status: "active", writer_generation: "generation-2" },
+      });
+    }
   });
 
   it("retires an active lease when idempotent adoption finds divergent filesystem identity", () => {
@@ -814,11 +1069,12 @@ describe("task worktree lifecycle", () => {
     });
     const path = created.lease!.worktree_path;
     git.update(path, {
+      head: OTHER_HEAD,
       clean: true,
       upstream: "origin/feat/task-one",
-      upstreamHead: HEAD,
+      upstreamHead: OTHER_HEAD,
     });
-    git.provider.set("hasna/repos:feat/task-one", HEAD);
+    git.provider.set("hasna/repos:feat/task-one", OTHER_HEAD);
     git.prState = "open";
     const blocked = service.cleanup({
       leaseId: created.lease!.lease_id,
@@ -853,6 +1109,7 @@ describe("task worktree lifecycle", () => {
     });
     git.provider.set("hasna/repos:feat/task-one", HEAD);
     git.prState = "merged";
+    git.prHead = HEAD;
     const cleaned = service.cleanup({
       leaseId: created.lease!.lease_id,
       writerGeneration: "generation-1",
@@ -865,6 +1122,291 @@ describe("task worktree lifecycle", () => {
     expect(git.cleanupCount).toBe(1);
     expect(db.query("SELECT payload_json FROM task_worktree_receipts WHERE receipt_id = ?").get(cleaned.receipt_id))
       .toEqual({ payload_json: JSON.stringify(cleaned) });
+    expect(cleaned).toMatchObject({
+      pull_request: { state: "merged", head_sha: HEAD },
+    });
+  });
+
+  it("binds configured PR policy to the exact cleanup head", () => {
+    const created = service.createOrAdopt({
+      ...base,
+      cleanupPolicy: { pullRequest: "merged" },
+    });
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      head: OTHER_HEAD,
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: OTHER_HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", OTHER_HEAD);
+    git.prState = "merged";
+    git.prHead = HEAD;
+
+    const blocked = service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    });
+
+    expect(blocked).toMatchObject({
+      ok: false,
+      outcome: "blocked",
+      lease: { status: "cleanup_blocked" },
+      pull_request: { state: "merged", head_sha: HEAD },
+    });
+    expect(blocked.gates).toContainEqual(expect.objectContaining({
+      id: "pull_request_policy",
+      passed: false,
+    }));
+    expect(git.cleanupCount).toBe(0);
+    expect(git.states.has(path)).toBe(true);
+  });
+
+  it.each([
+    { name: "missing head", state: "merged" as const, head: null },
+    { name: "unreachable result", state: "unreachable" as const, head: null },
+    { name: "open exact head", state: "open" as const, head: HEAD },
+  ])("fails cleanup closed for $name PR evidence", ({ state, head }) => {
+    const created = service.createOrAdopt({
+      ...base,
+      cleanupPolicy: { pullRequest: "merged" },
+    });
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", HEAD);
+    git.prState = state;
+    git.prHead = head;
+
+    const blocked = service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    });
+
+    expect(blocked.outcome).toBe("blocked");
+    expect(blocked.gates).toContainEqual(expect.objectContaining({
+      id: "pull_request_policy",
+      passed: false,
+    }));
+    expect(git.cleanupCount).toBe(0);
+  });
+
+  it("blocks cleanup when exact PR-head evidence changes during final revalidation", () => {
+    const created = service.createOrAdopt({
+      ...base,
+      cleanupPolicy: { pullRequest: "merged" },
+    });
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", HEAD);
+    git.prResults.push(
+      { state: "merged", head_sha: HEAD },
+      { state: "merged", head_sha: OTHER_HEAD },
+    );
+
+    const blocked = service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    });
+
+    expect(blocked).toMatchObject({
+      ok: false,
+      outcome: "blocked",
+      pull_request: { state: "merged", head_sha: OTHER_HEAD },
+    });
+    expect(blocked.gates).toContainEqual(expect.objectContaining({
+      id: "pull_request_policy",
+      passed: false,
+    }));
+    expect(git.cleanupCount).toBe(0);
+  });
+
+  it("does not touch the filesystem when durable cleanup preparation fails", () => {
+    const created = service.createOrAdopt(base);
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", HEAD);
+    db.exec(`
+      CREATE TRIGGER task_worktree_cleanup_preparation_failure
+      BEFORE INSERT ON task_worktree_receipts
+      WHEN NEW.operation = 'cleanup' AND NEW.outcome = 'eligible'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected cleanup preparation failure');
+      END;
+    `);
+
+    expectCode(() => service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    }), "CLEANUP_FAILED");
+
+    expect(git.cleanupCount).toBe(0);
+    expect(git.states.has(path)).toBe(true);
+    expect(db.query("SELECT status FROM task_worktree_leases WHERE lease_id = ?")
+      .get(created.lease!.lease_id)).toEqual({ status: "cleanup_pending" });
+    db.exec("DROP TRIGGER task_worktree_cleanup_preparation_failure");
+    expect(service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    })).toMatchObject({ ok: true, outcome: "cleaned" });
+  });
+
+  it("records a durable terminal state when filesystem cleanup fails", () => {
+    const created = service.createOrAdopt(base);
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", HEAD);
+    git.cleanupFailure = true;
+
+    const failed = expectCode(() => service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    }), "CLEANUP_FAILED");
+
+    expect(failed.receipt).toMatchObject({
+      ok: false,
+      operation: "cleanup",
+      outcome: "failed",
+      lease: { status: "cleanup_failed" },
+    });
+    expect(git.states.has(path)).toBe(true);
+    expect(db.query("SELECT status FROM task_worktree_leases WHERE lease_id = ?")
+      .get(created.lease!.lease_id)).toEqual({ status: "cleanup_failed" });
+  });
+
+  it("recovers final cleanup receipt failure without falsely claiming deletion", () => {
+    const created = service.createOrAdopt(base);
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      head: OTHER_HEAD,
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: OTHER_HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", OTHER_HEAD);
+    db.exec(`
+      CREATE TRIGGER task_worktree_cleaned_receipt_failure
+      BEFORE INSERT ON task_worktree_receipts
+      WHEN NEW.outcome = 'cleaned'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected cleaned receipt failure');
+      END;
+    `);
+
+    const failed = expectCode(() => service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    }), "CLEANUP_FAILED");
+
+    expect(failed.receipt).toMatchObject({
+      operation: "cleanup",
+      outcome: "eligible",
+      lease: { status: "cleanup_pending", head_sha: OTHER_HEAD },
+    });
+    expect(git.cleanupCount).toBe(1);
+    expect(db.query("SELECT status FROM task_worktree_leases WHERE lease_id = ?")
+      .get(created.lease!.lease_id)).toEqual({ status: "cleanup_pending" });
+    expect(db.query(`SELECT count(*) AS count FROM task_worktree_receipts
+      WHERE lease_id = ? AND outcome = 'cleaned'`).get(created.lease!.lease_id)).toEqual({ count: 0 });
+
+    expect(service.status({ leaseId: created.lease!.lease_id })).toMatchObject({
+      operation: "status",
+      lease: { status: "cleanup_pending" },
+    });
+    db.exec("DROP TRIGGER task_worktree_cleaned_receipt_failure");
+    const reconciled = service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    });
+    expect(reconciled).toMatchObject({
+      ok: true,
+      outcome: "cleaned",
+      lease: { status: "cleaned" },
+    });
+    expect(git.cleanupCount).toBe(1);
+  });
+
+  it("resumes a prepared cleanup after interruption before filesystem removal", () => {
+    const created = service.createOrAdopt(base);
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", HEAD);
+    prepareCleanupCrash(created.lease!.lease_id, path, true);
+
+    const reconciled = service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    });
+
+    expect(reconciled).toMatchObject({
+      ok: true,
+      outcome: "cleaned",
+      lease: { status: "cleaned" },
+    });
+    expect(git.cleanupCount).toBe(1);
+  });
+
+  it("records a truthful terminal failure when a cleanup_pending path is absent without prepared evidence", () => {
+    const created = service.createOrAdopt(base);
+    const path = created.lease!.worktree_path;
+    prepareCleanupCrash(created.lease!.lease_id, path, false);
+    git.states.delete(path);
+    rmSync(path, { recursive: true });
+
+    const failed = expectCode(() => service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    }), "CLEANUP_FAILED");
+
+    expect(failed.receipt).toMatchObject({
+      ok: false,
+      operation: "cleanup",
+      outcome: "failed",
+      lease: { status: "cleanup_failed" },
+    });
+    expect(db.query("SELECT status FROM task_worktree_leases WHERE lease_id = ?")
+      .get(created.lease!.lease_id)).toEqual({ status: "cleanup_failed" });
+    expect(db.query(`SELECT count(*) AS count FROM task_worktree_receipts
+      WHERE lease_id = ? AND outcome = 'cleaned'`).get(created.lease!.lease_id)).toEqual({ count: 0 });
   });
 
   it("emits cleanup eligibility without deleting the worktree", () => {

@@ -327,12 +327,53 @@ describe("database", () => {
         "2026-07-23T12:02:00.000Z",
         "2026-07-23T12:02:00.000Z",
       );
+    legacy.query(`INSERT INTO task_worktree_leases
+      (lease_id, repository, repo_catalog_id, task_id, pr_group, leaf, branch,
+       worktree_path, machine_id, writer_generation, attempt, status, head_sha,
+       cleanup_policy, heartbeat_at, lease_expires_at, receipt_sequence, created_at, updated_at)
+      VALUES (
+        'lease-aba', 'hasna/repos', 1, 'task-aba', NULL, NULL, 'feat/task-aba',
+        '/tmp/repos/task-aba', 'machine-a-returned', 'generation-1', 'attempt-3',
+        'active', NULL, '{"pullRequest":"none"}', ?, ?, 3, ?, ?
+      )`)
+      .run(
+        "2026-07-23T12:03:00.000Z",
+        "2026-07-23T12:18:00.000Z",
+        "2026-07-23T12:00:00.000Z",
+        "2026-07-23T12:03:00.000Z",
+      );
+    for (const [receiptId, sequence, operation, generation, attempt, machine, createdAt] of [
+      ["receipt-aba-1", 1, "create_or_adopt", "generation-1", "attempt-1", "machine-a", "2026-07-23T12:00:00.000Z"],
+      ["receipt-aba-2", 2, "transfer", "generation-2", "attempt-2", "machine-b", "2026-07-23T12:01:00.000Z"],
+      ["receipt-aba-3", 3, "recover", "generation-1", "attempt-3", "machine-a-returned", "2026-07-23T12:03:00.000Z"],
+    ] as const) {
+      legacy.query(`INSERT INTO task_worktree_receipts
+        (receipt_id, lease_id, sequence, operation, outcome, ok, payload_json, created_at)
+        VALUES (?, 'lease-aba', ?, ?, ?, 1, ?, ?)`)
+        .run(
+          receiptId,
+          sequence,
+          operation,
+          operation === "create_or_adopt" ? "created" : operation === "transfer" ? "transferred" : "recovered",
+          JSON.stringify({
+            outcome: operation === "create_or_adopt" ? "created" : operation === "transfer" ? "transferred" : "recovered",
+            lease: {
+              writer_generation: generation,
+              attempt,
+              machine_id: machine,
+              status: "active",
+            },
+          }),
+          createdAt,
+        );
+    }
 
     try {
       migrateDb(legacy);
       expect(legacy.query(`SELECT
         generation_sequence, writer_generation, attempt, machine_id, transition
         FROM task_worktree_generations
+        WHERE lease_id = 'lease-1'
         ORDER BY generation_sequence`).all()).toEqual([
         {
           generation_sequence: 1,
@@ -366,6 +407,28 @@ describe("database", () => {
         FROM task_worktree_generations WHERE lease_id = 'lease-2'`).get()).toEqual({
         count: 0,
       });
+      expect(legacy.query(`SELECT status, lease_expires_at, receipt_sequence
+        FROM task_worktree_leases WHERE lease_id = 'lease-aba'`).get()).toEqual({
+        status: "failed",
+        lease_expires_at: null,
+        receipt_sequence: 4,
+      });
+      expect(legacy.query(`SELECT generation_sequence, writer_generation
+        FROM task_worktree_generations WHERE lease_id = 'lease-aba'
+        ORDER BY generation_sequence`).all()).toEqual([
+        { generation_sequence: 1, writer_generation: "generation-1" },
+        { generation_sequence: 2, writer_generation: "generation-2" },
+      ]);
+      expect(legacy.query(`SELECT outcome, ok, payload_json
+        FROM task_worktree_receipts
+        WHERE lease_id = 'lease-aba' AND sequence = 4`).get()).toEqual({
+        outcome: "failed",
+        ok: 0,
+        payload_json: expect.stringContaining('"migration_reason":"legacy_generation_reuse"'),
+      });
+      migrateDb(legacy);
+      expect(legacy.query(`SELECT count(*) AS count FROM task_worktree_receipts
+        WHERE lease_id = 'lease-aba' AND outcome = 'failed'`).get()).toEqual({ count: 1 });
       expect(legacy.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       legacy.close();
