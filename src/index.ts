@@ -68,6 +68,37 @@ export type {
 export { getReposStatus } from "./lib/status.js";
 export type { ReposStatusContract } from "./lib/status.js";
 export {
+  TASK_WORKTREE_CAPABILITY,
+  TASK_WORKTREE_CAPABILITY_SCHEMA,
+  TASK_WORKTREE_ERROR_SCHEMA,
+  TASK_WORKTREE_RECEIPT_SCHEMA,
+  TaskWorktreeError,
+  TaskWorktreeService,
+  createTaskWorktreeService,
+  defaultTaskWorktreeGitAdapter,
+  getTaskWorktreeCapabilities,
+} from "./lib/task-worktrees.js";
+export type {
+  CleanupPolicy,
+  CleanupTaskWorktreeOptions,
+  CreateOrAdoptTaskWorktreeOptions,
+  FencedTaskWorktreeOptions,
+  RecoverTaskWorktreeOptions,
+  TaskWorktreeCapabilities,
+  TaskWorktreeErrorCode,
+  TaskWorktreeErrorEnvelope,
+  TaskWorktreeGate,
+  TaskWorktreeGitAdapter,
+  TaskWorktreeGitState,
+  TaskWorktreeIdentity,
+  TaskWorktreeOperation,
+  TaskWorktreeOutcome,
+  TaskWorktreeReceipt,
+  TaskWorktreeServiceOptions,
+  TaskWorktreeStatus,
+  TransferTaskWorktreeOptions,
+} from "./lib/task-worktrees.js";
+export {
   getDocsDrift,
   getPackageDrift,
   getPackageHealth,

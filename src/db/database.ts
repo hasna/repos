@@ -779,4 +779,61 @@ const MIGRATIONS: Migration[] = [
         ON branch_adjudication_audit(created_at);
     `,
   },
+  {
+    version: 12,
+    sql: `
+      CREATE TABLE IF NOT EXISTS task_worktree_leases (
+        lease_id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        repo_catalog_id INTEGER NOT NULL,
+        task_id TEXT NOT NULL,
+        pr_group TEXT,
+        leaf TEXT,
+        branch TEXT NOT NULL,
+        worktree_path TEXT NOT NULL UNIQUE,
+        machine_id TEXT NOT NULL,
+        writer_generation TEXT NOT NULL,
+        attempt TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN (
+            'provisioning', 'active', 'cleanup_pending', 'cleanup_blocked',
+            'cleanup_failed', 'cleaned', 'failed'
+          )
+        ),
+        head_sha TEXT,
+        cleanup_policy TEXT NOT NULL DEFAULT '{"pullRequest":"none"}',
+        heartbeat_at TEXT,
+        lease_expires_at TEXT,
+        receipt_sequence INTEGER NOT NULL DEFAULT 0 CHECK (receipt_sequence >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_task_worktree_active_branch
+        ON task_worktree_leases(repository, branch)
+        WHERE status <> 'cleaned';
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_task_worktree_active_task
+        ON task_worktree_leases(task_id)
+        WHERE status <> 'cleaned';
+
+      CREATE INDEX IF NOT EXISTS idx_task_worktree_task
+        ON task_worktree_leases(task_id, updated_at);
+
+      CREATE TABLE IF NOT EXISTS task_worktree_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        lease_id TEXT REFERENCES task_worktree_leases(lease_id) ON DELETE RESTRICT,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        operation TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        ok INTEGER NOT NULL CHECK (ok IN (0, 1)),
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(lease_id, sequence)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_worktree_receipts_lease
+        ON task_worktree_receipts(lease_id, sequence);
+    `,
+  },
 ];

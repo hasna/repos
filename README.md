@@ -68,8 +68,41 @@ repos-serve  # http://localhost:19450
 | `repos ops workspace-worktree-hygiene` | Scan workspace repos for stale, dirty, detached, or missing loop worktrees |
 | `repos ops task-route-health` | Check that task-created lifecycle router loops are active and recently succeeding |
 | `repos ops protected-release` | Emit a protected release task only when release-candidate gates are green |
+| `repos worktrees capabilities` | Discover the Repos-owned task-worktree contract |
+| `repos worktrees create-or-adopt` | Idempotently create or adopt a canonical task worktree |
+| `repos worktrees show` / `status` | Read persisted lease and worktree identity |
+| `repos worktrees heartbeat` / `renew` | Renew the exact writer generation and attempt |
+| `repos worktrees transfer` / `recover` | Fence a previous writer and move or recover ownership |
+| `repos worktrees cleanup` | Fail closed on clean, pushed, reachable, writer, and PR gates |
 
 Legacy list/search/status commands support `--json` for machine-readable output.
+
+### Task worktree lifecycle
+
+`repos worktrees` is a JSON-first CLI and SDK lifecycle owned by Repos. Its
+SQLite records bind repository, Todos task, optional deterministic PR-group and
+leaf identities, branch, canonical path, machine, writer generation, and
+attempt. The canonical resolver is:
+
+```text
+$HOME/.hasna/repos/worktrees/<repo-name>/<task-worktree-name>
+```
+
+Create-or-adopt is idempotent only for the complete identity. A conflicting
+repository, task, branch, path, or active writer emits a stable collision
+receipt. Heartbeat, transfer, recovery, and cleanup require exact generation,
+attempt, and machine fencing; a transferred or recovered predecessor cannot
+mutate the lifecycle.
+
+Consumers must probe `repos worktrees capabilities` before using a direct Git
+fallback. A missing command means the capability is absent. Once the capability
+reports `available: true`, every operational failure is a
+`repos.task-worktrees.error.v1` envelope and must not trigger fallback.
+
+Cleanup first retires the exact fenced writer, then verifies path containment,
+a clean worktree/index, an exact pushed `origin/<branch>`, provider reachability
+of the same commit, and any configured pull-request policy. Every failed gate
+is returned explicitly and the worktree remains in a recoverable blocked state.
 
 ### Primary registry relocation
 

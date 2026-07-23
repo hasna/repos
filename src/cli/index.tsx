@@ -68,6 +68,12 @@ import {
   withTodos,
 } from "../lib/repo-ops.js";
 import { getNoCloudInventory } from "../lib/no-cloud-inventory.js";
+import {
+  TaskWorktreeError,
+  createTaskWorktreeService,
+  getTaskWorktreeCapabilities,
+  type FencedTaskWorktreeOptions,
+} from "../lib/task-worktrees.js";
 
 const ORG_ALIASES: Record<string, string> = {
   oss: "hasna",
@@ -95,6 +101,7 @@ const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set([
   "no-cloud",
   "release-health",
   "registry",
+  "worktrees",
 ]);
 
 program
@@ -148,6 +155,52 @@ function csvFlag(value: string | undefined): string[] | undefined {
 
 function printOpsJson(report: unknown, pretty?: boolean) {
   console.log(JSON.stringify(report, null, pretty ? 2 : 0));
+}
+
+function taskWorktreeAction(action: () => unknown, pretty?: boolean) {
+  try {
+    const result = action();
+    printOpsJson(result, pretty);
+    if (
+      result
+      && typeof result === "object"
+      && "ok" in result
+      && (result as { ok?: unknown }).ok === false
+    ) {
+      process.exitCode = 2;
+    }
+  } catch (error) {
+    const envelope = error instanceof TaskWorktreeError
+      ? error.toJSON()
+      : new TaskWorktreeError("CAPABILITY_OPERATION_FAILED", "task worktree operation failed").toJSON();
+    printOpsJson(envelope, pretty);
+    process.exitCode = 2;
+  }
+}
+
+function addTaskWorktreeSelector(command: any) {
+  return command
+    .option("--lease-id <id>", "Exact task worktree lease ID")
+    .option("--path <path>", "Exact canonical worktree path")
+    .option("--task-id <id>", "Exact Todos task ID");
+}
+
+function addTaskWorktreeFence(command: any) {
+  return addTaskWorktreeSelector(command)
+    .requiredOption("--writer-generation <generation>", "Current writer lease generation")
+    .requiredOption("--attempt <attempt>", "Current dispatch attempt or nonce")
+    .option("--machine <id>", "Current machine identity");
+}
+
+function taskWorktreeFence(opts: any): FencedTaskWorktreeOptions {
+  return {
+    leaseId: opts.leaseId,
+    worktreePath: opts.path,
+    taskId: opts.taskId,
+    writerGeneration: opts.writerGeneration,
+    attempt: opts.attempt,
+    machineId: opts.machine,
+  };
 }
 
 function collectValues(value: string, previous: string[] = []) {
@@ -1934,6 +1987,124 @@ noCloudOps
     });
     printOpsJson(report, opts.pretty);
   });
+
+// ── Task worktree lease lifecycle ──
+const taskWorktrees = program
+  .command("worktrees")
+  .description("Repos-owned task worktree lifecycle with fenced writer leases");
+
+taskWorktrees
+  .command("capabilities")
+  .description("Discover the machine-readable task worktree lifecycle contract")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => taskWorktreeAction(
+    () => getTaskWorktreeCapabilities(),
+    opts.pretty,
+  ));
+
+taskWorktrees
+  .command("create-or-adopt")
+  .description("Idempotently create or adopt one canonical task worktree")
+  .requiredOption("--repo <owner/name>", "Registered repository identity")
+  .requiredOption("--task-id <id>", "Todos task ID")
+  .requiredOption("--name <name>", "Canonical task worktree name")
+  .requiredOption("--branch <branch>", "Owned task branch")
+  .requiredOption("--writer-generation <generation>", "Writer lease generation")
+  .requiredOption("--attempt <attempt>", "Dispatch attempt or nonce")
+  .option("--machine <id>", "Machine identity")
+  .option("--pr-group <id>", "Deterministic PR-group identity")
+  .option("--leaf <id>", "Deterministic leaf identity")
+  .option("--base-branch <branch>", "Provider base branch")
+  .option("--path <path>", "Exact canonical path; must match the resolver")
+  .option("--ttl <seconds>", "Writer lease TTL in seconds")
+  .option("--cleanup-pr-policy <policy>", "none, closed-or-merged, or merged", "none")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => taskWorktreeAction(() => createTaskWorktreeService().createOrAdopt({
+    repository: opts.repo,
+    taskId: opts.taskId,
+    taskWorktreeName: opts.name,
+    branch: opts.branch,
+    machineId: opts.machine,
+    writerGeneration: opts.writerGeneration,
+    attempt: opts.attempt,
+    prGroup: opts.prGroup,
+    leaf: opts.leaf,
+    baseBranch: opts.baseBranch,
+    worktreePath: opts.path,
+    ttlSeconds: optionalIntFlag(opts.ttl, "--ttl", 30),
+    cleanupPolicy: { pullRequest: opts.cleanupPrPolicy },
+  }), opts.pretty));
+
+for (const name of ["show", "status"]) {
+  addTaskWorktreeSelector(taskWorktrees
+    .command(name)
+    .description("Show persisted lease identity and current worktree status")
+    .option("--pretty", "Pretty-print JSON"))
+    .action((opts: any) => taskWorktreeAction(() => createTaskWorktreeService().status({
+      leaseId: opts.leaseId,
+      worktreePath: opts.path,
+      taskId: opts.taskId,
+    }), opts.pretty));
+}
+
+addTaskWorktreeFence(taskWorktrees
+  .command("heartbeat")
+  .alias("renew")
+  .description("Renew the current fenced writer lease")
+  .option("--ttl <seconds>", "Writer lease TTL in seconds")
+  .option("--pretty", "Pretty-print JSON"))
+  .action((opts: any) => taskWorktreeAction(() => createTaskWorktreeService().heartbeat({
+    ...taskWorktreeFence(opts),
+    ttlSeconds: optionalIntFlag(opts.ttl, "--ttl", 30),
+  }), opts.pretty));
+
+addTaskWorktreeFence(taskWorktrees
+  .command("transfer")
+  .description("Atomically fence the current writer and transfer ownership")
+  .requiredOption("--new-writer-generation <generation>", "Replacement writer lease generation")
+  .requiredOption("--new-attempt <attempt>", "Replacement attempt")
+  .requiredOption("--new-machine <id>", "Replacement machine identity")
+  .option("--ttl <seconds>", "Replacement writer lease TTL in seconds")
+  .option("--pretty", "Pretty-print JSON"))
+  .action((opts: any) => taskWorktreeAction(() => createTaskWorktreeService().transfer({
+    ...taskWorktreeFence(opts),
+    newWriterGeneration: opts.newWriterGeneration,
+    newAttempt: opts.newAttempt,
+    newMachineId: opts.newMachine,
+    ttlSeconds: optionalIntFlag(opts.ttl, "--ttl", 30),
+  }), opts.pretty));
+
+addTaskWorktreeSelector(taskWorktrees
+  .command("recover")
+  .description("Recover an expired or blocked lease while fencing the observed writer")
+  .requiredOption("--observed-writer-generation <generation>", "Exact observed writer generation")
+  .requiredOption("--observed-attempt <attempt>", "Exact observed attempt")
+  .requiredOption("--new-writer-generation <generation>", "Replacement writer lease generation")
+  .requiredOption("--new-attempt <attempt>", "Replacement attempt")
+  .requiredOption("--new-machine <id>", "Replacement machine identity")
+  .option("--ttl <seconds>", "Replacement writer lease TTL in seconds")
+  .option("--pretty", "Pretty-print JSON"))
+  .action((opts: any) => taskWorktreeAction(() => createTaskWorktreeService().recover({
+    leaseId: opts.leaseId,
+    worktreePath: opts.path,
+    taskId: opts.taskId,
+    observedWriterGeneration: opts.observedWriterGeneration,
+    observedAttempt: opts.observedAttempt,
+    newWriterGeneration: opts.newWriterGeneration,
+    newAttempt: opts.newAttempt,
+    newMachineId: opts.newMachine,
+    ttlSeconds: optionalIntFlag(opts.ttl, "--ttl", 30),
+  }), opts.pretty));
+
+addTaskWorktreeFence(taskWorktrees
+  .command("cleanup")
+  .description("Fail-closed cleanup with clean, pushed, reachable, writer, and PR gates")
+  .option("--eligibility-only", "Evaluate gates and retire the fenced writer without deleting")
+  .option("--pretty", "Pretty-print JSON"))
+  .action((opts: any) => taskWorktreeAction(() => createTaskWorktreeService().cleanup({
+    ...taskWorktreeFence(opts),
+    eligibilityOnly: Boolean(opts.eligibilityOnly),
+  }), opts.pretty));
 
 // ── Knowledge Graph ──
 const graph = program.command("graph").description("Knowledge graph commands");
