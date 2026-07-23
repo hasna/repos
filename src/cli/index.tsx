@@ -73,6 +73,7 @@ import {
   createTaskWorktreeService,
   getTaskWorktreeCapabilities,
   type FencedTaskWorktreeOptions,
+  type TaskWorktreeSelector,
 } from "../lib/task-worktrees.js";
 
 const ORG_ALIASES: Record<string, string> = {
@@ -182,7 +183,9 @@ function addTaskWorktreeSelector(command: any) {
   return command
     .option("--lease-id <id>", "Exact task worktree lease ID")
     .option("--path <path>", "Exact canonical worktree path")
-    .option("--task-id <id>", "Exact Todos task ID");
+    .option("--task-id <id>", "Exact Todos task ID")
+    .option("--repo <owner/name>", "Expected authoritative repository identity")
+    .option("--branch <branch>", "Expected authoritative branch");
 }
 
 function addTaskWorktreeFence(command: any) {
@@ -192,11 +195,19 @@ function addTaskWorktreeFence(command: any) {
     .option("--machine <id>", "Current machine identity");
 }
 
-function taskWorktreeFence(opts: any): FencedTaskWorktreeOptions {
+function taskWorktreeSelector(opts: any): TaskWorktreeSelector {
   return {
     leaseId: opts.leaseId,
     worktreePath: opts.path,
     taskId: opts.taskId,
+    repository: opts.repo,
+    branch: opts.branch,
+  };
+}
+
+function taskWorktreeFence(opts: any): FencedTaskWorktreeOptions {
+  return {
+    ...taskWorktreeSelector(opts),
     writerGeneration: opts.writerGeneration,
     attempt: opts.attempt,
     machineId: opts.machine,
@@ -2040,11 +2051,10 @@ for (const name of ["show", "status"]) {
     .command(name)
     .description("Show persisted lease identity and current worktree status")
     .option("--pretty", "Pretty-print JSON"))
-    .action((opts: any) => taskWorktreeAction(() => createTaskWorktreeService().status({
-      leaseId: opts.leaseId,
-      worktreePath: opts.path,
-      taskId: opts.taskId,
-    }), opts.pretty));
+    .action((opts: any) => taskWorktreeAction(
+      () => createTaskWorktreeService().status(taskWorktreeSelector(opts)),
+      opts.pretty,
+    ));
 }
 
 addTaskWorktreeFence(taskWorktrees
@@ -2085,9 +2095,7 @@ addTaskWorktreeSelector(taskWorktrees
   .option("--ttl <seconds>", "Replacement writer lease TTL in seconds")
   .option("--pretty", "Pretty-print JSON"))
   .action((opts: any) => taskWorktreeAction(() => createTaskWorktreeService().recover({
-    leaseId: opts.leaseId,
-    worktreePath: opts.path,
-    taskId: opts.taskId,
+    ...taskWorktreeSelector(opts),
     observedWriterGeneration: opts.observedWriterGeneration,
     observedAttempt: opts.observedAttempt,
     newWriterGeneration: opts.newWriterGeneration,

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
@@ -835,5 +836,205 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_task_worktree_receipts_lease
         ON task_worktree_receipts(lease_id, sequence);
     `,
+  },
+  {
+    version: 13,
+    sql: `
+      CREATE TABLE IF NOT EXISTS task_worktree_generations (
+        lease_id TEXT NOT NULL REFERENCES task_worktree_leases(lease_id) ON DELETE RESTRICT,
+        generation_sequence INTEGER NOT NULL CHECK (generation_sequence > 0),
+        writer_generation TEXT NOT NULL,
+        attempt TEXT NOT NULL,
+        machine_id TEXT NOT NULL,
+        transition TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (lease_id, generation_sequence),
+        UNIQUE (lease_id, writer_generation)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_worktree_generations_writer
+        ON task_worktree_generations(lease_id, writer_generation);
+    `,
+    run: (db) => {
+      const provisioning = db.query("SELECT * FROM task_worktree_leases WHERE status = 'provisioning'")
+        .all() as Array<{
+          lease_id: string;
+          repository: string;
+          repo_catalog_id: number;
+          task_id: string;
+          pr_group: string | null;
+          leaf: string | null;
+          branch: string;
+          worktree_path: string;
+          machine_id: string;
+          writer_generation: string;
+          attempt: string;
+          status: string;
+          head_sha: string | null;
+          cleanup_policy: string;
+          heartbeat_at: string | null;
+          lease_expires_at: string | null;
+          receipt_sequence: number;
+          created_at: string;
+          updated_at: string;
+        }>;
+      const insertReceipt = db.query(`INSERT INTO task_worktree_receipts
+        (receipt_id, lease_id, sequence, operation, outcome, ok, payload_json, created_at)
+        VALUES (?, ?, ?, 'create_or_adopt', 'failed', 0, ?, ?)`);
+      for (const row of provisioning) {
+        const sequence = row.receipt_sequence + 1;
+        db.query(`UPDATE task_worktree_leases SET
+          status = 'failed', lease_expires_at = NULL, receipt_sequence = ?, updated_at = ?
+          WHERE lease_id = ?`)
+          .run(sequence, row.updated_at, row.lease_id);
+        let policy: { pullRequest: "none" | "closed-or-merged" | "merged" } = {
+          pullRequest: "merged",
+        };
+        try {
+          const parsed = JSON.parse(row.cleanup_policy) as { pullRequest?: string };
+          if (["none", "closed-or-merged", "merged"].includes(parsed.pullRequest ?? "none")) {
+            policy = {
+              pullRequest: (parsed.pullRequest ?? "none") as
+                "none" | "closed-or-merged" | "merged",
+            };
+          }
+        } catch {
+          // Preserve fail-closed cleanup semantics for corrupt legacy policy.
+        }
+        const receiptId = randomUUID();
+        const payload = {
+          schema: "repos.task-worktrees.receipt.v1",
+          capability: "repos.task-worktrees.v1",
+          available: true,
+          ok: false,
+          receipt_id: receiptId,
+          sequence,
+          operation: "create_or_adopt",
+          outcome: "failed",
+          at: row.updated_at,
+          lease: {
+            lease_id: row.lease_id,
+            repository: row.repository,
+            repo_catalog_id: row.repo_catalog_id,
+            task_id: row.task_id,
+            pr_group: row.pr_group,
+            leaf: row.leaf,
+            branch: row.branch,
+            worktree_path: row.worktree_path,
+            machine_id: row.machine_id,
+            writer_generation: row.writer_generation,
+            attempt: row.attempt,
+            status: "failed",
+            head_sha: row.head_sha,
+            cleanup_policy: policy,
+            heartbeat_at: row.heartbeat_at,
+            lease_expires_at: null,
+          },
+        };
+        insertReceipt.run(
+          receiptId,
+          row.lease_id,
+          sequence,
+          JSON.stringify(payload),
+          row.updated_at,
+        );
+      }
+
+      const leases = db.query(`SELECT
+        lease_id, writer_generation, attempt, machine_id, status, created_at, updated_at
+        FROM task_worktree_leases ORDER BY lease_id`).all() as Array<{
+          lease_id: string;
+          writer_generation: string;
+          attempt: string;
+          machine_id: string;
+          status: string;
+          created_at: string;
+          updated_at: string;
+        }>;
+      const receipts = db.query(`SELECT
+        lease_id, operation, payload_json, created_at
+        FROM task_worktree_receipts
+        WHERE lease_id IS NOT NULL
+        ORDER BY lease_id, sequence`).all() as Array<{
+          lease_id: string;
+          operation: string;
+          payload_json: string;
+          created_at: string;
+        }>;
+      const histories = new Map<string, Array<{
+        writer_generation: string;
+        attempt: string;
+        machine_id: string;
+        transition: string;
+        created_at: string;
+      }>>();
+
+      for (const receipt of receipts) {
+        let payload: unknown;
+        try {
+          payload = JSON.parse(receipt.payload_json);
+        } catch {
+          continue;
+        }
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+        const lease = (payload as { lease?: unknown }).lease;
+        if (!lease || typeof lease !== "object" || Array.isArray(lease)) continue;
+        const identity = lease as Record<string, unknown>;
+        const envelope = payload as Record<string, unknown>;
+        if (
+          typeof identity["writer_generation"] !== "string"
+          || typeof identity["attempt"] !== "string"
+          || typeof identity["machine_id"] !== "string"
+        ) continue;
+        const status = typeof identity["status"] === "string" ? identity["status"] : "";
+        const outcome = typeof envelope["outcome"] === "string" ? envelope["outcome"] : "";
+        if (
+          !["active", "cleanup_pending", "cleanup_blocked", "cleanup_failed", "cleaned"].includes(status)
+          && !["created", "adopted", "heartbeat", "transferred", "recovered", "eligible", "blocked", "cleaned"]
+            .includes(outcome)
+        ) continue;
+        const history = histories.get(receipt.lease_id) ?? [];
+        history.push({
+          writer_generation: identity["writer_generation"],
+          attempt: identity["attempt"],
+          machine_id: identity["machine_id"],
+          transition: receipt.operation,
+          created_at: receipt.created_at,
+        });
+        histories.set(receipt.lease_id, history);
+      }
+
+      const insert = db.query(`INSERT INTO task_worktree_generations
+        (lease_id, generation_sequence, writer_generation, attempt, machine_id, transition, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      for (const lease of leases) {
+        const candidates = histories.get(lease.lease_id) ?? [];
+        if (["active", "cleanup_pending", "cleanup_blocked", "cleanup_failed", "cleaned"].includes(lease.status)) {
+          candidates.push({
+            writer_generation: lease.writer_generation,
+            attempt: lease.attempt,
+            machine_id: lease.machine_id,
+            transition: "migration-current",
+            created_at: lease.updated_at || lease.created_at,
+          });
+        }
+        const seen = new Set<string>();
+        let sequence = 0;
+        for (const candidate of candidates) {
+          if (seen.has(candidate.writer_generation)) continue;
+          seen.add(candidate.writer_generation);
+          sequence += 1;
+          insert.run(
+            lease.lease_id,
+            sequence,
+            candidate.writer_generation,
+            candidate.attempt,
+            candidate.machine_id,
+            candidate.transition,
+            candidate.created_at,
+          );
+        }
+      }
+    },
   },
 ];

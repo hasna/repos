@@ -201,7 +201,186 @@ describe("task worktree lifecycle", () => {
     });
     expect(git.createCount).toBe(1);
     expect(db.query("SELECT count(*) AS count FROM task_worktree_leases").get()).toEqual({ count: 1 });
-    expect(db.query("SELECT count(*) AS count FROM task_worktree_receipts").get()).toEqual({ count: 2 });
+    expect(db.query("SELECT count(*) AS count FROM task_worktree_receipts").get()).toEqual({ count: 3 });
+  });
+
+  it("requires explicit recovery after expiry instead of renewing through create-or-adopt", () => {
+    const created = service.createOrAdopt(base);
+    const originalExpiry = created.lease!.lease_expires_at;
+    now = new Date(now.getTime() + 31_000);
+
+    const stale = expectCode(
+      () => service.createOrAdopt(base),
+      "STALE_WRITER",
+    );
+    expect(stale.receipt).toMatchObject({
+      ok: false,
+      operation: "create_or_adopt",
+      outcome: "collision",
+      lease: {
+        writer_generation: "generation-1",
+        lease_expires_at: originalExpiry,
+      },
+    });
+    expect(git.createCount).toBe(1);
+  });
+
+  it("never reactivates a retired writer generation through ABA transfer or recovery", () => {
+    const created = service.createOrAdopt(base);
+    service.transfer({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+      newWriterGeneration: "generation-2",
+      newAttempt: "attempt-2",
+      newMachineId: "machine-b",
+      ttlSeconds: 30,
+    });
+
+    expectCode(() => service.transfer({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-2",
+      attempt: "attempt-2",
+      machineId: "machine-b",
+      newWriterGeneration: "generation-1",
+      newAttempt: "attempt-1",
+      newMachineId: "machine-a",
+      ttlSeconds: 30,
+    }), "STALE_WRITER");
+
+    now = new Date(now.getTime() + 31_000);
+    expectCode(() => service.recover({
+      leaseId: created.lease!.lease_id,
+      observedWriterGeneration: "generation-2",
+      observedAttempt: "attempt-2",
+      newWriterGeneration: "generation-1",
+      newAttempt: "attempt-replay",
+      newMachineId: "machine-c",
+      ttlSeconds: 30,
+    }), "STALE_WRITER");
+    expect(db.query(
+      "SELECT writer_generation FROM task_worktree_leases WHERE lease_id = ?",
+    ).get(created.lease!.lease_id)).toEqual({ writer_generation: "generation-2" });
+  });
+
+  it("rejects contradictory cleanup policy and preserves an advanced unmerged head", () => {
+    const created = service.createOrAdopt({
+      ...base,
+      cleanupPolicy: { pullRequest: "merged" },
+    });
+
+    const collision = expectCode(
+      () => service.createOrAdopt({
+        ...base,
+        cleanupPolicy: { pullRequest: "none" },
+      }),
+      "WORKTREE_COLLISION",
+    );
+    expect(collision.receipt).toMatchObject({
+      ok: false,
+      operation: "create_or_adopt",
+      outcome: "collision",
+    });
+
+    const path = created.lease!.worktree_path;
+    git.update(path, {
+      head: OTHER_HEAD,
+      clean: true,
+      upstream: "origin/feat/task-one",
+      upstreamHead: OTHER_HEAD,
+    });
+    git.provider.set("hasna/repos:feat/task-one", OTHER_HEAD);
+    git.prState = "open";
+    const blocked = service.cleanup({
+      leaseId: created.lease!.lease_id,
+      writerGeneration: "generation-1",
+      attempt: "attempt-1",
+      machineId: "machine-a",
+    });
+    expect(blocked).toMatchObject({
+      ok: false,
+      outcome: "blocked",
+      lease: { status: "cleanup_blocked" },
+    });
+    expect(blocked.gates).toContainEqual(expect.objectContaining({
+      id: "pull_request_policy",
+      passed: false,
+    }));
+    expect(git.cleanupCount).toBe(0);
+  });
+
+  it("fails closed when lease-id selectors contradict the authoritative binding", () => {
+    const created = service.createOrAdopt(base);
+    const leaseId = created.lease!.lease_id;
+    const contradictions = [
+      { taskId: "task-other" },
+      { worktreePath: join(root, "repos", "task-other") },
+      { repository: "hasna/other" },
+      { branch: "feat/other" },
+    ];
+
+    for (const selector of contradictions) {
+      expectCode(
+        () => service.status({ leaseId, ...selector }),
+        "INVALID_REQUEST",
+      );
+    }
+  });
+
+  it("rolls back provisioning before filesystem mutation when receipt persistence fails", () => {
+    db.exec(`
+      CREATE TRIGGER task_worktree_receipt_failure
+      BEFORE INSERT ON task_worktree_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'injected receipt persistence failure');
+      END;
+    `);
+
+    expectCode(
+      () => service.createOrAdopt(base),
+      "CAPABILITY_OPERATION_FAILED",
+    );
+    expect(git.createCount).toBe(0);
+    expect(db.query("SELECT count(*) AS count FROM task_worktree_leases").get()).toEqual({ count: 0 });
+    expect(db.query("SELECT count(*) AS count FROM task_worktree_receipts").get()).toEqual({ count: 0 });
+  });
+
+  it("leaves a deterministic failed reservation receipt and supports retry after final receipt failure", () => {
+    db.exec(`
+      CREATE TRIGGER task_worktree_final_receipt_failure
+      BEFORE INSERT ON task_worktree_receipts
+      WHEN NEW.outcome = 'created'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected final receipt persistence failure');
+      END;
+    `);
+
+    const failed = expectCode(
+      () => service.createOrAdopt(base),
+      "CAPABILITY_OPERATION_FAILED",
+    );
+    expect(failed.receipt).toMatchObject({
+      operation: "create_or_adopt",
+      outcome: "failed",
+      ok: false,
+      lease: { status: "failed" },
+    });
+    expect(git.createCount).toBe(1);
+    expect(db.query("SELECT status FROM task_worktree_leases").get()).toEqual({ status: "failed" });
+    expect(db.query("SELECT count(*) AS count FROM task_worktree_generations").get()).toEqual({ count: 0 });
+
+    db.exec("DROP TRIGGER task_worktree_final_receipt_failure");
+    const retried = service.createOrAdopt(base);
+    expect(retried).toMatchObject({
+      outcome: "adopted",
+      lease: {
+        status: "active",
+        writer_generation: "generation-1",
+      },
+    });
+    expect(git.createCount).toBe(1);
+    expect(db.query("SELECT count(*) AS count FROM task_worktree_generations").get()).toEqual({ count: 1 });
   });
 
   it("retires an active lease when idempotent adoption finds divergent filesystem identity", () => {
@@ -223,6 +402,11 @@ describe("task worktree lifecycle", () => {
       attempt: "attempt-1",
       machineId: "machine-a",
     }), "LEASE_NOT_ACTIVE");
+    expectCode(
+      () => service.createOrAdopt(base),
+      "STALE_WRITER",
+    );
+    expect(git.createCount).toBe(1);
   });
 
   it("returns stable collision receipts for path, branch, and concurrent-writer conflicts", () => {

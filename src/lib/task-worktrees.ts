@@ -34,6 +34,7 @@ export type TaskWorktreeOperation =
   | "cleanup";
 
 export type TaskWorktreeOutcome =
+  | "reserved"
   | "created"
   | "adopted"
   | "status"
@@ -92,6 +93,7 @@ export interface TaskWorktreeIdentity {
   attempt: string;
   status: TaskWorktreeStatus;
   head_sha: string | null;
+  cleanup_policy: CleanupPolicy;
   heartbeat_at: string | null;
   lease_expires_at: string | null;
 }
@@ -158,10 +160,15 @@ export interface CreateOrAdoptTaskWorktreeOptions {
   cleanupPolicy?: CleanupPolicy;
 }
 
-export interface FencedTaskWorktreeOptions {
+export interface TaskWorktreeSelector {
   leaseId?: string;
   worktreePath?: string;
   taskId?: string;
+  repository?: string;
+  branch?: string;
+}
+
+export interface FencedTaskWorktreeOptions extends TaskWorktreeSelector {
   writerGeneration: string;
   attempt: string;
   machineId?: string;
@@ -174,10 +181,7 @@ export interface TransferTaskWorktreeOptions extends FencedTaskWorktreeOptions {
   ttlSeconds?: number;
 }
 
-export interface RecoverTaskWorktreeOptions {
-  leaseId?: string;
-  worktreePath?: string;
-  taskId?: string;
+export interface RecoverTaskWorktreeOptions extends TaskWorktreeSelector {
   observedWriterGeneration: string;
   observedAttempt: string;
   newWriterGeneration: string;
@@ -385,6 +389,18 @@ function cleanupPolicy(value?: CleanupPolicy): string {
   return JSON.stringify({ pullRequest });
 }
 
+function readCleanupPolicy(value: string): CleanupPolicy {
+  try {
+    const parsed = JSON.parse(value) as CleanupPolicy;
+    if (["none", "closed-or-merged", "merged"].includes(parsed.pullRequest ?? "none")) {
+      return { pullRequest: parsed.pullRequest ?? "none" };
+    }
+  } catch {
+    // Corrupt policy state is interpreted as the strictest supported policy.
+  }
+  return { pullRequest: "merged" };
+}
+
 function isContained(root: string, target: string): boolean {
   const rel = relative(root, target);
   return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith(sep);
@@ -479,6 +495,7 @@ function leaseIdentity(row: LeaseRow): TaskWorktreeIdentity {
     attempt: row.attempt,
     status: row.status,
     head_sha: row.head_sha,
+    cleanup_policy: readCleanupPolicy(row.cleanup_policy),
     heartbeat_at: row.heartbeat_at,
     lease_expires_at: row.lease_expires_at,
   };
@@ -509,7 +526,7 @@ function withImmediate<T>(db: Database, fn: () => T): T {
 
 function readLease(
   db: Database,
-  input: { leaseId?: string; worktreePath?: string; taskId?: string },
+  input: TaskWorktreeSelector,
   root: string,
 ): LeaseRow | null {
   let row: LeaseRow | null;
@@ -526,6 +543,18 @@ function readLease(
     fail("INVALID_REQUEST", "leaseId, worktreePath, or taskId is required");
   }
   if (row) {
+    if (input.taskId && safeValue(input.taskId, "task id") !== row.task_id) {
+      fail("INVALID_REQUEST", "task selector contradicts the authoritative lease binding");
+    }
+    if (input.worktreePath && resolve(input.worktreePath) !== row.worktree_path) {
+      fail("INVALID_REQUEST", "path selector contradicts the authoritative lease binding");
+    }
+    if (input.repository && canonicalRepository(input.repository) !== row.repository) {
+      fail("INVALID_REQUEST", "repository selector contradicts the authoritative lease binding");
+    }
+    if (input.branch && safeBranch(input.branch) !== row.branch) {
+      fail("INVALID_REQUEST", "branch selector contradicts the authoritative lease binding");
+    }
     const repo = db.query("SELECT remote_url FROM repos WHERE id = ?").get(row.repo_catalog_id) as {
       remote_url: string | null;
     } | null;
@@ -615,6 +644,7 @@ function exactIdentity(
     machineId: string;
     writerGeneration: string;
     attempt: string;
+    cleanupPolicy: string;
   },
 ): boolean {
   return row.repository === input.repository
@@ -625,7 +655,37 @@ function exactIdentity(
     && row.worktree_path === input.path
     && row.machine_id === input.machineId
     && row.writer_generation === input.writerGeneration
-    && row.attempt === input.attempt;
+    && row.attempt === input.attempt
+    && row.cleanup_policy === input.cleanupPolicy;
+}
+
+function appendGeneration(
+  db: Database,
+  row: LeaseRow,
+  transition: "create_or_adopt" | "transfer" | "recover",
+  now: string,
+): void {
+  const used = db.query(`SELECT 1 FROM task_worktree_generations
+    WHERE lease_id = ? AND writer_generation = ?`)
+    .get(row.lease_id, row.writer_generation);
+  if (used) {
+    fail("STALE_WRITER", "writer generation was already active and cannot be reused");
+  }
+  const latest = db.query(`SELECT COALESCE(MAX(generation_sequence), 0) AS sequence
+    FROM task_worktree_generations WHERE lease_id = ?`)
+    .get(row.lease_id) as { sequence: number };
+  db.query(`INSERT INTO task_worktree_generations
+    (lease_id, generation_sequence, writer_generation, attempt, machine_id, transition, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      row.lease_id,
+      latest.sequence + 1,
+      row.writer_generation,
+      row.attempt,
+      row.machine_id,
+      transition,
+      now,
+    );
 }
 
 function safeGitEnvironment(): NodeJS.ProcessEnv {
@@ -869,86 +929,147 @@ export class TaskWorktreeService {
       machineId,
       writerGeneration,
       attempt,
+      cleanupPolicy: persistedCleanupPolicy,
     };
 
-    const reservation = withImmediate(this.db, () => {
-      const existing = this.db.query("SELECT * FROM task_worktree_leases WHERE worktree_path = ? OR lease_id = ? ORDER BY lease_id LIMIT 1")
-        .get(path, id) as LeaseRow | null;
-      const branchOwner = this.db.query(
-        `SELECT * FROM task_worktree_leases
-         WHERE repository = ? AND branch = ? AND status <> 'cleaned'
-         LIMIT 1`,
-      ).get(repository, branch) as LeaseRow | null;
-      const taskOwner = this.db.query(
-        `SELECT * FROM task_worktree_leases
-         WHERE task_id = ? AND status <> 'cleaned'
-         LIMIT 1`,
-      ).get(taskId) as LeaseRow | null;
-      const collision = existing && !exactIdentity(existing, desired)
-        ? existing
-        : branchOwner && branchOwner.lease_id !== existing?.lease_id
-          ? branchOwner
-          : taskOwner && taskOwner.lease_id !== existing?.lease_id
-            ? taskOwner
-          : null;
-      if (collision) {
-        const collisionReceipt = receipt(this.db, now, "create_or_adopt", "collision", collision, false);
-        return { collision: collisionReceipt, row: null as LeaseRow | null, idempotent: false };
-      }
-      if (existing) {
-        if (existing.status === "active") {
-          return { collision: null, row: existing, idempotent: true };
+    let reservation: {
+      collision: TaskWorktreeReceipt | null;
+      stale: TaskWorktreeReceipt | null;
+      row: LeaseRow | null;
+      idempotent: boolean;
+      reservationReceipt?: TaskWorktreeReceipt;
+    };
+    try {
+      reservation = withImmediate(this.db, () => {
+        const existing = this.db.query("SELECT * FROM task_worktree_leases WHERE worktree_path = ? OR lease_id = ? ORDER BY lease_id LIMIT 1")
+          .get(path, id) as LeaseRow | null;
+        const branchOwner = this.db.query(
+          `SELECT * FROM task_worktree_leases
+           WHERE repository = ? AND branch = ? AND status <> 'cleaned'
+           LIMIT 1`,
+        ).get(repository, branch) as LeaseRow | null;
+        const taskOwner = this.db.query(
+          `SELECT * FROM task_worktree_leases
+           WHERE task_id = ? AND status <> 'cleaned'
+           LIMIT 1`,
+        ).get(taskId) as LeaseRow | null;
+        const collision = existing && !exactIdentity(existing, desired)
+          ? existing
+          : branchOwner && branchOwner.lease_id !== existing?.lease_id
+            ? branchOwner
+            : taskOwner && taskOwner.lease_id !== existing?.lease_id
+              ? taskOwner
+            : null;
+        if (collision) {
+          const collisionReceipt = receipt(this.db, now, "create_or_adopt", "collision", collision, false);
+          return {
+            collision: collisionReceipt,
+            stale: null,
+            row: null as LeaseRow | null,
+            idempotent: false,
+          };
         }
-        if (existing.status === "provisioning") {
-          fail("CONCURRENT_MUTATION", "matching worktree creation is already in progress");
+        if (existing) {
+          if (existing.status === "active") {
+            if (existing.lease_expires_at != null && existing.lease_expires_at <= now) {
+              const staleReceipt = receipt(this.db, now, "create_or_adopt", "collision", existing, false);
+              return {
+                collision: null,
+                stale: staleReceipt,
+                row: null as LeaseRow | null,
+                idempotent: false,
+              };
+            }
+            return {
+              collision: null,
+              stale: null,
+              row: existing,
+              idempotent: true,
+            };
+          }
+          if (existing.status === "provisioning") {
+            fail("CONCURRENT_MUTATION", "matching worktree creation is already in progress");
+          }
+          if (!["failed", "cleaned"].includes(existing.status)) {
+            const collisionReceipt = receipt(this.db, now, "create_or_adopt", "collision", existing, false);
+            return {
+              collision: collisionReceipt,
+              stale: null,
+              row: null as LeaseRow | null,
+              idempotent: false,
+            };
+          }
+          if (this.db.query(`SELECT 1 FROM task_worktree_generations
+            WHERE lease_id = ? AND writer_generation = ?`)
+            .get(existing.lease_id, writerGeneration)) {
+            const staleReceipt = receipt(this.db, now, "create_or_adopt", "collision", existing, false);
+            return {
+              collision: null,
+              stale: staleReceipt,
+              row: null as LeaseRow | null,
+              idempotent: false,
+            };
+          }
+          this.db.query(`UPDATE task_worktree_leases SET
+            repo_catalog_id = ?, machine_id = ?, writer_generation = ?, attempt = ?,
+            status = 'provisioning', head_sha = NULL, cleanup_policy = ?,
+            heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+            WHERE lease_id = ?`)
+            .run(repo.id, machineId, writerGeneration, attempt, persistedCleanupPolicy, now, leaseExpires, now, existing.lease_id);
+          const reserved = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?")
+            .get(existing.lease_id) as LeaseRow;
+          const reservationReceipt = receipt(this.db, now, "create_or_adopt", "reserved", reserved);
+          return {
+            collision: null,
+            stale: null,
+            row: reserved,
+            idempotent: false,
+            reservationReceipt,
+          };
         }
-        if (!["failed", "cleaned"].includes(existing.status)) {
-          const collisionReceipt = receipt(this.db, now, "create_or_adopt", "collision", existing, false);
-          return { collision: collisionReceipt, row: null as LeaseRow | null, idempotent: false };
-        }
-        this.db.query(`UPDATE task_worktree_leases SET
-          repo_catalog_id = ?, machine_id = ?, writer_generation = ?, attempt = ?,
-          status = 'provisioning', head_sha = NULL, cleanup_policy = ?,
-          heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
-          WHERE lease_id = ?`)
-          .run(repo.id, machineId, writerGeneration, attempt, persistedCleanupPolicy, now, leaseExpires, now, existing.lease_id);
+        this.db.query(`INSERT INTO task_worktree_leases (
+          lease_id, repository, repo_catalog_id, task_id, pr_group, leaf, branch,
+          worktree_path, machine_id, writer_generation, attempt, status, head_sha,
+          cleanup_policy, heartbeat_at, lease_expires_at, receipt_sequence, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provisioning', NULL, ?, ?, ?, 0, ?, ?)`)
+          .run(
+            id,
+            repository,
+            repo.id,
+            taskId,
+            prGroup,
+            leaf,
+            branch,
+            path,
+            machineId,
+            writerGeneration,
+            attempt,
+            persistedCleanupPolicy,
+            now,
+            leaseExpires,
+            now,
+            now,
+          );
+        const reserved = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?")
+          .get(id) as LeaseRow;
+        const reservationReceipt = receipt(this.db, now, "create_or_adopt", "reserved", reserved);
         return {
           collision: null,
-          row: this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(existing.lease_id) as LeaseRow,
+          stale: null,
+          row: reserved,
           idempotent: false,
+          reservationReceipt,
         };
-      }
-      this.db.query(`INSERT INTO task_worktree_leases (
-        lease_id, repository, repo_catalog_id, task_id, pr_group, leaf, branch,
-        worktree_path, machine_id, writer_generation, attempt, status, head_sha,
-        cleanup_policy, heartbeat_at, lease_expires_at, receipt_sequence, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provisioning', NULL, ?, ?, ?, 0, ?, ?)`)
-        .run(
-          id,
-          repository,
-          repo.id,
-          taskId,
-          prGroup,
-          leaf,
-          branch,
-          path,
-          machineId,
-          writerGeneration,
-          attempt,
-          persistedCleanupPolicy,
-          now,
-          leaseExpires,
-          now,
-          now,
-        );
-      return {
-        collision: null,
-        row: this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(id) as LeaseRow,
-        idempotent: false,
-      };
-    });
+      });
+    } catch (error) {
+      if (error instanceof TaskWorktreeError) throw error;
+      fail("CAPABILITY_OPERATION_FAILED", "task worktree reservation failed");
+    }
     if (reservation.collision) {
       fail("WORKTREE_COLLISION", "worktree identity collides with an existing or active writer", reservation.collision);
+    }
+    if (reservation.stale) {
+      fail("STALE_WRITER", "writer lease expired and requires recovery", reservation.stale);
     }
     const row = reservation.row!;
 
@@ -988,6 +1109,9 @@ export class TaskWorktreeService {
         if (!current || !exactIdentity(current, desired) || !["provisioning", "active"].includes(current.status)) {
           fail("CONCURRENT_MUTATION", "worktree lease changed during create or adopt");
         }
+        if (current.status === "provisioning") {
+          appendGeneration(this.db, current, "create_or_adopt", now);
+        }
         this.db.query(`UPDATE task_worktree_leases SET
           status = 'active', head_sha = ?, heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
           WHERE lease_id = ?`)
@@ -1002,40 +1126,65 @@ export class TaskWorktreeService {
         );
       });
     } catch (error) {
-      const persistedReceipt = withImmediate(this.db, () => {
-        const current = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(row.lease_id) as LeaseRow | null;
-        if (
-          current
-          && (
-            current.status === "provisioning"
-            || (reservation.idempotent && current.status === "active")
-          )
-        ) {
-          this.db.query("UPDATE task_worktree_leases SET status = 'failed', lease_expires_at = NULL, updated_at = ? WHERE lease_id = ?")
-            .run(now, current.lease_id);
-          const failed = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(current.lease_id) as LeaseRow;
-          return receipt(
-            this.db,
-            now,
-            "create_or_adopt",
-            error instanceof TaskWorktreeError
-              && ["WORKTREE_COLLISION", "BRANCH_COLLISION"].includes(error.code)
-              ? "collision"
-              : "failed",
-            failed,
-            false,
-          );
-        }
-        return undefined;
-      });
-      if (error instanceof TaskWorktreeError) {
-        throw new TaskWorktreeError(error.code, error.message, error.receipt ?? persistedReceipt);
+      let persistedReceipt: TaskWorktreeReceipt | undefined;
+      try {
+        persistedReceipt = withImmediate(this.db, () => {
+          const current = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(row.lease_id) as LeaseRow | null;
+          if (
+            current
+            && (
+              current.status === "provisioning"
+              || (reservation.idempotent && current.status === "active")
+            )
+          ) {
+            this.db.query("UPDATE task_worktree_leases SET status = 'failed', lease_expires_at = NULL, updated_at = ? WHERE lease_id = ?")
+              .run(now, current.lease_id);
+            const failed = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(current.lease_id) as LeaseRow;
+            return receipt(
+              this.db,
+              now,
+              "create_or_adopt",
+              error instanceof TaskWorktreeError
+                && ["WORKTREE_COLLISION", "BRANCH_COLLISION"].includes(error.code)
+                ? "collision"
+                : "failed",
+              failed,
+              false,
+            );
+          }
+          return undefined;
+        });
+      } catch {
+        withImmediate(this.db, () => {
+          const current = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(row.lease_id) as LeaseRow | null;
+          if (
+            current
+            && (
+              current.status === "provisioning"
+              || (reservation.idempotent && current.status === "active")
+            )
+          ) {
+            this.db.query("UPDATE task_worktree_leases SET status = 'failed', lease_expires_at = NULL, updated_at = ? WHERE lease_id = ?")
+              .run(now, current.lease_id);
+          }
+        });
       }
-      fail("CAPABILITY_OPERATION_FAILED", "create or adopt operation failed");
+      if (error instanceof TaskWorktreeError) {
+        throw new TaskWorktreeError(
+          error.code,
+          error.message,
+          error.receipt ?? persistedReceipt ?? reservation.reservationReceipt,
+        );
+      }
+      fail(
+        "CAPABILITY_OPERATION_FAILED",
+        "create or adopt operation failed",
+        persistedReceipt ?? reservation.reservationReceipt,
+      );
     }
   }
 
-  status(input: { leaseId?: string; worktreePath?: string; taskId?: string }): TaskWorktreeReceipt {
+  status(input: TaskWorktreeSelector): TaskWorktreeReceipt {
     const now = iso(this.now());
     return withImmediate(this.db, () => {
       const row = readLease(this.db, input, this.root);
@@ -1089,6 +1238,10 @@ export class TaskWorktreeService {
       if (toGeneration === row.writer_generation) {
         fail("INVALID_REQUEST", "transfer target must use a new writer generation");
       }
+      if (this.db.query(`SELECT 1 FROM task_worktree_generations
+        WHERE lease_id = ? AND writer_generation = ?`).get(row.lease_id, toGeneration)) {
+        fail("STALE_WRITER", "writer generation was already active and cannot be reused");
+      }
       const transition = {
         from_generation: row.writer_generation,
         from_attempt: row.attempt,
@@ -1102,6 +1255,7 @@ export class TaskWorktreeService {
         lease_expires_at = ?, updated_at = ? WHERE lease_id = ?`)
         .run(toMachine, toGeneration, toAttempt, now, leaseExpires, now, row.lease_id);
       const updated = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(row.lease_id) as LeaseRow;
+      appendGeneration(this.db, updated, "transfer", now);
       return receipt(this.db, now, "transfer", "transferred", updated, true, { transition });
     });
   }
@@ -1128,6 +1282,10 @@ export class TaskWorktreeService {
       if (toGeneration === row.writer_generation) {
         fail("INVALID_REQUEST", "recovery must fence the previous writer generation");
       }
+      if (this.db.query(`SELECT 1 FROM task_worktree_generations
+        WHERE lease_id = ? AND writer_generation = ?`).get(row.lease_id, toGeneration)) {
+        fail("STALE_WRITER", "writer generation was already active and cannot be reused");
+      }
       const state = this.git.inspect(row.worktree_path);
       if (state.repository !== row.repository || state.branch !== row.branch) {
         fail("GIT_STATE_INVALID", "worktree identity changed before recovery");
@@ -1146,6 +1304,7 @@ export class TaskWorktreeService {
         WHERE lease_id = ?`)
         .run(toMachine, toGeneration, toAttempt, state.head, now, leaseExpires, now, row.lease_id);
       const updated = this.db.query("SELECT * FROM task_worktree_leases WHERE lease_id = ?").get(row.lease_id) as LeaseRow;
+      appendGeneration(this.db, updated, "recover", now);
       return receipt(this.db, now, "recover", "recovered", updated, true, { transition });
     });
   }
@@ -1181,13 +1340,7 @@ export class TaskWorktreeService {
       providerFailed = true;
     }
 
-    const policy = (() => {
-      try {
-        return JSON.parse(prepared.cleanup_policy) as CleanupPolicy;
-      } catch {
-        return { pullRequest: "merged" } as CleanupPolicy;
-      }
-    })();
+    const policy = readCleanupPolicy(prepared.cleanup_policy);
     const prMode = policy.pullRequest ?? "none";
     const prState = prMode === "none"
       ? "absent"

@@ -33,7 +33,16 @@ describe("task worktree CLI contract", () => {
   });
 
   it("reports an operational failure distinctly from an absent command", () => {
-    const failed = cli(["worktrees", "status", "--lease-id", "missing"]);
+    const failed = cli([
+      "worktrees",
+      "status",
+      "--lease-id",
+      "missing",
+      "--repo",
+      "hasna/repos",
+      "--branch",
+      "feat/missing",
+    ]);
     expect(failed.status).toBe(2);
     expect(JSON.parse(failed.stdout)).toMatchObject({
       schema: "repos.task-worktrees.error.v1",

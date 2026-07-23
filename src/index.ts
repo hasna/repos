@@ -94,6 +94,7 @@ export type {
   TaskWorktreeOperation,
   TaskWorktreeOutcome,
   TaskWorktreeReceipt,
+  TaskWorktreeSelector,
   TaskWorktreeServiceOptions,
   TaskWorktreeStatus,
   TransferTaskWorktreeOptions,

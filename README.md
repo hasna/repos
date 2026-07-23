@@ -88,11 +88,17 @@ attempt. The canonical resolver is:
 $HOME/.hasna/repos/worktrees/<repo-name>/<task-worktree-name>
 ```
 
-Create-or-adopt is idempotent only for the complete identity. A conflicting
-repository, task, branch, path, or active writer emits a stable collision
-receipt. Heartbeat, transfer, recovery, and cleanup require exact generation,
-attempt, and machine fencing; a transferred or recovered predecessor cannot
-mutate the lifecycle.
+Create-or-adopt is idempotent only for the complete identity, including its
+cleanup/PR policy. A conflicting repository, task, branch, path, policy, or
+active writer emits a stable collision receipt. A durable reservation receipt
+is committed before filesystem provisioning, so receipt failure cannot strand
+an unreceipted provisioning lease. Heartbeat, transfer, recovery, and cleanup
+require exact generation, attempt, and machine fencing; an expired writer must
+use recovery, and a transferred or recovered generation can never be reused.
+
+Lease-ID operations accept optional `--task-id`, `--path`, `--repo`, and
+`--branch` assertions. Every supplied selector must match the authoritative
+lease binding or the operation fails closed with `INVALID_REQUEST`.
 
 Consumers must probe `repos worktrees capabilities` before using a direct Git
 fallback. A missing command means the capability is absent. Once the capability

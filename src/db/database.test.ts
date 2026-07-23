@@ -4,7 +4,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getDb, closeDb } from "./database";
+import { getDb, closeDb, migrateDb } from "./database";
 import { listRepos } from "./repos";
 
 describe("database", () => {
@@ -112,7 +112,7 @@ describe("database", () => {
       const migrated = getDb(path);
       expect(migrated).toBe(raw);
       expect(migrated.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12].map((version) => ({ version })));
+        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13].map((version) => ({ version })));
       expect(getDb(path)).toBe(migrated);
       expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get())
         .toEqual({ count: 1 });
@@ -199,7 +199,7 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13]);
     expect(db.query("PRAGMA table_info(task_worktree_leases)").all()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "lease_id", type: "TEXT", notnull: 0, pk: 1 }),
@@ -210,6 +210,166 @@ describe("database", () => {
     );
     expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(db.query("PRAGMA foreign_key_list(task_worktree_leases)").all()).toEqual([]);
+    expect(db.query("PRAGMA table_info(task_worktree_generations)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "lease_id", type: "TEXT", notnull: 1, pk: 1 }),
+        expect.objectContaining({ name: "generation_sequence", type: "INTEGER", notnull: 1, pk: 2 }),
+        expect.objectContaining({ name: "writer_generation", type: "TEXT", notnull: 1 }),
+        expect.objectContaining({ name: "attempt", type: "TEXT", notnull: 1 }),
+        expect.objectContaining({ name: "machine_id", type: "TEXT", notnull: 1 }),
+      ]),
+    );
+  });
+
+  it("backfills monotonic writer generation history from v12 receipts", () => {
+    const legacy = new Database(":memory:");
+    legacy.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version)
+        VALUES (1), (2), (3), (4), (6), (7), (8), (9), (10), (11), (12);
+      CREATE TABLE task_worktree_leases (
+        lease_id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        repo_catalog_id INTEGER NOT NULL,
+        task_id TEXT NOT NULL,
+        pr_group TEXT,
+        leaf TEXT,
+        branch TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        machine_id TEXT NOT NULL,
+        writer_generation TEXT NOT NULL,
+        attempt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        head_sha TEXT,
+        cleanup_policy TEXT NOT NULL,
+        heartbeat_at TEXT,
+        lease_expires_at TEXT,
+        receipt_sequence INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE task_worktree_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        lease_id TEXT,
+        sequence INTEGER NOT NULL,
+        operation TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+    legacy.query(`INSERT INTO task_worktree_leases
+      (lease_id, repository, repo_catalog_id, task_id, pr_group, leaf, branch,
+       worktree_path, machine_id, writer_generation, attempt, status, head_sha,
+       cleanup_policy, heartbeat_at, lease_expires_at, receipt_sequence, created_at, updated_at)
+      VALUES (
+        'lease-1', 'hasna/repos', 1, 'task-1', NULL, NULL, 'feat/task-1',
+        '/tmp/repos/task-1', 'machine-b', 'generation-2', 'attempt-2', 'active', NULL,
+        '{"pullRequest":"none"}', NULL, NULL, 2, ?, ?
+      )`)
+      .run("2026-07-23T12:00:00.000Z", "2026-07-23T12:01:00.000Z");
+    legacy.query(`INSERT INTO task_worktree_receipts
+      (receipt_id, lease_id, sequence, operation, outcome, ok, payload_json, created_at)
+      VALUES (?, 'lease-1', ?, ?, ?, 1, ?, ?)`)
+      .run(
+        "receipt-1",
+        1,
+        "create_or_adopt",
+        "created",
+        JSON.stringify({
+          outcome: "created",
+          lease: {
+            writer_generation: "generation-1",
+            attempt: "attempt-1",
+            machine_id: "machine-a",
+            status: "active",
+          },
+        }),
+        "2026-07-23T12:00:00.000Z",
+      );
+    legacy.query(`INSERT INTO task_worktree_receipts
+      (receipt_id, lease_id, sequence, operation, outcome, ok, payload_json, created_at)
+      VALUES (?, 'lease-1', ?, ?, ?, 1, ?, ?)`)
+      .run(
+        "receipt-2",
+        2,
+        "transfer",
+        "transferred",
+        JSON.stringify({
+          outcome: "transferred",
+          lease: {
+            writer_generation: "generation-2",
+            attempt: "attempt-2",
+            machine_id: "machine-b",
+            status: "active",
+          },
+        }),
+        "2026-07-23T12:01:00.000Z",
+      );
+    legacy.query(`INSERT INTO task_worktree_leases
+      (lease_id, repository, repo_catalog_id, task_id, pr_group, leaf, branch,
+       worktree_path, machine_id, writer_generation, attempt, status, head_sha,
+       cleanup_policy, heartbeat_at, lease_expires_at, receipt_sequence, created_at, updated_at)
+      VALUES (
+        'lease-2', 'hasna/repos', 1, 'task-2', NULL, NULL, 'feat/task-2',
+        '/tmp/repos/task-2', 'machine-c', 'generation-stranded', 'attempt-stranded',
+        'provisioning', NULL, '{"pullRequest":"merged"}', ?, ?, 0, ?, ?
+      )`)
+      .run(
+        "2026-07-23T12:02:00.000Z",
+        "2026-07-23T12:17:00.000Z",
+        "2026-07-23T12:02:00.000Z",
+        "2026-07-23T12:02:00.000Z",
+      );
+
+    try {
+      migrateDb(legacy);
+      expect(legacy.query(`SELECT
+        generation_sequence, writer_generation, attempt, machine_id, transition
+        FROM task_worktree_generations
+        ORDER BY generation_sequence`).all()).toEqual([
+        {
+          generation_sequence: 1,
+          writer_generation: "generation-1",
+          attempt: "attempt-1",
+          machine_id: "machine-a",
+          transition: "create_or_adopt",
+        },
+        {
+          generation_sequence: 2,
+          writer_generation: "generation-2",
+          attempt: "attempt-2",
+          machine_id: "machine-b",
+          transition: "transfer",
+        },
+      ]);
+      expect(legacy.query(`SELECT
+        status, lease_expires_at, receipt_sequence
+        FROM task_worktree_leases WHERE lease_id = 'lease-2'`).get()).toEqual({
+        status: "failed",
+        lease_expires_at: null,
+        receipt_sequence: 1,
+      });
+      expect(legacy.query(`SELECT outcome, ok, payload_json
+        FROM task_worktree_receipts WHERE lease_id = 'lease-2'`).get()).toEqual({
+        outcome: "failed",
+        ok: 0,
+        payload_json: expect.stringContaining('"status":"failed"'),
+      });
+      expect(legacy.query(`SELECT count(*) AS count
+        FROM task_worktree_generations WHERE lease_id = 'lease-2'`).get()).toEqual({
+        count: 0,
+      });
+      expect(legacy.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      legacy.close();
+    }
   });
 
   it("migrates existing branch uniqueness to include remote classification", () => {
@@ -313,7 +473,7 @@ describe("database", () => {
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       closeDb();
@@ -830,7 +990,7 @@ describe("database", () => {
       const results = await Promise.all(children.map(({ completed }) => completed));
       expect(results).toEqual(Array.from({ length: 8 }, () => ({
         code: 0,
-        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12].map((version) => ({ version }))),
+        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13].map((version) => ({ version }))),
         stderr: "",
       })));
     } finally {
