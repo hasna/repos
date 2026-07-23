@@ -394,6 +394,19 @@ function protectedBranch(branch: string, baseRef?: string): boolean {
   return Boolean(baseName && name === baseName);
 }
 
+function probeOriginDefaultBranch(path: string): string | null {
+  const result = runGit(["ls-remote", "--symref", "origin", "HEAD"], path);
+  if (!result.ok) return null;
+  const matches = result.stdout
+    .split("\n")
+    .map((line) => line.trim().match(/^ref:\s+(refs\/heads\/(\S+))\s+HEAD$/))
+    .filter((match): match is RegExpMatchArray => match !== null);
+  if (matches.length !== 1) return null;
+  const branch = matches[0]![2]!;
+  const valid = runGit(["check-ref-format", "--branch", branch], path);
+  return valid.ok ? branch : null;
+}
+
 function assertSafePath(path: string, root = DEFAULT_ROOT()): string {
   const rootAbs = resolve(root);
   mkdirSync(rootAbs, { recursive: true });
@@ -585,6 +598,40 @@ function withGitMutationLocks<T>(
       try { closeSync(lock.fd); } catch {}
       try { unlinkSync(lock.path); } catch {}
     }
+  }
+}
+
+function withLeaseOperationLock<T>(
+  lease: WorktreeLease,
+  operation: string,
+  callback: () => T,
+): T {
+  const configuredRoot = lease.metadata["worktree_root"];
+  if (typeof configuredRoot !== "string" || !configuredRoot.trim()) {
+    throw new Error("lease does not record a trusted worktree root");
+  }
+  const root = resolve(configuredRoot);
+  assertSafePath(lease.canonical_path, root);
+  const lockPath = assertSafePath(join(
+    root,
+    ".control-plane-locks",
+    `${sanitizeSegment(operation, "operation")}-${sanitizeSegment(lease.lease_id, "lease")}-${lease.generation}.lock`,
+  ), root);
+  mkdirSync(dirname(lockPath), { recursive: true });
+  let fd: number;
+  try {
+    fd = acquireGitMutationLock(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new GitMutationLockBusyError(lockPath);
+    }
+    throw error;
+  }
+  try {
+    return callback();
+  } finally {
+    try { closeSync(fd); } catch {}
+    try { unlinkSync(lockPath); } catch {}
   }
 }
 
@@ -1154,6 +1201,25 @@ export function importWorktree(options: ImportWorktreeOptions): WorktreeResult {
     if (blocking.length > 0) return { ok: false, action: "import", code: "unsafe_import_refused", git, issues: blocking };
     if (rawOriginRepoIdentity(canonicalPath) !== canonicalRepo) {
       return { ok: false, action: "import", code: "repo_mismatch", git, message: "imported worktree repository does not match repo" };
+    }
+    const defaultBranch = probeOriginDefaultBranch(canonicalPath);
+    if (!defaultBranch) {
+      return {
+        ok: false,
+        action: "import",
+        code: "remote_default_branch_unverified",
+        git,
+        message: "could not verify the repository default branch from origin HEAD",
+      };
+    }
+    if (protectedBranch(options.branch, defaultBranch)) {
+      return {
+        ok: false,
+        action: "import",
+        code: "protected_branch",
+        git,
+        message: `refusing repository default branch import: ${options.branch}`,
+      };
     }
     if (git.branch !== options.branch) {
       return {
@@ -1729,6 +1795,28 @@ function resumeProvisionalRelease(lease: WorktreeLease): WorktreeResult {
 }
 
 function completeQuarantine(locked: WorktreeLease, originalGit?: GitInspection): WorktreeResult {
+  try {
+    return withLeaseOperationLock(
+      locked,
+      "quarantine",
+      () => completeQuarantineWithOperationLock(locked, originalGit),
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      action: "release",
+      code: error instanceof GitMutationLockBusyError ? "terminal_lock_busy" : "quarantine_failed",
+      message: error instanceof Error ? error.message : String(error),
+      lease: queryLeaseByIdOrPath({ leaseId: locked.lease_id }) || locked,
+      git: originalGit,
+    };
+  }
+}
+
+function completeQuarantineWithOperationLock(
+  locked: WorktreeLease,
+  originalGit?: GitInspection,
+): WorktreeResult {
   const planned = locked.metadata["planned_quarantine_path"];
   const recordedPlannedRef = locked.metadata["planned_backup_ref"];
   if (typeof planned !== "string") {

@@ -95,6 +95,13 @@ function installGitTestShim() {
   const shim = join(bin, "git");
   mkdirSync(bin, { recursive: true });
   writeFileSync(shim, `#!/bin/sh
+if [ "$1" = "ls-remote" ] && [ "$2" = "--symref" ] && [ "$3" = "origin" ] && [ "$4" = "HEAD" ]; then
+  if [ "\${HASNA_REPOS_TEST_LS_REMOTE_FAIL:-}" = "1" ]; then
+    echo "simulated remote default probe failure" >&2
+    exit 128
+  fi
+  exec "${realGit}" ls-remote --symref "$HASNA_REPOS_TEST_GIT_REMOTE" HEAD
+fi
 if [ "$1" = "ls-remote" ] && [ "$2" = "--exit-code" ] && [ "$3" = "origin" ]; then
   if [ -n "\${HASNA_REPOS_TEST_RELEASE_LOCK_COUNTER:-}" ]; then
     count=0
@@ -174,6 +181,11 @@ if [ "$1" = "worktree" ] && [ "$2" = "move" ] && [ "\${HASNA_REPOS_TEST_WORKTREE
   "${realGit}" "$@"
   echo "simulated failure after worktree move" >&2
   exit 128
+fi
+if [ "$1" = "worktree" ] && [ "$2" = "move" ] && [ -n "\${HASNA_REPOS_TEST_QUARANTINE_RETRY_RESULT:-}" ]; then
+  "${realGit}" "$@"
+  bun -e 'const { releaseWorktree } = await import(process.env["HASNA_REPOS_TEST_WORKTREES_MODULE"]); const result = releaseWorktree({ leaseId: process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_LEASE"], generation: Number(process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_GENERATION"]), fencingToken: process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_FENCE"], cleanup: "quarantine" }); await Bun.write(process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_RESULT"], JSON.stringify(result))'
+  exit 0
 fi
 if [ "$1" = "worktree" ] && [ "$2" = "move" ] && [ "\${HASNA_REPOS_TEST_MUTATE_AFTER_WORKTREE_MOVE:-}" = "1" ]; then
   "${realGit}" "$@"
@@ -299,6 +311,10 @@ afterEach(() => {
   delete process.env["HASNA_REPOS_TEST_ROLLBACK_CLAIM_BRANCH"];
   delete process.env["HASNA_REPOS_TEST_ROLLBACK_CLAIM_ROOT"];
   delete process.env["HASNA_REPOS_TEST_WORKTREES_MODULE"];
+  delete process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_RESULT"];
+  delete process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_LEASE"];
+  delete process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_GENERATION"];
+  delete process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_FENCE"];
   delete process.env["GIT_CONFIG_GLOBAL"];
   delete process.env["GIT_SSH"];
   delete process.env["GIT_SSH_COMMAND"];
@@ -1716,6 +1732,51 @@ describe("worktree control plane", () => {
     expect(imported.code).toBe("protected_branch");
   });
 
+  it("rejects the live repository default branch even when its name is not statically protected", () => {
+    const importedPath = join(root, "protected-default-import");
+    git(["clone", source, importedPath], tempDir);
+    git(["checkout", "-b", "stable", "--track", "origin/main"], importedPath);
+    git(["push", join(tempDir, "remote.git"), "HEAD:refs/heads/stable"], importedPath);
+    git(["--git-dir", join(tempDir, "remote.git"), "symbolic-ref", "HEAD", "refs/heads/stable"], tempDir);
+    git(["remote", "set-url", "origin", "https://github.com/hasna/repos.git"], importedPath);
+
+    const imported = importWorktree({
+      repo: "hasna/repos",
+      taskId: "task-protected-default-import",
+      runId: "run-protected-default-import",
+      machineId: "machine-1",
+      branch: "stable",
+      owner: "pacuvius",
+      path: importedPath,
+      root,
+    });
+
+    expect(imported.ok).toBe(false);
+    expect(imported.code).toBe("protected_branch");
+  });
+
+  it("fails closed when origin HEAD cannot prove the live repository default branch", () => {
+    const importedPath = join(root, "unverified-default-import");
+    git(["clone", source, importedPath], tempDir);
+    git(["checkout", "-b", "task/import-unverified-default", "--track", "origin/main"], importedPath);
+    git(["remote", "set-url", "origin", "https://github.com/hasna/repos.git"], importedPath);
+    process.env["HASNA_REPOS_TEST_LS_REMOTE_FAIL"] = "1";
+
+    const imported = importWorktree({
+      repo: "hasna/repos",
+      taskId: "task-unverified-default-import",
+      runId: "run-unverified-default-import",
+      machineId: "machine-1",
+      branch: "task/import-unverified-default",
+      owner: "pacuvius",
+      path: importedPath,
+      root,
+    });
+
+    expect(imported.ok).toBe(false);
+    expect(imported.code).toBe("remote_default_branch_unverified");
+  });
+
   it("imports an existing safe worktree idempotently and includes it in inventory", () => {
     const importedPath = join(root, "imported-main");
     git(["clone", source, importedPath], tempDir);
@@ -2098,6 +2159,35 @@ describe("worktree control plane", () => {
     expect(after.ok).toBe(false);
     expect(after.code).toBe("owner_collision");
     expect(after.lease?.lease_id).toBe(lease.lease_id);
+  });
+
+  it("serializes a concurrent quarantine retry across the filesystem move", () => {
+    const result = claim("task/quarantine-concurrent-retry");
+    expect(result.ok).toBe(true);
+    const lease = result.lease!;
+    publishBranch(lease.canonical_path, lease.branch);
+    const retryResultPath = join(tempDir, "quarantine-retry-result.json");
+    process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_RESULT"] = retryResultPath;
+    process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_LEASE"] = lease.lease_id;
+    process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_GENERATION"] = String(lease.generation);
+    process.env["HASNA_REPOS_TEST_QUARANTINE_RETRY_FENCE"] = lease.fencing_token;
+    process.env["HASNA_REPOS_TEST_WORKTREES_MODULE"] = join(import.meta.dir, "worktrees.ts");
+
+    const released = releaseWorktree({
+      leaseId: lease.lease_id,
+      generation: lease.generation,
+      fencingToken: lease.fencing_token,
+      cleanup: "quarantine",
+    });
+    const retry = JSON.parse(readFileSync(retryResultPath, "utf8")) as {
+      ok: boolean;
+      code?: string;
+    };
+
+    expect(retry.ok).toBe(false);
+    expect(retry.code).toBe("terminal_lock_busy");
+    expect(released.ok).toBe(true);
+    expect(released.lease?.status).toBe("quarantined");
   });
 
   it("resumes quarantine compensation after a crash before rollback", () => {

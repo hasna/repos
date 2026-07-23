@@ -579,6 +579,8 @@ function validateBranchControlSchema(db: Database): void {
 
 interface IntegratedControlState {
   remote: V9RemoteIdentityTargetState;
+  repos: Array<Record<string, unknown>>;
+  remotes: Array<Record<string, unknown>>;
   branches: Array<Record<string, unknown>>;
   branchAudits: Array<Record<string, unknown>>;
   worktreeLeases: Array<Record<string, unknown>>;
@@ -590,6 +592,13 @@ function readIntegratedControlState(
 ): IntegratedControlState {
   return {
     remote,
+    // V9 verifies the complete set of remote-bearing values, while the
+    // integrated successor must additionally prove that a marker-time trigger
+    // did not alter any non-remote field on those same registry rows.
+    repos: (db.query("SELECT * FROM repos").all() as Array<Record<string, unknown>>)
+      .sort((left, right) => Number(left["id"]) - Number(right["id"])),
+    remotes: (db.query("SELECT * FROM remotes").all() as Array<Record<string, unknown>>)
+      .sort((left, right) => Number(left["id"]) - Number(right["id"])),
     branches: (db.query("SELECT * FROM branches").all() as Array<Record<string, unknown>>)
       .sort((left, right) => Number(left["id"]) - Number(right["id"])),
     branchAudits: (db.query("SELECT * FROM branch_adjudication_audit").all() as Array<Record<string, unknown>>)

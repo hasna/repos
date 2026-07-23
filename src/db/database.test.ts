@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDb, closeDb } from "./database";
@@ -332,7 +332,7 @@ describe("database", () => {
   });
 
   it("rolls back version 21 when its marker trigger mutates any integrated row set", () => {
-    for (const scenario of ["branch", "branch-audit", "worktree-lease"] as const) {
+    for (const scenario of ["repo", "remote", "branch", "branch-audit", "worktree-lease"] as const) {
       closeDb();
       const dir = mkdtempSync(join(tmpdir(), `repos-v21-marker-${scenario}-`));
       const path = join(dir, "repos.db");
@@ -340,6 +340,10 @@ describe("database", () => {
         const initial = getDb(path);
         const repo = initial.query("INSERT INTO repos (path, name) VALUES (?, ?) RETURNING id")
           .get(join(dir, "repo"), `repo-${scenario}`) as { id: number };
+        const remote = initial.query(`INSERT INTO remotes (
+          repo_id, name, url
+        ) VALUES (?, 'origin', 'https://github.com/hasna/repos.git') RETURNING id`)
+          .get(repo.id) as { id: number };
         const branch = initial.query(`INSERT INTO branches (
           repo_id, name, is_remote, last_commit_sha
         ) VALUES (?, 'codewith/v21-proof', 0, ?) RETURNING id`)
@@ -361,11 +365,15 @@ describe("database", () => {
           1, 'wt_v21_marker_proof:1', 1, 1, 1, 1, '{}'
         )`).run(join(dir, "worktree"));
         initial.query("DELETE FROM migrations WHERE version = 21").run();
-        const triggerAction = scenario === "branch"
-          ? `DELETE FROM branches WHERE id = ${branch.id};`
-          : scenario === "branch-audit"
-            ? "UPDATE branch_adjudication_audit SET actor = 'substituted' WHERE id = 'audit-v21-proof';"
-            : "DELETE FROM worktree_leases WHERE lease_id = 'wt_v21_marker_proof';";
+        const triggerAction = scenario === "repo"
+          ? `UPDATE repos SET name = 'substituted' WHERE id = ${repo.id};`
+          : scenario === "remote"
+            ? `UPDATE remotes SET name = 'mirror' WHERE id = ${remote.id};`
+            : scenario === "branch"
+              ? `DELETE FROM branches WHERE id = ${branch.id};`
+              : scenario === "branch-audit"
+                ? "UPDATE branch_adjudication_audit SET actor = 'substituted' WHERE id = 'audit-v21-proof';"
+                : "DELETE FROM worktree_leases WHERE lease_id = 'wt_v21_marker_proof';";
         initial.exec(`
           CREATE TRIGGER mutate_v21_target AFTER INSERT ON migrations
           WHEN NEW.version = 21
@@ -379,6 +387,10 @@ describe("database", () => {
         closeDb();
         const check = new Database(path, { readonly: true });
         expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toBeNull();
+        expect(check.query("SELECT name FROM repos WHERE id = ?").get(repo.id))
+          .toEqual({ name: `repo-${scenario}` });
+        expect(check.query("SELECT name FROM remotes WHERE id = ?").get(remote.id))
+          .toEqual({ name: "origin" });
         expect(check.query("SELECT id FROM branches WHERE id = ?").get(branch.id)).toEqual({ id: branch.id });
         expect(check.query("SELECT actor FROM branch_adjudication_audit WHERE id = 'audit-v21-proof'").get())
           .toEqual({ actor: "reviewed-actor" });
@@ -568,16 +580,36 @@ describe("database", () => {
       git("add", "README.md");
       git("commit", "-m", "initial");
       git("checkout", "-b", "codewith/migrated-claim");
-      const claim = importWorktree({
-        repo: "hasna/migrated-claim",
-        taskId: "task-migrated-claim",
-        runId: "run-migrated-claim",
-        machineId: "station01",
-        branch: "codewith/migrated-claim",
-        owner: "migration-test",
-        path: source,
-        root: worktreeRoot,
-      });
+      const originalPath = process.env["PATH"] || "";
+      const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+      const shimDir = join(dir, "bin");
+      const shim = join(shimDir, "git");
+      mkdirSync(shimDir, { recursive: true });
+      writeFileSync(shim, `#!/bin/sh
+if [ "$1" = "ls-remote" ] && [ "$2" = "--symref" ] && [ "$3" = "origin" ] && [ "$4" = "HEAD" ]; then
+  head="$(${JSON.stringify(realGit)} rev-parse refs/heads/main)"
+  printf 'ref: refs/heads/main\\tHEAD\\n%s\\tHEAD\\n' "$head"
+  exit 0
+fi
+exec ${JSON.stringify(realGit)} "$@"
+`);
+      chmodSync(shim, 0o755);
+      process.env["PATH"] = `${shimDir}:${originalPath}`;
+      let claim;
+      try {
+        claim = importWorktree({
+          repo: "hasna/migrated-claim",
+          taskId: "task-migrated-claim",
+          runId: "run-migrated-claim",
+          machineId: "station01",
+          branch: "codewith/migrated-claim",
+          owner: "migration-test",
+          path: source,
+          root: worktreeRoot,
+        });
+      } finally {
+        process.env["PATH"] = originalPath;
+      }
       expect(claim.ok).toBe(true);
       expect(inspectWorktree({ leaseId: claim.lease!.lease_id }).lease?.status).toBe("active");
       expect(renewWorktreeLease({

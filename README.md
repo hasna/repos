@@ -108,6 +108,9 @@ repos worktrees claim \
 When `--branch` is omitted, Repos derives a non-protected task branch from the
 task and run IDs. An owner/name repo is resolved to its GitHub clone URL, so the
 minimal command emitted by the worktree guard is directly executable.
+Import refuses both statically protected branch names and the repository's live
+default branch as proved by `origin`'s symbolic `HEAD`; an unavailable or
+malformed default-branch proof fails closed before a lease is created.
 
 Release and cleanup are fenced operations. `release` requires the current
 generation and fencing token, refuses dirty/staged/untracked/detached,
@@ -120,10 +123,12 @@ configuration plus proxy and CA override variables; canonical SSH claims with in
 repositories with direct, included, or per-worktree custom transport programs
 fail closed. Effective upstream configuration must resolve to the matching
 `origin/<branch>` rather than only appearing correct in common config. Quarantine
-first locks the lease with a compare-and-swap transition, derives a canonical
-direct `refs/hasna/worktrees/...` backup ref, rejects symbolic or conflicting
-refs, moves the Git worktree with Git-aware metadata handling, and then records
-the final path. Recovery revalidates the actual source or quarantine path
+first locks the lease with a compare-and-swap transition and holds a
+PID-attributed per-lease operation lock across the filesystem move and backup
+proof. It derives a canonical direct `refs/hasna/worktrees/...` backup ref,
+rejects symbolic or conflicting refs, moves the Git worktree with Git-aware
+metadata handling, and then records the final path. Recovery revalidates the
+actual source or quarantine path
 against the same release-safety proof after the move and before completion,
 requires the canonical machine/repository/lease path shape, and rolls back
 post-move failures or leaves terminally inspectable failed leases. A competing
