@@ -95,12 +95,40 @@ function installGitTestShim() {
   const shim = join(bin, "git");
   mkdirSync(bin, { recursive: true });
   writeFileSync(shim, `#!/bin/sh
-if [ "$1" = "ls-remote" ] && [ "$2" = "--symref" ] && [ "$3" = "origin" ] && [ "$4" = "HEAD" ]; then
+if [ "$1" = "ls-remote" ] && [ "$2" = "--symref" ] && [ "$4" = "HEAD" ]; then
   if [ "\${HASNA_REPOS_TEST_LS_REMOTE_FAIL:-}" = "1" ]; then
     echo "simulated remote default probe failure" >&2
     exit 128
   fi
-  exec "${realGit}" ls-remote --symref "$HASNA_REPOS_TEST_GIT_REMOTE" HEAD
+  if [ "\${HASNA_REPOS_TEST_LS_REMOTE_MALFORMED:-}" = "1" ]; then
+    printf 'ref: refs/heads/main\\tHEAD\\n'
+    exit 0
+  fi
+  if [ "\${HASNA_REPOS_TEST_LS_REMOTE_SHA256_PROOF:-}" = "1" ]; then
+    printf 'ref: refs/heads/main\\tHEAD\\n'
+    printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\tHEAD\\n'
+    exit 0
+  fi
+  if [ -n "\${HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER:-}" ]; then
+    count=0
+    if [ -f "$HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER" ]; then
+      count="$(cat "$HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER")"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"
+    if [ "$count" = "\${HASNA_REPOS_TEST_DEFAULT_PROBE_FAIL_AT:-0}" ]; then
+      echo "simulated pre-activation default probe failure" >&2
+      exit 128
+    fi
+    if [ "$count" = "2" ] && [ -n "\${HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH:-}" ]; then
+      "${realGit}" --git-dir="$HASNA_REPOS_TEST_GIT_REMOTE" symbolic-ref \
+        HEAD "refs/heads/$HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"
+    fi
+  fi
+  if [ "$3" = "origin" ]; then
+    exec "${realGit}" ls-remote --symref "$HASNA_REPOS_TEST_GIT_REMOTE" HEAD
+  fi
+  exec "${realGit}" ls-remote --symref "$3" HEAD
 fi
 if [ "$1" = "ls-remote" ] && [ "$2" = "--exit-code" ] && [ "$3" = "origin" ]; then
   if [ -n "\${HASNA_REPOS_TEST_RELEASE_LOCK_COUNTER:-}" ]; then
@@ -283,6 +311,11 @@ afterEach(() => {
   delete process.env["HASNA_REPOS_DB_PATH"];
   delete process.env["HASNA_REPOS_TEST_GIT_REMOTE"];
   delete process.env["HASNA_REPOS_TEST_LS_REMOTE_FAIL"];
+  delete process.env["HASNA_REPOS_TEST_LS_REMOTE_MALFORMED"];
+  delete process.env["HASNA_REPOS_TEST_LS_REMOTE_SHA256_PROOF"];
+  delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"];
+  delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_FAIL_AT"];
+  delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"];
   delete process.env["HASNA_REPOS_TEST_WORKTREE_MOVE_FAIL_AFTER_MOVE"];
   delete process.env["HASNA_REPOS_TEST_QUARANTINE_WINNER_DB"];
   delete process.env["HASNA_REPOS_TEST_QUARANTINE_WINNER_PATH"];
@@ -391,7 +424,7 @@ describe("worktree control plane", () => {
     expect(result.git?.branch).toBe(branch);
   });
 
-  it("uses main rather than the source checkout HEAD when base is omitted", () => {
+  it("uses the live default rather than the source checkout HEAD when base is omitted", () => {
     const mainHead = git(["rev-parse", "main"], source);
     git(["checkout", "-b", "unrelated-feature"], source);
     writeFileSync(join(source, "feature.txt"), "feature\n");
@@ -408,6 +441,223 @@ describe("worktree control plane", () => {
     });
     expect(result.ok).toBe(true);
     expect(result.git?.head_sha).toBe(mainHead);
+  });
+
+  it("rejects the live repository default on claim and derives the base from that proof", () => {
+    git(["checkout", "-b", "stable"], source);
+    writeFileSync(join(source, "stable.txt"), "stable default\n");
+    git(["add", "stable.txt"], source);
+    git(["commit", "-m", "stable default"], source);
+    publishBranch(source, "stable");
+    git(["--git-dir", join(tempDir, "remote.git"), "symbolic-ref", "HEAD", "refs/heads/stable"], tempDir);
+    const stableHead = git(["rev-parse", "HEAD"], source);
+
+    const rejected = claimWorktree({
+      repo: "hasna/repos",
+      source,
+      taskId: "task-claim-default-stable",
+      runId: "run-claim-default-stable",
+      machineId: "machine-1",
+      branch: "stable",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "claim-default-stable",
+    });
+    expect(rejected.ok).toBe(false);
+    expect(rejected.code).toBe("protected_branch");
+    expect(getDb().query("SELECT COUNT(*) AS count FROM worktree_leases").get()).toEqual({ count: 0 });
+
+    const claimed = claimWorktree({
+      repo: "hasna/repos",
+      source,
+      taskId: "task-claim-stable-base",
+      runId: "run-claim-stable-base",
+      machineId: "machine-1",
+      branch: "task/claim-stable-base",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "claim-stable-base",
+    });
+    expect(claimed.ok).toBe(true);
+    expect(claimed.lease?.base_ref).toBe("stable");
+    expect(claimed.lease?.head_sha).toBe(stableHead);
+  });
+
+  it("fails closed when claim cannot prove a well-formed live default branch", () => {
+    for (const mode of ["failure", "malformed"] as const) {
+      if (mode === "failure") process.env["HASNA_REPOS_TEST_LS_REMOTE_FAIL"] = "1";
+      else process.env["HASNA_REPOS_TEST_LS_REMOTE_MALFORMED"] = "1";
+      const result = claimWorktree({
+        repo: "hasna/repos",
+        source,
+        taskId: `task-claim-default-${mode}`,
+        runId: `run-claim-default-${mode}`,
+        machineId: "machine-1",
+        branch: `task/claim-default-${mode}`,
+        owner: "pacuvius",
+        root,
+        idempotencyKey: `claim-default-${mode}`,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.code).toBe("remote_default_branch_unverified");
+      delete process.env["HASNA_REPOS_TEST_LS_REMOTE_FAIL"];
+      delete process.env["HASNA_REPOS_TEST_LS_REMOTE_MALFORMED"];
+    }
+    expect(getDb().query("SELECT COUNT(*) AS count FROM worktree_leases").get()).toEqual({ count: 0 });
+    expect(existsSync(root)).toBe(false);
+  });
+
+  it("accepts a SHA-256 object id in a well-formed live-default proof", () => {
+    process.env["HASNA_REPOS_TEST_LS_REMOTE_SHA256_PROOF"] = "1";
+    const result = claimWorktree({
+      repo: "hasna/repos",
+      source,
+      taskId: "task-claim-default-sha256-proof",
+      runId: "run-claim-default-sha256-proof",
+      machineId: "machine-1",
+      branch: "task/claim-default-sha256-proof",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "claim-default-sha256-proof",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.lease?.base_ref).toBe("main");
+  });
+
+  it("re-proves the live default immediately before claim activation and can retry after recovery", () => {
+    const branch = "task/claim-default-race";
+    const mainHead = git(["rev-parse", "refs/heads/main"], source);
+    git(["--git-dir", join(tempDir, "remote.git"), "update-ref", `refs/heads/${branch}`, mainHead], tempDir);
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"] = join(tempDir, "claim-default-probe-counter");
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"] = branch;
+
+    const options = {
+      repo: "hasna/repos",
+      source,
+      taskId: "task-claim-default-race",
+      runId: "run-claim-default-race",
+      machineId: "machine-1",
+      branch,
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "claim-default-race",
+    };
+    const claimed = claimWorktree(options);
+
+    expect(claimed.ok).toBe(false);
+    expect(claimed.code).toBe("protected_branch");
+    expect(claimed.lease?.status).toBe("preparing");
+    expect(getDb().query("SELECT COUNT(*) AS count FROM worktree_leases WHERE status = 'active'").get())
+      .toEqual({ count: 0 });
+
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"];
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"];
+    git(["--git-dir", join(tempDir, "remote.git"), "symbolic-ref", "HEAD", "refs/heads/main"], tempDir);
+    const recovered = claimWorktree(options);
+    expect(recovered.ok).toBe(true);
+    expect(recovered.idempotent).toBe(true);
+    expect(recovered.lease?.lease_id).toBe(claimed.lease?.lease_id);
+  });
+
+  it("keeps a claim retryable when its final live-default proof is unavailable", () => {
+    const options = {
+      repo: "hasna/repos",
+      source,
+      taskId: "task-claim-default-reproof-failure",
+      runId: "run-claim-default-reproof-failure",
+      machineId: "machine-1",
+      branch: "task/claim-default-reproof-failure",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "claim-default-reproof-failure",
+    };
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"] = join(tempDir, "claim-default-failure-counter");
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_FAIL_AT"] = "2";
+
+    const failed = claimWorktree(options);
+    expect(failed.ok).toBe(false);
+    expect(failed.code).toBe("remote_default_branch_unverified");
+    expect(failed.lease?.status).toBe("preparing");
+
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"];
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_FAIL_AT"];
+    const recovered = claimWorktree(options);
+    expect(recovered.ok).toBe(true);
+    expect(recovered.idempotent).toBe(true);
+    expect(recovered.lease?.lease_id).toBe(failed.lease?.lease_id);
+  });
+
+  it("retains the persisted base when retrying after the live default changes to another safe branch", () => {
+    const branch = "task/claim-safe-default-race";
+    const mainHead = git(["rev-parse", "refs/heads/main"], source);
+    git(["--git-dir", join(tempDir, "remote.git"), "update-ref", "refs/heads/stable", mainHead], tempDir);
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"] = join(tempDir, "claim-safe-default-probe-counter");
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"] = "stable";
+
+    const options = {
+      repo: "hasna/repos",
+      source,
+      taskId: "task-claim-safe-default-race",
+      runId: "run-claim-safe-default-race",
+      machineId: "machine-1",
+      branch,
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "claim-safe-default-race",
+    };
+    const changed = claimWorktree(options);
+
+    expect(changed.ok).toBe(false);
+    expect(changed.code).toBe("remote_default_branch_changed");
+    expect(changed.lease?.status).toBe("preparing");
+    expect(changed.lease?.base_ref).toBe("main");
+
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"];
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"];
+    const recovered = claimWorktree(options);
+    expect(recovered.ok).toBe(true);
+    expect(recovered.idempotent).toBe(true);
+    expect(recovered.lease?.lease_id).toBe(changed.lease?.lease_id);
+    expect(recovered.lease?.base_ref).toBe("main");
+    expect(recovered.lease?.head_sha).toBe(mainHead);
+  });
+
+  it("replays an active omitted-base claim after a safe default change but rejects an explicit base change", () => {
+    const options = {
+      repo: "hasna/repos",
+      source,
+      taskId: "task-active-safe-default-change",
+      runId: "run-active-safe-default-change",
+      machineId: "machine-1",
+      branch: "task/active-safe-default-change",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "active-safe-default-change",
+    };
+    const claimed = claimWorktree(options);
+    expect(claimed.ok).toBe(true);
+    expect(claimed.lease?.base_ref).toBe("main");
+
+    const mainHead = git(["rev-parse", "refs/heads/main"], source);
+    git(["--git-dir", join(tempDir, "remote.git"), "update-ref", "refs/heads/stable", mainHead], tempDir);
+    git(["--git-dir", join(tempDir, "remote.git"), "symbolic-ref", "HEAD", "refs/heads/stable"], tempDir);
+
+    const replayed = claimWorktree(options);
+    expect(replayed.ok).toBe(true);
+    expect(replayed.idempotent).toBe(true);
+    expect(replayed.lease?.lease_id).toBe(claimed.lease?.lease_id);
+    expect(replayed.lease?.base_ref).toBe("main");
+
+    const explicitChange = claimWorktree({ ...options, baseRef: "stable" });
+    expect(explicitChange.ok).toBe(false);
+    expect(explicitChange.code).toBe("idempotency_key_conflict");
+    expect(explicitChange.issues?.some((issue) => issue.ref === "main != stable")).toBe(true);
+
+    git(["--git-dir", join(tempDir, "remote.git"), "update-ref", `refs/heads/${options.branch}`, mainHead], tempDir);
+    git(["--git-dir", join(tempDir, "remote.git"), "symbolic-ref", "HEAD", `refs/heads/${options.branch}`], tempDir);
+    const becameDefault = claimWorktree(options);
+    expect(becameDefault.ok).toBe(false);
+    expect(becameDefault.code).toBe("protected_branch");
   });
 
   it("rejects an unpushed local base that differs from validated origin", () => {
@@ -1732,6 +1982,29 @@ describe("worktree control plane", () => {
     expect(imported.code).toBe("protected_branch");
   });
 
+  it("rejects blank import identity fields and paths before resolving or persisting them", () => {
+    const base = {
+      repo: "hasna/repos",
+      taskId: "task-import-required",
+      runId: "run-import-required",
+      machineId: "machine-1",
+      branch: "task/import-required",
+      owner: "pacuvius",
+      path: join(root, "required-import"),
+      root,
+    };
+    for (const field of ["taskId", "runId", "machineId", "owner"] as const) {
+      const imported = importWorktree({ ...base, [field]: " \t " });
+      expect(imported.ok).toBe(false);
+      expect(imported.code).toBe("missing_required_key");
+    }
+    const blankPath = importWorktree({ ...base, path: " \t " });
+    expect(blankPath.ok).toBe(false);
+    expect(blankPath.code).toBe("missing_required_path");
+    expect(getDb().query("SELECT COUNT(*) AS count FROM worktree_leases").get()).toEqual({ count: 0 });
+    expect(existsSync(root)).toBe(false);
+  });
+
   it("rejects the live repository default branch even when its name is not statically protected", () => {
     const importedPath = join(root, "protected-default-import");
     git(["clone", source, importedPath], tempDir);
@@ -1777,6 +2050,44 @@ describe("worktree control plane", () => {
     expect(imported.code).toBe("remote_default_branch_unverified");
   });
 
+  it("re-proves the live default immediately before import activation and can retry after recovery", () => {
+    const importedPath = join(root, "default-race-import");
+    const branch = "task/import-default-race";
+    git(["clone", source, importedPath], tempDir);
+    git(["checkout", "-b", branch, "--track", "origin/main"], importedPath);
+    git(["push", join(tempDir, "remote.git"), `HEAD:refs/heads/${branch}`], importedPath);
+    git(["remote", "set-url", "origin", "https://github.com/hasna/repos.git"], importedPath);
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"] = join(tempDir, "import-default-probe-counter");
+    process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"] = branch;
+
+    const options = {
+      repo: "hasna/repos",
+      taskId: "task-import-default-race",
+      runId: "run-import-default-race",
+      machineId: "machine-1",
+      branch,
+      owner: "pacuvius",
+      path: importedPath,
+      root,
+      idempotencyKey: "import-default-race",
+    };
+    const imported = importWorktree(options);
+
+    expect(imported.ok).toBe(false);
+    expect(imported.code).toBe("protected_branch");
+    expect(imported.lease?.status).toBe("preparing");
+    expect(getDb().query("SELECT COUNT(*) AS count FROM worktree_leases WHERE status = 'active'").get())
+      .toEqual({ count: 0 });
+
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"];
+    delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"];
+    git(["--git-dir", join(tempDir, "remote.git"), "symbolic-ref", "HEAD", "refs/heads/main"], tempDir);
+    const recovered = importWorktree(options);
+    expect(recovered.ok).toBe(true);
+    expect(recovered.idempotent).toBe(true);
+    expect(recovered.lease?.lease_id).toBe(imported.lease?.lease_id);
+  });
+
   it("imports an existing safe worktree idempotently and includes it in inventory", () => {
     const importedPath = join(root, "imported-main");
     git(["clone", source, importedPath], tempDir);
@@ -1796,8 +2107,9 @@ describe("worktree control plane", () => {
     });
     expect(imported.ok).toBe(true);
     expect(imported.lease?.canonical_path).toBe(importedPath);
-    getDb().query("UPDATE worktree_leases SET status = 'preparing' WHERE lease_id = ?")
-      .run(imported.lease!.lease_id);
+    expect(imported.lease?.metadata["created_by"]).toBe("repos.worktrees.import");
+    getDb().query("UPDATE worktree_leases SET status = 'preparing', metadata_json = ? WHERE lease_id = ?")
+      .run(JSON.stringify({ ...imported.lease!.metadata, created_by: "repos.worktrees.claim" }), imported.lease!.lease_id);
 
     const replay = importWorktree({
       repo: "hasna/repos",
@@ -1814,6 +2126,7 @@ describe("worktree control plane", () => {
     expect(replay.idempotent).toBe(true);
     expect(replay.lease?.lease_id).toBe(imported.lease?.lease_id);
     expect(replay.lease?.status).toBe("active");
+    expect(replay.lease?.metadata["created_by"]).toBe("repos.worktrees.import");
 
     const inventory = inventoryWorktrees({ root });
     expect(inventory.discovered.map((entry) => entry.path)).toContain(importedPath);

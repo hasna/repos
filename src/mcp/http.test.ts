@@ -86,6 +86,21 @@ describe("MCP HTTP transport", () => {
       }
     }
 
+    for (const [toolName, propertyNames] of [
+      ["worktree_claim", ["repo", "task_id", "run_id", "machine_id", "owner"]],
+      ["worktree_import", ["repo", "task_id", "run_id", "machine_id", "branch", "owner", "path"]],
+    ] as const) {
+      const tool = tools.find((candidate) => candidate.name === toolName);
+      expect(tool).toBeDefined();
+      const properties = tool!.inputSchema.properties as Record<string, Record<string, unknown>>;
+      for (const propertyName of propertyNames) {
+        expect(properties[propertyName]).toMatchObject({
+          type: "string",
+          minLength: 1,
+        });
+      }
+    }
+
     await client.close();
   });
 

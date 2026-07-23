@@ -309,12 +309,12 @@ server.tool("release_pipeline_parity", "Check the standard ci.yml + tag-publish 
 // ── Worktree control plane ──
 
 server.tool("worktree_claim", "Atomically claim and create a managed git worktree lease", {
-  repo: z.string().describe("Canonical repo, URL, or source path"),
-  task_id: z.string().describe("Todos task id"),
-  run_id: z.string().describe("Run/session id"),
-  machine_id: z.string().describe("Machine id"),
-  branch: z.string().optional().describe("Non-protected branch; derived from task/run when omitted"),
-  owner: z.string().describe("Lease owner"),
+  repo: z.string().trim().min(1).describe("Canonical repo, URL, or source path"),
+  task_id: z.string().trim().min(1).describe("Todos task id"),
+  run_id: z.string().trim().min(1).describe("Run/session id"),
+  machine_id: z.string().trim().min(1).describe("Machine id"),
+  branch: z.string().trim().min(1).optional().describe("Non-protected branch; derived from task/run when omitted"),
+  owner: z.string().trim().min(1).describe("Lease owner"),
   source: z.string().optional().describe("Git source path or URL; defaults to repo"),
   base: z.string().optional().describe("Base ref"),
   ttl_seconds: z.number().int().positive().optional().describe("Lease TTL seconds"),
@@ -376,13 +376,13 @@ server.tool("worktree_inventory", "List discovered worktrees and persisted lease
 }, async (args) => jsonText({ ok: true, action: "inventory", ...inventoryWorktrees({ root: args.root, limit: args.limit }) }));
 
 server.tool("worktree_import", "Import an existing safe git worktree into the lease store", {
-  repo: z.string().describe("Canonical repo"),
-  task_id: z.string().describe("Todos task id"),
-  run_id: z.string().describe("Run/session id"),
-  machine_id: z.string().describe("Machine id"),
-  branch: z.string().describe("Existing branch"),
-  owner: z.string().describe("Lease owner"),
-  path: z.string().describe("Existing worktree path under root"),
+  repo: z.string().trim().min(1).describe("Canonical repo"),
+  task_id: z.string().trim().min(1).describe("Todos task id"),
+  run_id: z.string().trim().min(1).describe("Run/session id"),
+  machine_id: z.string().trim().min(1).describe("Machine id"),
+  branch: z.string().trim().min(1).describe("Existing branch"),
+  owner: z.string().trim().min(1).describe("Lease owner"),
+  path: z.string().trim().min(1).describe("Existing worktree path under root"),
   root: z.string().optional().describe("Canonical worktree root"),
   ttl_seconds: z.number().int().positive().optional().describe("Lease TTL seconds"),
   idempotency_key: z.string().optional().describe("Idempotency key"),

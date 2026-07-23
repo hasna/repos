@@ -108,9 +108,15 @@ repos worktrees claim \
 When `--branch` is omitted, Repos derives a non-protected task branch from the
 task and run IDs. An owner/name repo is resolved to its GitHub clone URL, so the
 minimal command emitted by the worktree guard is directly executable.
-Import refuses both statically protected branch names and the repository's live
-default branch as proved by `origin`'s symbolic `HEAD`; an unavailable or
-malformed default-branch proof fails closed before a lease is created.
+Claim and import refuse both statically protected branch names and the
+repository's live default branch as proved by the canonical `origin`'s symbolic
+`HEAD`; an unavailable or malformed default-branch proof fails closed before a
+lease is created. When claim omits `--base`, that same live proof selects the
+base instead of assuming a particular branch name. Both operations re-prove the
+unchanged live default as their final pre-activation check. A proof failure,
+change, or branch becoming default keeps the provisional lease retryable and
+never activates it. Required import identities and paths must be nonempty before
+path resolution or persistence, and imported leases record import provenance.
 
 Release and cleanup are fenced operations. `release` requires the current
 generation and fencing token, refuses dirty/staged/untracked/detached,

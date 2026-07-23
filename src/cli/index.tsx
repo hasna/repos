@@ -1983,7 +1983,7 @@ worktrees
   .option("--source <path-or-url>", "Git source path or URL; defaults to --repo")
   .option("--machine-id <id>", "Machine id; defaults to CODEWITH_MACHINE_ID/HOSTNAME")
   .option("--owner <agent>", "Lease owner; defaults to CODEWITH_AGENT_NAME/USER")
-  .option("--base <ref>", "Base ref for git worktree add", "main")
+  .option("--base <ref>", "Base ref for git worktree add; defaults to the live origin default")
   .option("--ttl-seconds <n>", "Lease TTL in seconds", "21600")
   .option("--idempotency-key <key>", "Idempotency key for safe retries")
   .option("--mode <mode>", "Worktree mode; only required is supported", "required")

@@ -105,6 +105,7 @@ export interface ClaimWorktreeOptions {
 interface ResolvedClaimWorktreeOptions extends Omit<ClaimWorktreeOptions, "branch"> {
   branch: string;
   source: string;
+  verifiedDefaultBranch: string;
 }
 
 export interface ImportWorktreeOptions {
@@ -310,12 +311,18 @@ function gitSourceFor(options: Pick<ClaimWorktreeOptions, "repo" | "source">): s
   return source;
 }
 
-function resolvedClaimOptions(options: ClaimWorktreeOptions): ResolvedClaimWorktreeOptions {
+function resolvedClaimOptions(
+  options: ClaimWorktreeOptions,
+  source: string,
+  verifiedDefaultBranch: string,
+  persistedBaseRef?: string | null,
+): ResolvedClaimWorktreeOptions {
   return {
     ...options,
     branch: options.branch?.trim() || defaultWorktreeBranch(options),
-    source: gitSourceFor(options),
-    baseRef: options.baseRef?.trim() || "main",
+    source,
+    baseRef: options.baseRef?.trim() || persistedBaseRef || verifiedDefaultBranch,
+    verifiedDefaultBranch,
   };
 }
 
@@ -394,17 +401,73 @@ function protectedBranch(branch: string, baseRef?: string): boolean {
   return Boolean(baseName && name === baseName);
 }
 
-function probeOriginDefaultBranch(path: string): string | null {
-  const result = runGit(["ls-remote", "--symref", "origin", "HEAD"], path);
+function probeRemoteDefaultBranch(remote: string, cwd: string): string | null {
+  const result = runGit(["ls-remote", "--symref", remote, "HEAD"], cwd);
   if (!result.ok) return null;
-  const matches = result.stdout
+  const lines = result.stdout
     .split("\n")
-    .map((line) => line.trim().match(/^ref:\s+(refs\/heads\/(\S+))\s+HEAD$/))
-    .filter((match): match is RegExpMatchArray => match !== null);
-  if (matches.length !== 1) return null;
-  const branch = matches[0]![2]!;
-  const valid = runGit(["check-ref-format", "--branch", branch], path);
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length !== 2) return null;
+  const ref = lines[0]!.match(/^ref:\s+(refs\/heads\/(\S+))\s+HEAD$/);
+  const head = lines[1]!.match(/^([0-9a-f]{40,64})\s+HEAD$/);
+  if (!ref || !head) return null;
+  const branch = ref[2]!;
+  const valid = runGit(["check-ref-format", "--branch", branch], cwd);
   return valid.ok ? branch : null;
+}
+
+function probeOriginDefaultBranch(path: string): string | null {
+  return probeRemoteDefaultBranch("origin", path);
+}
+
+function probeSourceDefaultBranch(source: string): string | null {
+  const local = localSourcePath(source);
+  return local
+    ? probeOriginDefaultBranch(local)
+    : probeRemoteDefaultBranch(source, process.cwd());
+}
+
+class DefaultBranchContractError extends Error {
+  constructor(readonly code: "remote_default_branch_unverified" | "remote_default_branch_changed" | "protected_branch", message: string) {
+    super(message);
+    this.name = "DefaultBranchContractError";
+  }
+}
+
+function assertStableDefaultBranch(
+  path: string,
+  request: Pick<ResolvedClaimWorktreeOptions, "branch" | "verifiedDefaultBranch">,
+): void {
+  const currentDefault = probeOriginDefaultBranch(path);
+  if (!currentDefault) {
+    throw new DefaultBranchContractError(
+      "remote_default_branch_unverified",
+      "could not re-verify the repository default branch from origin HEAD before activation",
+    );
+  }
+  if (currentDefault !== request.verifiedDefaultBranch) {
+    if (currentDefault === request.branch) {
+      throw new DefaultBranchContractError(
+        "protected_branch",
+        `refusing repository default branch activation: ${request.branch}`,
+      );
+    }
+    throw new DefaultBranchContractError(
+      "remote_default_branch_changed",
+      `repository default branch changed during activation: ${request.verifiedDefaultBranch} -> ${currentDefault}`,
+    );
+  }
+  if (currentDefault === request.branch) {
+    throw new DefaultBranchContractError(
+      "protected_branch",
+      `refusing repository default branch activation: ${request.branch}`,
+    );
+  }
+}
+
+function nonEmpty(value: string | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function assertSafePath(path: string, root = DEFAULT_ROOT()): string {
@@ -913,6 +976,7 @@ function insertPreparingLease(
   canonicalRepo: string,
   canonicalPath: string,
   leaseId: string,
+  action: "claim" | "import",
 ): WorktreeLease {
   const db = getDb();
   const now = nowMs();
@@ -942,7 +1006,7 @@ function insertPreparingLease(
       now,
       now,
       JSON.stringify({
-        created_by: "repos.worktrees.claim",
+        created_by: `repos.worktrees.${action}`,
         worktree_root: resolve(options.root || DEFAULT_ROOT()),
       }),
       options.source,
@@ -972,15 +1036,12 @@ function transitionLease(lease: WorktreeLease, nextStatus: WorktreeLeaseStatus, 
 
 export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
   try {
-    if (!options.taskId || !options.runId || !options.machineId || !options.owner) {
-      return { ok: false, action: "claim", code: "missing_required_key", message: "taskId, runId, machineId, and owner are required" };
+    if (![options.repo, options.taskId, options.runId, options.machineId, options.owner].every(nonEmpty)) {
+      return { ok: false, action: "claim", code: "missing_required_key", message: "repo, taskId, runId, machineId, and owner must be nonempty" };
     }
-    const request = resolvedClaimOptions(options);
-    if (protectedBranch(request.branch, request.baseRef)) {
-      return { ok: false, action: "claim", code: "protected_branch", message: `refusing protected worktree branch: ${request.branch}` };
-    }
-    const canonicalRepo = canonicalizeRepo(request.repo);
-    const sourceRepo = sourceRepoIdentity(request.source);
+    const source = gitSourceFor(options);
+    const canonicalRepo = canonicalizeRepo(options.repo);
+    const sourceRepo = sourceRepoIdentity(source);
     if (sourceRepo !== canonicalRepo) {
       return {
         ok: false,
@@ -989,7 +1050,7 @@ export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
         message: `source repository identity ${sourceRepo || "unknown"} does not match ${canonicalRepo}`,
       };
     }
-    if (sourceTransportWasRewritten(request.source)) {
+    if (sourceTransportWasRewritten(source)) {
       return {
         ok: false,
         action: "claim",
@@ -997,7 +1058,7 @@ export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
         message: "canonical source URL is redirected by effective Git fetch configuration",
       };
     }
-    const unsafeSshControl = inheritedSshTransportControl(request.source);
+    const unsafeSshControl = inheritedSshTransportControl(source);
     if (unsafeSshControl) {
       return {
         ok: false,
@@ -1007,7 +1068,24 @@ export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
       };
     }
 
-    const existing = leaseByIdempotency(request.idempotencyKey);
+    const existing = leaseByIdempotency(options.idempotencyKey);
+    const verifiedDefaultBranch = existing && isGitWorktree(existing.canonical_path)
+      ? probeOriginDefaultBranch(existing.canonical_path)
+      : probeSourceDefaultBranch(source);
+    if (!verifiedDefaultBranch) {
+      return {
+        ok: false,
+        action: "claim",
+        code: "remote_default_branch_unverified",
+        message: "could not verify the repository default branch from origin HEAD",
+      };
+    }
+    const request = resolvedClaimOptions(options, source, verifiedDefaultBranch, existing?.base_ref);
+    if (protectedBranch(request.branch, request.baseRef)
+      || protectedBranch(request.branch, verifiedDefaultBranch)) {
+      return { ok: false, action: "claim", code: "protected_branch", message: `refusing protected worktree branch: ${request.branch}` };
+    }
+
     if (existing) {
       const canonicalPath = assertSafePath(defaultWorktreePath(request, existing.lease_id), request.root || DEFAULT_ROOT());
       const issues = validateIdempotentReplay(existing, request, canonicalRepo, canonicalPath);
@@ -1041,7 +1119,7 @@ export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
       };
     }
 
-    const lease = insertPreparingLease(request, canonicalRepo, canonicalPath, leaseId);
+    const lease = insertPreparingLease(request, canonicalRepo, canonicalPath, leaseId, "claim");
     return completePreparingLease(lease, request, false);
   } catch (error) {
     return { ok: false, action: "claim", code: "claim_failed", message: error instanceof Error ? error.message : String(error) };
@@ -1056,6 +1134,7 @@ function completePreparingLease(lease: WorktreeLease, options: ResolvedClaimWork
     return withGitMutationLocks(claimed.lease.canonical_path, claimed.lease.branch, () => {
       validateUrlTargetAgainstRemoteBase(options, claimed.lease.canonical_path, head);
       const git = inspectGitWorktree(claimed.lease.canonical_path);
+      assertStableDefaultBranch(claimed.lease.canonical_path, options);
       const activated = activatePreparingCompletion(claimed.lease, claimed.token, head);
       if (!activated) return reconcilePreparingCompletion(claimed.lease, "claim", idempotent, git);
       const active = queryLeaseByIdOrPath({ leaseId: claimed.lease.lease_id })!;
@@ -1090,6 +1169,7 @@ function claimPreparingCompletion(
   const token = randomUUID();
   const metadata = {
     ...lease.metadata,
+    ...(action === "import" ? { created_by: "repos.worktrees.import" } : {}),
     preparing_completion_token: token,
     preparing_completion_started_at_ms: now,
   };
@@ -1181,7 +1261,7 @@ function releasePreparingCompletion(
   return {
     ok: false,
     action,
-    code: "worktree_create_failed",
+    code: error instanceof DefaultBranchContractError ? error.code : "worktree_create_failed",
     idempotent,
     lease: queryLeaseByIdOrPath({ leaseId: lease.lease_id }) || lease,
     message,
@@ -1190,12 +1270,27 @@ function releasePreparingCompletion(
 
 export function importWorktree(options: ImportWorktreeOptions): WorktreeResult {
   try {
+    if (![options.repo, options.taskId, options.runId, options.machineId, options.branch, options.owner].every(nonEmpty)) {
+      return {
+        ok: false,
+        action: "import",
+        code: "missing_required_key",
+        message: "repo, taskId, runId, machineId, branch, and owner must be nonempty",
+      };
+    }
+    if (!nonEmpty(options.path)) {
+      return {
+        ok: false,
+        action: "import",
+        code: "missing_required_path",
+        message: "path must be nonempty",
+      };
+    }
     const canonicalRepo = canonicalizeRepo(options.repo);
     if (protectedBranch(options.branch)) {
       return { ok: false, action: "import", code: "protected_branch", message: `refusing protected branch import: ${options.branch}` };
     }
     const canonicalPath = assertSafePath(options.path, options.root || DEFAULT_ROOT());
-    const request: ResolvedClaimWorktreeOptions = { ...options, source: canonicalPath };
     const git = inspectGitWorktree(canonicalPath);
     const blocking = safetyRefusals(git, undefined).filter((issue) => issue.code !== "unknown_owner");
     if (blocking.length > 0) return { ok: false, action: "import", code: "unsafe_import_refused", git, issues: blocking };
@@ -1212,6 +1307,11 @@ export function importWorktree(options: ImportWorktreeOptions): WorktreeResult {
         message: "could not verify the repository default branch from origin HEAD",
       };
     }
+    const request: ResolvedClaimWorktreeOptions = {
+      ...options,
+      source: canonicalPath,
+      verifiedDefaultBranch: defaultBranch,
+    };
     if (protectedBranch(options.branch, defaultBranch)) {
       return {
         ok: false,
@@ -1249,7 +1349,7 @@ export function importWorktree(options: ImportWorktreeOptions): WorktreeResult {
       return { ok: false, action: "import", code: "owner_collision", lease: collision, git };
     }
 
-    const lease = insertPreparingLease(request, canonicalRepo, canonicalPath, newLeaseId());
+    const lease = insertPreparingLease(request, canonicalRepo, canonicalPath, newLeaseId(), "import");
     return completePreparingImportLease(lease, request, canonicalRepo, false);
   } catch (error) {
     return { ok: false, action: "import", code: "import_failed", message: error instanceof Error ? error.message : String(error) };
@@ -1273,6 +1373,7 @@ function completePreparingImportLease(
         throw new Error("imported worktree repository does not match repo");
       }
       if (git.branch !== request.branch) throw new Error(`import branch mismatch: ${git.branch || "detached"}`);
+      assertStableDefaultBranch(claimed.lease.canonical_path, request);
       const activated = activatePreparingCompletion(claimed.lease, claimed.token, git.head_sha);
       if (!activated) return reconcilePreparingCompletion(claimed.lease, "import", idempotent, git);
       return {
