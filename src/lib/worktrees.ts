@@ -106,6 +106,7 @@ interface ResolvedClaimWorktreeOptions extends Omit<ClaimWorktreeOptions, "branc
   branch: string;
   source: string;
   verifiedDefaultBranch: string;
+  baseProvenance: "explicit" | "derived" | null;
 }
 
 export interface ImportWorktreeOptions {
@@ -148,7 +149,7 @@ const OWNERSHIP_PREDICATE = `(status NOT IN ('released', 'failed', 'quarantined'
   OR (status = 'released' AND NOT (
     COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
     AND COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
-    AND length(json_extract(metadata_json, '$.release_verified_head_sha')) = 40
+    AND length(json_extract(metadata_json, '$.release_verified_head_sha')) IN (40, 64)
     AND json_extract(metadata_json, '$.release_verified_head_sha') NOT GLOB '*[^0-9a-f]*'
     AND json_extract(metadata_json, '$.release_verified_head_sha') = head_sha
     AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
@@ -157,7 +158,7 @@ const OWNERSHIP_PREDICATE = `(status NOT IN ('released', 'failed', 'quarantined'
   OR (status = 'quarantined' AND NOT (
     COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
     AND COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
-    AND length(json_extract(metadata_json, '$.verified_head_sha')) = 40
+    AND length(json_extract(metadata_json, '$.verified_head_sha')) IN (40, 64)
     AND json_extract(metadata_json, '$.verified_head_sha') NOT GLOB '*[^0-9a-f]*'
     AND json_extract(metadata_json, '$.verified_head_sha') = head_sha
     AND json_extract(metadata_json, '$.quarantine_path') = canonical_path
@@ -168,8 +169,13 @@ const OWNERSHIP_PREDICATE = `(status NOT IN ('released', 'failed', 'quarantined'
 const DEFAULT_TTL_SECONDS = 60 * 60 * 6;
 const PREPARING_COMPLETION_TIMEOUT_MS = 2 * 60 * 1000;
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+const GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const DEFAULT_ROOT = () => process.env["HASNA_REPOS_WORKTREES_ROOT"]
   || join(process.env["HOME"] || "/home/hasna", ".hasna", "repos", "worktrees");
+
+function isGitObjectId(value: unknown): value is string {
+  return typeof value === "string" && GIT_OBJECT_ID_PATTERN.test(value);
+}
 
 function safeJsonParse(value: string | null | undefined): Record<string, unknown> {
   if (!value) return {};
@@ -316,13 +322,20 @@ function resolvedClaimOptions(
   source: string,
   verifiedDefaultBranch: string,
   persistedBaseRef?: string | null,
+  persistedBaseProvenance?: unknown,
 ): ResolvedClaimWorktreeOptions {
+  const explicitBaseRef = options.baseRef?.trim();
+  const baseProvenance = explicitBaseRef ? "explicit" : "derived";
+  const retainedDerivedBase = baseProvenance === "derived" && persistedBaseProvenance === "derived"
+    ? persistedBaseRef
+    : undefined;
   return {
     ...options,
     branch: options.branch?.trim() || defaultWorktreeBranch(options),
     source,
-    baseRef: options.baseRef?.trim() || persistedBaseRef || verifiedDefaultBranch,
+    baseRef: explicitBaseRef || retainedDerivedBase || verifiedDefaultBranch,
     verifiedDefaultBranch,
+    baseProvenance,
   };
 }
 
@@ -410,8 +423,8 @@ function probeRemoteDefaultBranch(remote: string, cwd: string): string | null {
     .filter(Boolean);
   if (lines.length !== 2) return null;
   const ref = lines[0]!.match(/^ref:\s+(refs\/heads\/(\S+))\s+HEAD$/);
-  const head = lines[1]!.match(/^([0-9a-f]{40,64})\s+HEAD$/);
-  if (!ref || !head) return null;
+  const head = lines[1]!.match(/^(\S+)\s+HEAD$/);
+  if (!ref || !head || !isGitObjectId(head[1])) return null;
   const branch = ref[2]!;
   const valid = runGit(["check-ref-format", "--branch", branch], cwd);
   return valid.ok ? branch : null;
@@ -543,7 +556,8 @@ function resolveBaseCommit(source: string, requested?: string): string | null {
   if (!normalized.startsWith("origin/")) candidates.push(`origin/${normalized}`);
   for (const candidate of [...new Set(candidates)]) {
     const result = runGit(["rev-parse", "--verify", `${candidate}^{commit}`], source);
-    if (result.ok) return result.stdout.trim();
+    const objectId = result.stdout.trim();
+    if (result.ok && isGitObjectId(objectId)) return objectId;
   }
   return null;
 }
@@ -848,7 +862,7 @@ function probeOriginRef(path: string, ref: string): {
   }
   const matches = probe.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   const parsed = matches.length === 1 ? matches[0]!.split(/\s+/) : [];
-  const sha = parsed[1] === ref && /^[0-9a-f]{40,64}$/i.test(parsed[0] || "") ? parsed[0]! : null;
+  const sha = parsed[1] === ref && isGitObjectId(parsed[0]) ? parsed[0] : null;
   return sha ? { ok: true, sha } : { ok: false, code: "remote_probe_invalid" };
 }
 
@@ -887,7 +901,8 @@ function validateUrlTargetAgainstRemoteBase(
 
 function readHead(path: string): string | null {
   const head = runGit(["rev-parse", "HEAD"], path);
-  return head.ok ? head.stdout.trim() : null;
+  const objectId = head.stdout.trim();
+  return head.ok && isGitObjectId(objectId) ? objectId : null;
 }
 
 function queryLeaseByIdOrPath(options: { leaseId?: string; path?: string }): WorktreeLease | undefined {
@@ -925,7 +940,9 @@ function isSameClaim(lease: WorktreeLease, options: ResolvedClaimWorktreeOptions
     && lease.branch === options.branch
     && lease.owner === options.owner
     && lease.source === options.source
-    && lease.base_ref === (options.baseRef || null);
+    && lease.base_ref === (options.baseRef || null)
+    && (options.baseProvenance === null
+      || lease.metadata["claim_base_provenance"] === options.baseProvenance);
 }
 
 function leaseByIdempotency(idempotencyKey: string | undefined): WorktreeLease | undefined {
@@ -947,7 +964,7 @@ function requestMismatchIssues(lease: WorktreeLease, options: ResolvedClaimWorkt
     ["source", expectedSource],
     ["base_ref", expectedBaseRef],
   ];
-  return fields
+  const issues = fields
     .filter(([field, expected]) => lease[field] !== expected)
     .map(([field, expected]) => ({
       code: "idempotency_request_mismatch",
@@ -955,6 +972,18 @@ function requestMismatchIssues(lease: WorktreeLease, options: ResolvedClaimWorkt
       message: `idempotency key belongs to a different ${String(field)}`,
       ref: `${String(lease[field])} != ${String(expected)}`,
     }));
+  if (options.baseProvenance !== null) {
+    const persisted = lease.metadata["claim_base_provenance"];
+    if (persisted !== options.baseProvenance) {
+      issues.push({
+        code: "idempotency_request_mismatch",
+        severity: "block",
+        message: "idempotency key belongs to a different claim base provenance",
+        ref: `${persisted === "explicit" || persisted === "derived" ? persisted : "unknown"} != ${options.baseProvenance}`,
+      });
+    }
+  }
+  return issues;
 }
 
 function validateIdempotentReplay(lease: WorktreeLease, options: ResolvedClaimWorktreeOptions, canonicalRepo: string, canonicalPath: string): WorktreeIssue[] {
@@ -1008,6 +1037,7 @@ function insertPreparingLease(
       JSON.stringify({
         created_by: `repos.worktrees.${action}`,
         worktree_root: resolve(options.root || DEFAULT_ROOT()),
+        ...(action === "claim" ? { claim_base_provenance: options.baseProvenance } : {}),
       }),
       options.source,
       canonicalPath,
@@ -1080,7 +1110,13 @@ export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
         message: "could not verify the repository default branch from origin HEAD",
       };
     }
-    const request = resolvedClaimOptions(options, source, verifiedDefaultBranch, existing?.base_ref);
+    const request = resolvedClaimOptions(
+      options,
+      source,
+      verifiedDefaultBranch,
+      existing?.base_ref,
+      existing?.metadata["claim_base_provenance"],
+    );
     if (protectedBranch(request.branch, request.baseRef)
       || protectedBranch(request.branch, verifiedDefaultBranch)) {
       return { ok: false, action: "claim", code: "protected_branch", message: `refusing protected worktree branch: ${request.branch}` };
@@ -1101,12 +1137,23 @@ export function claimWorktree(options: ClaimWorktreeOptions): WorktreeResult {
     const canonicalPath = assertSafePath(defaultWorktreePath(request, leaseId), request.root || DEFAULT_ROOT());
     const collision = activeCollision(canonicalRepo, request.branch, canonicalPath);
     if (collision) {
-      if (isSameClaim(collision, request, canonicalRepo)) {
+      // A same-request retry without an idempotency key is discovered through
+      // the ownership guard. Preserve a previously derived base here just as
+      // the idempotency-key path does, rather than reinterpreting omission as
+      // whichever branch is the live default now.
+      const replayRequest = resolvedClaimOptions(
+        options,
+        source,
+        verifiedDefaultBranch,
+        collision.base_ref,
+        collision.metadata["claim_base_provenance"],
+      );
+      if (isSameClaim(collision, replayRequest, canonicalRepo)) {
         if (collision.status === "active") {
           return activeReplayResult(collision);
         }
         if (collision.status === "preparing" || collision.status === "creating") {
-          return completePreparingLease(collision, request, true);
+          return completePreparingLease(collision, replayRequest, true);
         }
       }
       const stale = collision.expires_at_ms < nowMs();
@@ -1311,6 +1358,7 @@ export function importWorktree(options: ImportWorktreeOptions): WorktreeResult {
       ...options,
       source: canonicalPath,
       verifiedDefaultBranch: defaultBranch,
+      baseProvenance: null,
     };
     if (protectedBranch(options.branch, defaultBranch)) {
       return {
@@ -1578,7 +1626,9 @@ export function releaseWorktree(options: FencedLeaseOptions & { cleanup?: "none"
 
   if (options.cleanup !== "quarantine") {
     const expectedHead = git.head_sha;
-    if (!expectedHead) return { ok: false, action: "release", code: "unsafe_release_refused", lease, git, issues };
+    if (!isGitObjectId(expectedHead)) {
+      return { ok: false, action: "release", code: "unsafe_release_refused", lease, git, issues };
+    }
     const metadata = {
       ...lease.metadata,
       release_expected_head_sha: expectedHead,
@@ -1637,9 +1687,12 @@ export function releaseWorktree(options: FencedLeaseOptions & { cleanup?: "none"
 
 function completeRelease(locked: WorktreeLease, originalGit?: GitInspection): WorktreeResult {
   const expectedHead = locked.metadata["release_expected_head_sha"];
-  if (typeof expectedHead !== "string") {
-    const failed = failTransientLease(locked, "releasing", "release plan is missing");
-    return { ok: false, action: "release", code: "release_plan_missing", lease: failed || locked };
+  if (!isGitObjectId(expectedHead)) {
+    const message = typeof expectedHead === "string"
+      ? "release plan has an invalid object ID"
+      : "release plan is missing";
+    const failed = failTransientLease(locked, "releasing", message);
+    return { ok: false, action: "release", code: "release_plan_missing", message, lease: failed || locked };
   }
   try {
     const git = inspectGitWorktree(locked.canonical_path);
@@ -1714,9 +1767,12 @@ function completeRelease(locked: WorktreeLease, originalGit?: GitInspection): Wo
 
 function completeReleaseCommit(locked: WorktreeLease, originalGit?: GitInspection): WorktreeResult {
   const expectedHead = locked.metadata["release_verified_head_sha"];
-  if (typeof expectedHead !== "string") {
-    const failed = failTransientLease(locked, "release_committing", "release commit proof is missing");
-    return { ok: false, action: "release", code: "release_plan_missing", lease: failed || locked };
+  if (!isGitObjectId(expectedHead)) {
+    const message = typeof expectedHead === "string"
+      ? "release commit proof has an invalid object ID"
+      : "release commit proof is missing";
+    const failed = failTransientLease(locked, "release_committing", message);
+    return { ok: false, action: "release", code: "release_plan_missing", message, lease: failed || locked };
   }
   try {
     return withGitMutationLocks(locked.canonical_path, locked.branch, () => {
@@ -1818,7 +1874,8 @@ function releaseProofMatches(lease: WorktreeLease, requireFinalized = true): boo
   const expectedHead = lease.metadata["release_verified_head_sha"];
   if (lease.status !== "released"
     || (requireFinalized && lease.metadata["release_finalized"] !== true)
-    || typeof expectedHead !== "string"
+    || !isGitObjectId(expectedHead)
+    || !isGitObjectId(lease.head_sha)
     || lease.head_sha !== expectedHead
     || !existsSync(lease.canonical_path)) {
     return false;
@@ -1837,7 +1894,7 @@ function resumeProvisionalRelease(lease: WorktreeLease): WorktreeResult {
     return withGitMutationLocks(lease.canonical_path, lease.branch, () => {
       const git = inspectGitWorktree(lease.canonical_path);
       const expectedHead = lease.metadata["release_verified_head_sha"];
-      if (typeof expectedHead !== "string"
+      if (!isGitObjectId(expectedHead)
         || !releaseProofMatches(lease, false)
         || readHead(lease.canonical_path) !== expectedHead) {
         getDb().query(`UPDATE worktree_leases SET status = 'worktree_failed', updated_at_ms = ?, metadata_json = ?
@@ -1953,7 +2010,7 @@ function completeQuarantineWithOperationLock(
       throw new Error(`quarantine safety validation failed: ${safetyIssues.map((issue) => issue.code).join(",")}`);
     }
     const provedHead = finalGit.head_sha;
-    if (!provedHead) throw new Error("quarantine safety proof did not produce a HEAD");
+    if (!isGitObjectId(provedHead)) throw new Error("quarantine safety proof did not produce a valid object ID");
     createBackupRef(locked, safePlanned, provedHead);
     if (!quarantineProofMatches(safePlanned, canonicalBackupRef, provedHead)) {
       throw new Error("HEAD changed after quarantine safety proof");
@@ -1994,7 +2051,7 @@ function completeQuarantineWithOperationLock(
         locked.fencing_token,
     );
     if (committed.changes !== 1) throw new Error("quarantine commit CAS failed");
-    return completeQuarantineCommit(queryLeaseByIdOrPath({ leaseId: locked.lease_id })!, finalGit);
+    return completeQuarantineCommit(queryLeaseByIdOrPath({ leaseId: locked.lease_id })!, finalGit, true);
   } catch (error) {
     if (error instanceof GitMutationLockBusyError) {
       return {
@@ -2050,16 +2107,21 @@ function completeQuarantineWithOperationLock(
     return completeQuarantineCompensation(
       queryLeaseByIdOrPath({ leaseId: locked.lease_id }) || locked,
       originalGit,
+      true,
     );
   }
 }
 
-function completeQuarantineCommit(locked: WorktreeLease, originalGit?: GitInspection): WorktreeResult {
+function completeQuarantineCommit(
+  locked: WorktreeLease,
+  originalGit?: GitInspection,
+  operationLockHeld = false,
+): WorktreeResult {
   const path = locked.metadata["quarantine_path"];
   const backupRef = locked.metadata["backup_ref"];
   const expectedHead = locked.metadata["verified_head_sha"];
   try {
-    if (typeof path !== "string" || typeof backupRef !== "string" || typeof expectedHead !== "string") {
+    if (typeof path !== "string" || typeof backupRef !== "string" || !isGitObjectId(expectedHead)) {
       throw new Error("quarantine commit proof is missing");
     }
     const safePath = assertQuarantineTarget(locked, path);
@@ -2105,7 +2167,11 @@ function completeQuarantineCommit(locked: WorktreeLease, originalGit?: GitInspec
         if (claimed.changes !== 1) {
           return { ok: false, action: "release", code: "cas_transition_failed", lease: quarantined, git };
         }
-        return completeQuarantineCompensation(queryLeaseByIdOrPath({ leaseId: quarantined.lease_id })!, git);
+        return completeQuarantineCompensation(
+          queryLeaseByIdOrPath({ leaseId: quarantined.lease_id })!,
+          git,
+          operationLockHeld,
+        );
       }
       const finalizedAt = nowMs();
       const proofFinalized = getDb().query(`UPDATE worktree_leases SET updated_at_ms = ?, metadata_json = ?
@@ -2169,11 +2235,42 @@ function completeQuarantineCommit(locked: WorktreeLease, originalGit?: GitInspec
       }
       return { ok: false, action: "release", code: "cas_transition_failed", message, lease: current || locked, git: originalGit };
     }
-    return completeQuarantineCompensation(queryLeaseByIdOrPath({ leaseId: locked.lease_id })!, originalGit);
+    return completeQuarantineCompensation(
+      queryLeaseByIdOrPath({ leaseId: locked.lease_id })!,
+      originalGit,
+      operationLockHeld,
+    );
   }
 }
 
-function completeQuarantineCompensation(locked: WorktreeLease, originalGit?: GitInspection): WorktreeResult {
+function completeQuarantineCompensation(
+  locked: WorktreeLease,
+  originalGit?: GitInspection,
+  operationLockHeld = false,
+): WorktreeResult {
+  if (operationLockHeld) return completeQuarantineCompensationWithOperationLock(locked, originalGit);
+  try {
+    return withLeaseOperationLock(
+      locked,
+      "quarantine",
+      () => completeQuarantineCompensationWithOperationLock(locked, originalGit),
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      action: "release",
+      code: error instanceof GitMutationLockBusyError ? "terminal_lock_busy" : "quarantine_failed",
+      message: error instanceof Error ? error.message : String(error),
+      lease: queryLeaseByIdOrPath({ leaseId: locked.lease_id }) || locked,
+      git: originalGit,
+    };
+  }
+}
+
+function completeQuarantineCompensationWithOperationLock(
+  locked: WorktreeLease,
+  originalGit?: GitInspection,
+): WorktreeResult {
   const message = typeof locked.metadata["quarantine_error"] === "string"
     ? locked.metadata["quarantine_error"]
     : "quarantine compensation resumed";
@@ -2298,7 +2395,8 @@ function quarantineProofFinalizedMatches(lease: WorktreeLease, requireFinalized 
   const verifiedHead = lease.metadata["verified_head_sha"];
   if (typeof path !== "string"
     || typeof backupRef !== "string"
-    || typeof verifiedHead !== "string"
+    || !isGitObjectId(verifiedHead)
+    || !isGitObjectId(lease.head_sha)
     || lease.canonical_path !== path
     || lease.head_sha !== verifiedHead
     || !existsSync(path)) {
@@ -2347,7 +2445,7 @@ function resumeProvisionalQuarantine(lease: WorktreeLease): WorktreeResult {
     return withGitMutationLocks(lease.canonical_path, lease.branch, () => {
       const git = inspectGitWorktree(lease.canonical_path);
       const expectedHead = lease.metadata["verified_head_sha"];
-      if (typeof expectedHead !== "string"
+      if (!isGitObjectId(expectedHead)
         || !quarantineProofFinalizedMatches(lease, false)
         || readHead(lease.canonical_path) !== expectedHead) {
         getDb().query(`UPDATE worktree_leases SET status = 'quarantine_failed', updated_at_ms = ?, metadata_json = ?
@@ -2406,10 +2504,12 @@ function resumeProvisionalQuarantine(lease: WorktreeLease): WorktreeResult {
 }
 
 function quarantineProofMatches(cwd: string, backupRef: string, expectedHead: string): boolean {
+  if (!isGitObjectId(expectedHead)) return false;
   const proof = runGit(["rev-parse", "HEAD", backupRef], cwd);
   if (!proof.ok) return false;
   const values = proof.stdout.split("\n").map((value) => value.trim()).filter(Boolean);
-  return values.length === 2 && values.every((value) => value === expectedHead);
+  return values.length === 2
+    && values.every((value) => isGitObjectId(value) && value === expectedHead);
 }
 
 function failQuarantiningLease(locked: WorktreeLease, message: string): WorktreeLease | undefined {
@@ -2443,6 +2543,7 @@ function backupRefFor(lease: WorktreeLease): string {
 }
 
 function createBackupRef(lease: WorktreeLease, cwd: string, expectedHead: string): string {
+  if (!isGitObjectId(expectedHead)) throw new Error("quarantine proof has an invalid object ID");
   const ref = backupRefFor(lease);
   const head = readHead(cwd);
   if (!head) throw new Error("failed to resolve quarantine backup HEAD");

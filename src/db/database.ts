@@ -632,6 +632,38 @@ function verifyIntegratedControlSchema(db: Database, expected: unknown): void {
   validateWorktreeLeaseSchema(db);
 }
 
+type MigrationMarkerRow = Record<string, unknown>;
+
+function readMigrationMarkerRows(db: Database): MigrationMarkerRow[] {
+  return db.query("SELECT * FROM migrations").all() as MigrationMarkerRow[];
+}
+
+function verifyMigrationMarkerIntegrity(
+  db: Database,
+  previous: MigrationMarkerRow[],
+  inserted: MigrationMarkerRow,
+): void {
+  const expected = [...previous, inserted].map(stableMigrationState).sort();
+  const actual = readMigrationMarkerRows(db).map(stableMigrationState).sort();
+  if (stableMigrationState(actual) !== stableMigrationState(expected)) {
+    throw new Error("migration marker integrity verification failed");
+  }
+}
+
+function verifyFtsReposIntegrity(db: Database): void {
+  const table = db.query(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fts_repos'",
+  ).get();
+  if (!table) return;
+  try {
+    // rank=1 extends FTS5's structural integrity check to prove that the
+    // external-content index exactly matches every current repos row.
+    db.exec("INSERT INTO fts_repos(fts_repos, rank) VALUES ('integrity-check', 1)");
+  } catch {
+    throw new Error("migration fts_repos integrity verification failed");
+  }
+}
+
 function runMigrations(db: Database): void {
   db.exec(`CREATE TABLE IF NOT EXISTS migrations (
     id INTEGER PRIMARY KEY,
@@ -650,9 +682,20 @@ function runMigrations(db: Database): void {
       // waited for the write lock, so the marker must be read under that lock.
       const applied = db.query("SELECT 1 FROM migrations WHERE version = ?").get(migration.version);
       if (!applied) {
+        const previousMarkers = readMigrationMarkerRows(db);
         if (migration.sql) db.exec(migration.sql);
         const runResult = migration.run?.(db);
-        db.query("INSERT INTO migrations (version) VALUES (?)").run(migration.version);
+        // RETURNING captures SQLite's exact inserted row before any AFTER
+        // trigger can rewrite it. The generic ledger check then proves every
+        // preexisting marker and this precise new marker survived unchanged.
+        const insertedMarker = db.query(
+          "INSERT INTO migrations (version) VALUES (?) RETURNING *",
+        ).get(migration.version) as MigrationMarkerRow | null;
+        if (!insertedMarker) {
+          throw new Error("migration marker integrity verification failed");
+        }
+        verifyMigrationMarkerIntegrity(db, previousMarkers, insertedMarker);
+        verifyFtsReposIntegrity(db);
         migration.verifyAfterMarker?.(db, runResult);
       }
       db.exec("COMMIT");
@@ -801,6 +844,8 @@ const MIGRATIONS: Migration[] = [
         INSERT INTO fts_repos(rowid, name, org, description, remote_url)
         VALUES (new.id, new.name, new.org, new.description, new.remote_url);
       END;
+
+      INSERT INTO fts_repos(fts_repos) VALUES ('rebuild');
 
       CREATE VIRTUAL TABLE IF NOT EXISTS fts_commits USING fts5(
         message, author_name, author_email,
@@ -1066,6 +1111,103 @@ const MIGRATIONS: Migration[] = [
   },
 ];
 
+interface LegacyCollisionCandidate {
+  lease_id: string;
+  canonical_path: string;
+  canonical_repo: string;
+  branch: string;
+  created_at_ms: number;
+  claimed_at_ms: number;
+}
+
+function compareLegacyCollisionLineage(
+  left: LegacyCollisionCandidate,
+  right: LegacyCollisionCandidate,
+): number {
+  if (left.claimed_at_ms !== right.claimed_at_ms) {
+    return left.claimed_at_ms < right.claimed_at_ms ? -1 : 1;
+  }
+  if (left.created_at_ms !== right.created_at_ms) {
+    return left.created_at_ms < right.created_at_ms ? -1 : 1;
+  }
+  return left.lease_id < right.lease_id ? -1 : left.lease_id > right.lease_id ? 1 : 0;
+}
+
+function reconcileLegacyWorktreeCollisions(db: Database): void {
+  const candidates = (db.query(`SELECT
+      lease_id,
+      canonical_path,
+      canonical_repo,
+      branch,
+      created_at_ms,
+      COALESCE(
+        CAST(json_extract(metadata_json, '$.legacy_import.claimed_at_ms') AS INTEGER),
+        created_at_ms
+      ) AS claimed_at_ms
+    FROM worktree_leases
+    WHERE json_extract(metadata_json, '$.legacy_layout') = 1
+      AND status IN ('worktree_failed', 'quarantine_failed')`).all() as LegacyCollisionCandidate[])
+    .sort(compareLegacyCollisionLineage);
+  const pathKeepers = new Map<string, LegacyCollisionCandidate>();
+  const branchKeepers = new Map<string, LegacyCollisionCandidate>();
+  const demote = db.query(`UPDATE worktree_leases
+    SET status = 'failed',
+        metadata_json = json_set(
+          metadata_json,
+          '$.legacy_collision_demoted', json('true'),
+          '$.legacy_collision', json(?)
+        )
+    WHERE lease_id = ?
+      AND status IN ('worktree_failed', 'quarantine_failed')`);
+
+  for (const current of candidates) {
+    const branchKey = stableMigrationState([current.canonical_repo, current.branch]);
+    const pathKeeper = pathKeepers.get(current.canonical_path);
+    const branchKeeper = branchKeepers.get(branchKey);
+    const keepers = [pathKeeper, branchKeeper]
+      .filter((keeper): keeper is LegacyCollisionCandidate => keeper !== undefined)
+      .filter((keeper, index, all) =>
+        all.findIndex((candidate) => candidate.lease_id === keeper.lease_id) === index)
+      .sort(compareLegacyCollisionLineage);
+    const keeper = keepers[0];
+    if (!keeper) {
+      pathKeepers.set(current.canonical_path, current);
+      branchKeepers.set(branchKey, current);
+      continue;
+    }
+
+    const collisionKey = keeper.canonical_path === current.canonical_path
+      ? {
+          kind: "canonical_path",
+          canonical_path: current.canonical_path,
+        }
+      : {
+          kind: "canonical_repo_branch",
+          canonical_repo: current.canonical_repo,
+          branch: current.branch,
+        };
+    const receipt = {
+      keeper_lease_id: keeper.lease_id,
+      collision_key: collisionKey,
+      lineage_order: ["claimed_at_ms", "created_at_ms", "lease_id"],
+      keeper_lineage: {
+        lease_id: keeper.lease_id,
+        claimed_at_ms: keeper.claimed_at_ms,
+        created_at_ms: keeper.created_at_ms,
+      },
+      demoted_lineage: {
+        lease_id: current.lease_id,
+        claimed_at_ms: current.claimed_at_ms,
+        created_at_ms: current.created_at_ms,
+      },
+    };
+    const result = demote.run(JSON.stringify(receipt), current.lease_id);
+    if (result.changes !== 1) {
+      throw new Error(`legacy worktree collision demotion failed: ${current.lease_id}`);
+    }
+  }
+}
+
 function migrateWorktreeLeaseSchema(db: Database): void {
   const table = db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'worktree_leases'").get();
   if (!table) throw new Error("worktree_leases is missing before worktree schema reconciliation");
@@ -1248,24 +1390,7 @@ function migrateWorktreeLeaseSchema(db: Database): void {
     SET status = 'quarantine_failed'
     WHERE json_extract(metadata_json, '$.legacy_layout') = 1
       AND status = 'quarantined'`).run();
-  db.query(`UPDATE worktree_leases AS current
-    SET status = 'failed',
-        metadata_json = json_set(metadata_json, '$.legacy_collision_demoted', json('true'))
-    WHERE json_extract(metadata_json, '$.legacy_layout') = 1
-      AND status IN ('worktree_failed', 'quarantine_failed')
-      AND EXISTS (
-        SELECT 1
-        FROM worktree_leases AS keeper
-        WHERE keeper.lease_id < current.lease_id
-          AND keeper.status IN ('worktree_failed', 'quarantine_failed')
-          AND (
-            keeper.canonical_path = current.canonical_path
-            OR (
-              keeper.canonical_repo = current.canonical_repo
-              AND keeper.branch = current.branch
-            )
-          )
-      )`).run();
+  reconcileLegacyWorktreeCollisions(db);
 
   validateWorktreeLeaseSchema(db, false);
   const indexStatements = worktreeLeaseIndexStatements();
@@ -1302,28 +1427,41 @@ function worktreeLeaseTableSql(): string {
   )`;
 }
 
+function gitObjectIdSql(value: string): string {
+  return `(length(${value}) IN (40, 64)
+    AND ${value} NOT GLOB '*[^0-9a-f]*')`;
+}
+
+function releaseTerminalProofSql(): string {
+  const verifiedHead = "json_extract(metadata_json, '$.release_verified_head_sha')";
+  return `(COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
+    AND COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
+    AND ${gitObjectIdSql(verifiedHead)}
+    AND ${verifiedHead} = head_sha
+    AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
+    AND json_extract(metadata_json, '$.release_finalized_at_ms') >= 0)`;
+}
+
+function quarantineTerminalProofSql(): string {
+  const verifiedHead = "json_extract(metadata_json, '$.verified_head_sha')";
+  return `(COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
+    AND COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
+    AND ${gitObjectIdSql(verifiedHead)}
+    AND ${verifiedHead} = head_sha
+    AND json_extract(metadata_json, '$.quarantine_path') = canonical_path
+    AND json_extract(metadata_json, '$.backup_ref') = 'refs/hasna/worktrees/' || lease_id || '/' || generation
+    AND COALESCE(json_type(metadata_json, '$.quarantine_finalized_at_ms'), '') = 'integer'
+    AND json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0)`;
+}
+
+function worktreeOwnershipPredicateSql(): string {
+  return `(status NOT IN ('released', 'failed', 'quarantined')
+    OR (status = 'released' AND NOT ${releaseTerminalProofSql()})
+    OR (status = 'quarantined' AND NOT ${quarantineTerminalProofSql()}))`;
+}
+
 function worktreeLeaseIndexStatements(): Record<string, string> {
-  const ownershipPredicate = `(status NOT IN ('released', 'failed', 'quarantined')
-        OR (status = 'released' AND NOT (
-          COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
-          AND COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
-          AND length(json_extract(metadata_json, '$.release_verified_head_sha')) = 40
-          AND json_extract(metadata_json, '$.release_verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-          AND json_extract(metadata_json, '$.release_verified_head_sha') = head_sha
-          AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
-          AND json_extract(metadata_json, '$.release_finalized_at_ms') >= 0
-        ))
-        OR (status = 'quarantined' AND NOT (
-          COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
-          AND COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
-          AND length(json_extract(metadata_json, '$.verified_head_sha')) = 40
-          AND json_extract(metadata_json, '$.verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-          AND json_extract(metadata_json, '$.verified_head_sha') = head_sha
-          AND json_extract(metadata_json, '$.quarantine_path') = canonical_path
-          AND json_extract(metadata_json, '$.backup_ref') = 'refs/hasna/worktrees/' || lease_id || '/' || generation
-          AND COALESCE(json_type(metadata_json, '$.quarantine_finalized_at_ms'), '') = 'integer'
-          AND json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0
-        )))`;
+  const ownershipPredicate = worktreeOwnershipPredicateSql();
   return {
     idx_worktree_leases_repo_branch: "CREATE INDEX idx_worktree_leases_repo_branch ON worktree_leases(canonical_repo, branch)",
     idx_worktree_leases_task: "CREATE INDEX idx_worktree_leases_task ON worktree_leases(task_id)",
@@ -1349,52 +1487,13 @@ function validateWorktreeLeaseSchema(db: Database, requireIndexes = true): void 
     throw new Error("worktree lease canonical table SQL is missing or invalid");
   }
 
+  const ownershipPredicate = worktreeOwnershipPredicateSql();
   const duplicatePath = db.query(`SELECT canonical_path FROM worktree_leases
-    WHERE (status NOT IN ('released', 'failed', 'quarantined')
-      OR (status = 'released' AND NOT (
-        COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
-        AND COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
-        AND length(json_extract(metadata_json, '$.release_verified_head_sha')) = 40
-        AND json_extract(metadata_json, '$.release_verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-        AND json_extract(metadata_json, '$.release_verified_head_sha') = head_sha
-        AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
-        AND json_extract(metadata_json, '$.release_finalized_at_ms') >= 0
-      ))
-      OR (status = 'quarantined' AND NOT (
-        COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
-        AND COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
-        AND length(json_extract(metadata_json, '$.verified_head_sha')) = 40
-        AND json_extract(metadata_json, '$.verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-        AND json_extract(metadata_json, '$.verified_head_sha') = head_sha
-        AND json_extract(metadata_json, '$.quarantine_path') = canonical_path
-        AND json_extract(metadata_json, '$.backup_ref') = 'refs/hasna/worktrees/' || lease_id || '/' || generation
-        AND COALESCE(json_type(metadata_json, '$.quarantine_finalized_at_ms'), '') = 'integer'
-        AND json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0
-      )))
+    WHERE ${ownershipPredicate}
     GROUP BY canonical_path HAVING COUNT(*) > 1 LIMIT 1`).get();
   if (duplicatePath) throw new Error("duplicate active worktree path blocks worktree lease reconciliation");
   const duplicateBranch = db.query(`SELECT canonical_repo, branch FROM worktree_leases
-    WHERE (status NOT IN ('released', 'failed', 'quarantined')
-      OR (status = 'released' AND NOT (
-        COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
-        AND COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
-        AND length(json_extract(metadata_json, '$.release_verified_head_sha')) = 40
-        AND json_extract(metadata_json, '$.release_verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-        AND json_extract(metadata_json, '$.release_verified_head_sha') = head_sha
-        AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
-        AND json_extract(metadata_json, '$.release_finalized_at_ms') >= 0
-      ))
-      OR (status = 'quarantined' AND NOT (
-        COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
-        AND COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
-        AND length(json_extract(metadata_json, '$.verified_head_sha')) = 40
-        AND json_extract(metadata_json, '$.verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-        AND json_extract(metadata_json, '$.verified_head_sha') = head_sha
-        AND json_extract(metadata_json, '$.quarantine_path') = canonical_path
-        AND json_extract(metadata_json, '$.backup_ref') = 'refs/hasna/worktrees/' || lease_id || '/' || generation
-        AND COALESCE(json_type(metadata_json, '$.quarantine_finalized_at_ms'), '') = 'integer'
-        AND json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0
-      )))
+    WHERE ${ownershipPredicate}
     GROUP BY canonical_repo, branch HAVING COUNT(*) > 1 LIMIT 1`).get();
   if (duplicateBranch) throw new Error("duplicate active repo/branch blocks worktree lease reconciliation");
   const duplicateIdempotency = db.query(`SELECT idempotency_key FROM worktree_leases
@@ -1413,27 +1512,11 @@ function validateWorktreeLeaseSchema(db: Database, requireIndexes = true): void 
     ) OR (
       status = 'released'
       AND COALESCE(json_type(metadata_json, '$.release_finalized'), '') = 'true'
-      AND NOT (
-        COALESCE(json_type(metadata_json, '$.release_verified_head_sha'), '') = 'text'
-        AND length(json_extract(metadata_json, '$.release_verified_head_sha')) = 40
-        AND json_extract(metadata_json, '$.release_verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-        AND json_extract(metadata_json, '$.release_verified_head_sha') = head_sha
-        AND COALESCE(json_type(metadata_json, '$.release_finalized_at_ms'), '') = 'integer'
-        AND json_extract(metadata_json, '$.release_finalized_at_ms') >= 0
-      )
+      AND NOT ${releaseTerminalProofSql()}
     ) OR (
       status = 'quarantined'
       AND COALESCE(json_type(metadata_json, '$.quarantine_finalized'), '') = 'true'
-      AND NOT (
-        COALESCE(json_type(metadata_json, '$.verified_head_sha'), '') = 'text'
-        AND length(json_extract(metadata_json, '$.verified_head_sha')) = 40
-        AND json_extract(metadata_json, '$.verified_head_sha') NOT GLOB '*[^0-9a-f]*'
-        AND json_extract(metadata_json, '$.verified_head_sha') = head_sha
-        AND json_extract(metadata_json, '$.quarantine_path') = canonical_path
-        AND json_extract(metadata_json, '$.backup_ref') = 'refs/hasna/worktrees/' || lease_id || '/' || generation
-        AND COALESCE(json_type(metadata_json, '$.quarantine_finalized_at_ms'), '') = 'integer'
-        AND json_extract(metadata_json, '$.quarantine_finalized_at_ms') >= 0
-      )
+      AND NOT ${quarantineTerminalProofSql()}
     ) LIMIT 1`).get();
   if (invalidTerminalProof) throw new Error("worktree lease terminal proof payload is missing or invalid");
   const canonicalColumns = db.query("PRAGMA table_info(worktree_leases)").all() as Array<{

@@ -115,8 +115,13 @@ lease is created. When claim omits `--base`, that same live proof selects the
 base instead of assuming a particular branch name. Both operations re-prove the
 unchanged live default as their final pre-activation check. A proof failure,
 change, or branch becoming default keeps the provisional lease retryable and
-never activates it. Required import identities and paths must be nonempty before
-path resolution or persistence, and imported leases record import provenance.
+never activates it. Claim leases persist whether the base was explicit or
+live-default-derived; idempotent retries must preserve that request shape even
+when the resolved branch names coincide, while derived-base retries retain their
+persisted safe base across a later default-branch change. Rows without that
+provenance fail closed. Required import identities and paths must be nonempty
+before path resolution or persistence, and imported leases record import
+provenance.
 
 Release and cleanup are fenced operations. `release` requires the current
 generation and fencing token, refuses dirty/staged/untracked/detached,
@@ -124,7 +129,10 @@ non-origin-upstream, remote-probe, exact-SHA, unique-commit, and unknown-owner
 failures, and only quarantines on an explicit `--cleanup quarantine` request.
 Mutable local remote-tracking refs are diagnostic only; verify and release query
 the validated origin and require its exact branch SHA to equal the worktree
-HEAD. Network Git operations clear inherited `GIT_*` controls and global/system
+HEAD. Every object-ID proof uses the same exact contract: 40 lowercase
+hexadecimal characters for SHA-1 or 64 for SHA-256; uppercase and intermediate
+lengths are rejected.
+Network Git operations clear inherited `GIT_*` controls and global/system
 configuration plus proxy and CA override variables; canonical SSH claims with inherited transport commands and
 repositories with direct, included, or per-worktree custom transport programs
 fail closed. Effective upstream configuration must resolve to the matching
@@ -158,7 +166,10 @@ owner PID metadata, so a later retry can remove only its own provably dead-owner
 locks while leaving foreign Git locks untouched.
 Rollback after a quarantine proof failure remains in
 `quarantine_compensating`, preserving path and repo/branch uniqueness until the
-filesystem and final lease state have both converged.
+filesystem and final lease state have both converged. Direct compensation
+retries acquire the same per-lease operation lock as the initial quarantine,
+while compensation already executing inside that locked operation reuses its
+held lock.
 If recovery cannot resolve a retained artifact, `quarantine_failed` continues
 to reserve path and repo/branch ownership for operator inspection.
 Creation and import completion use an exclusive `creating` owner; concurrent
@@ -187,11 +198,14 @@ is not yet set. Unknown future nonterminal states remain ownership-reserving by
 default. Legacy upgrades reject unknown columns before any rename or projection
 so forward data cannot be silently discarded. Migration 21 also requires a
 structurally complete proof payload before a terminal row leaves ownership
-indexes, valid lowercase 40-hex SHAs, nonnegative proof timestamps, and
-preserves one ownership-reserving legacy in-flight row when legacy claims
-collide. Its post-marker verification compares exact snapshots of all affected
-registry and lease rows, preventing a migration marker trigger from hiding a
-write. Completion also requires the exact
+indexes, valid lowercase 40- or 64-hex object IDs, nonnegative proof timestamps,
+and preserves chronological non-colliding ownership keepers when legacy claims
+collide. Demotion receipts always identify a keeper that remains
+ownership-reserving. Its post-marker verification compares exact snapshots of
+all affected registry and lease rows, and every marker insertion verifies the
+complete migration ledger plus the external-content repository FTS index,
+preventing a migration marker trigger from hiding a write. Completion also
+requires the exact
 `repo_catalog_id -> repos(id) ON DELETE SET NULL` foreign key and zero foreign-key
 violations, plus the complete canonical column type and nullability contract.
 Lease IDs are explicit non-null single-column `TEXT` primary keys, and

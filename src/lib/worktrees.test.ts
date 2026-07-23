@@ -109,6 +109,11 @@ if [ "$1" = "ls-remote" ] && [ "$2" = "--symref" ] && [ "$4" = "HEAD" ]; then
     printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\tHEAD\\n'
     exit 0
   fi
+  if [ -n "\${HASNA_REPOS_TEST_LS_REMOTE_OBJECT_ID:-}" ]; then
+    printf 'ref: refs/heads/main\\tHEAD\\n'
+    printf '%s\\tHEAD\\n' "$HASNA_REPOS_TEST_LS_REMOTE_OBJECT_ID"
+    exit 0
+  fi
   if [ -n "\${HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER:-}" ]; then
     count=0
     if [ -f "$HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER" ]; then
@@ -162,6 +167,10 @@ if [ "$1" = "ls-remote" ] && [ "$2" = "--exit-code" ] && [ "$3" = "origin" ]; th
   if [ "\${HASNA_REPOS_TEST_LS_REMOTE_FAIL:-}" = "1" ]; then
     echo "simulated remote probe failure" >&2
     exit 128
+  fi
+  if [ -n "\${HASNA_REPOS_TEST_REMOTE_OBJECT_ID:-}" ]; then
+    printf '%s\\t%s\\n' "$HASNA_REPOS_TEST_REMOTE_OBJECT_ID" "$4"
+    exit 0
   fi
   if [ "\${HASNA_REPOS_TEST_REQUIRE_SANITIZED_TRANSPORT_ENV:-}" = "1" ]; then
     for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR; do
@@ -313,6 +322,8 @@ afterEach(() => {
   delete process.env["HASNA_REPOS_TEST_LS_REMOTE_FAIL"];
   delete process.env["HASNA_REPOS_TEST_LS_REMOTE_MALFORMED"];
   delete process.env["HASNA_REPOS_TEST_LS_REMOTE_SHA256_PROOF"];
+  delete process.env["HASNA_REPOS_TEST_LS_REMOTE_OBJECT_ID"];
+  delete process.env["HASNA_REPOS_TEST_REMOTE_OBJECT_ID"];
   delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_COUNTER"];
   delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_FAIL_AT"];
   delete process.env["HASNA_REPOS_TEST_DEFAULT_PROBE_SWITCH_BRANCH"];
@@ -524,6 +535,25 @@ describe("worktree control plane", () => {
     expect(result.lease?.base_ref).toBe("main");
   });
 
+  it("rejects an intermediate-length object id in a live-default proof", () => {
+    process.env["HASNA_REPOS_TEST_LS_REMOTE_OBJECT_ID"] = "a".repeat(48);
+    const result = claimWorktree({
+      repo: "hasna/repos",
+      source,
+      taskId: "task-claim-default-intermediate-proof",
+      runId: "run-claim-default-intermediate-proof",
+      machineId: "machine-1",
+      branch: "task/claim-default-intermediate-proof",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "claim-default-intermediate-proof",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("remote_default_branch_unverified");
+    expect(getDb().query("SELECT COUNT(*) AS count FROM worktree_leases").get()).toEqual({ count: 0 });
+  });
+
   it("re-proves the live default immediately before claim activation and can retry after recovery", () => {
     const branch = "task/claim-default-race";
     const mainHead = git(["rev-parse", "refs/heads/main"], source);
@@ -658,6 +688,121 @@ describe("worktree control plane", () => {
     const becameDefault = claimWorktree(options);
     expect(becameDefault.ok).toBe(false);
     expect(becameDefault.code).toBe("protected_branch");
+  });
+
+  it("preserves a derived base on same-claim retries without an idempotency key", () => {
+    const options = {
+      repo: "hasna/repos",
+      source,
+      taskId: "task-no-key-derived-base",
+      runId: "run-no-key-derived-base",
+      machineId: "machine-1",
+      branch: "task/no-key-derived-base",
+      owner: "pacuvius",
+      root,
+    };
+    const claimed = claimWorktree(options);
+    expect(claimed.ok).toBe(true);
+    expect(claimed.lease?.base_ref).toBe("main");
+    expect(claimed.lease?.metadata["claim_base_provenance"]).toBe("derived");
+
+    const mainHead = git(["rev-parse", "refs/heads/main"], source);
+    git(["--git-dir", join(tempDir, "remote.git"), "update-ref", "refs/heads/stable", mainHead], tempDir);
+    git(["--git-dir", join(tempDir, "remote.git"), "symbolic-ref", "HEAD", "refs/heads/stable"], tempDir);
+
+    const replayed = claimWorktree(options);
+    expect(replayed.ok).toBe(true);
+    expect(replayed.idempotent).toBe(true);
+    expect(replayed.lease?.lease_id).toBe(claimed.lease?.lease_id);
+    expect(replayed.lease?.base_ref).toBe("main");
+
+    const explicitReplay = claimWorktree({ ...options, baseRef: "main" });
+    expect(explicitReplay.ok).toBe(false);
+    expect(explicitReplay.code).toBe("owner_collision");
+    expect(explicitReplay.lease?.lease_id).toBe(claimed.lease?.lease_id);
+  });
+
+  it("binds claim replay to explicit versus derived base provenance even when values coincide", () => {
+    const derivedOptions = {
+      repo: "hasna/repos",
+      source,
+      taskId: "task-derived-base-provenance",
+      runId: "run-derived-base-provenance",
+      machineId: "machine-1",
+      branch: "task/derived-base-provenance",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "derived-base-provenance",
+    };
+    const derived = claimWorktree(derivedOptions);
+    expect(derived.ok).toBe(true);
+    expect(derived.lease?.base_ref).toBe("main");
+    expect(derived.lease?.metadata["claim_base_provenance"]).toBe("derived");
+
+    const explicitReplay = claimWorktree({ ...derivedOptions, baseRef: "main" });
+    expect(explicitReplay.ok).toBe(false);
+    expect(explicitReplay.code).toBe("idempotency_key_conflict");
+    expect(explicitReplay.issues?.some((issue) => issue.ref === "derived != explicit")).toBe(true);
+
+    const explicitOptions = {
+      ...derivedOptions,
+      taskId: "task-explicit-base-provenance",
+      runId: "run-explicit-base-provenance",
+      branch: "task/explicit-base-provenance",
+      idempotencyKey: "explicit-base-provenance",
+      baseRef: "main",
+    };
+    const explicit = claimWorktree(explicitOptions);
+    expect(explicit.ok).toBe(true);
+    expect(explicit.lease?.metadata["claim_base_provenance"]).toBe("explicit");
+
+    const { baseRef: _omitted, ...omittedReplayOptions } = explicitOptions;
+    const omittedReplay = claimWorktree(omittedReplayOptions);
+    expect(omittedReplay.ok).toBe(false);
+    expect(omittedReplay.code).toBe("idempotency_key_conflict");
+    expect(omittedReplay.issues?.some((issue) => issue.ref === "explicit != derived")).toBe(true);
+  });
+
+  it("fails closed when a preexisting claim does not record base provenance", () => {
+    const options = {
+      repo: "hasna/repos",
+      source,
+      taskId: "task-legacy-base-provenance",
+      runId: "run-legacy-base-provenance",
+      machineId: "machine-1",
+      branch: "task/legacy-base-provenance",
+      owner: "pacuvius",
+      root,
+      idempotencyKey: "legacy-base-provenance",
+    };
+    const claimed = claimWorktree(options);
+    expect(claimed.ok).toBe(true);
+    getDb().query(`UPDATE worktree_leases
+      SET metadata_json = json_remove(metadata_json, '$.claim_base_provenance')
+      WHERE lease_id = ?`).run(claimed.lease!.lease_id);
+
+    const replay = claimWorktree(options);
+    expect(replay.ok).toBe(false);
+    expect(replay.code).toBe("idempotency_key_conflict");
+    expect(replay.issues?.some((issue) => issue.ref === "unknown != derived")).toBe(true);
+  });
+
+  it("rejects an intermediate-length object id in an origin branch proof", () => {
+    process.env["HASNA_REPOS_TEST_REMOTE_OBJECT_ID"] = "b".repeat(48);
+    const result = claim("task/intermediate-origin-proof");
+
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("worktree_create_failed");
+    expect(result.message).toContain("remote_probe_invalid");
+  });
+
+  it("rejects a non-canonical uppercase object id in an origin branch proof", () => {
+    process.env["HASNA_REPOS_TEST_REMOTE_OBJECT_ID"] = "B".repeat(40);
+    const result = claim("task/uppercase-origin-proof");
+
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("worktree_create_failed");
+    expect(result.message).toContain("remote_probe_invalid");
   });
 
   it("rejects an unpushed local base that differs from validated origin", () => {
@@ -1014,7 +1159,7 @@ describe("worktree control plane", () => {
       lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path, branch,
       owner, status, generation, fencing_token, idempotency_key, source, base_ref,
       expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 1, ?, ?, ?, ?, ?, ?, ?, ?, '{}')`).run(
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       "lease-crash",
       "hasna/repos",
       "task-crash",
@@ -1031,6 +1176,7 @@ describe("worktree control plane", () => {
       now,
       now,
       now,
+      JSON.stringify({ worktree_root: root, claim_base_provenance: "explicit" }),
     );
 
     const result = claimWorktree({
@@ -1079,6 +1225,7 @@ describe("worktree control plane", () => {
       now,
       JSON.stringify({
         worktree_root: root,
+        claim_base_provenance: "explicit",
         preparing_completion_token: "other-owner",
         preparing_completion_started_at_ms: now,
       }),
@@ -1207,7 +1354,7 @@ describe("worktree control plane", () => {
       lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path, branch,
       owner, status, generation, fencing_token, idempotency_key, source, base_ref,
       expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 1, ?, ?, ?, ?, ?, ?, ?, ?, '{}')`).run(
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       leaseId,
       "hasna/repos",
       "task-wrong-branch",
@@ -1224,6 +1371,7 @@ describe("worktree control plane", () => {
       now,
       now,
       now,
+      JSON.stringify({ worktree_root: root, claim_base_provenance: "explicit" }),
     );
 
     const result = claimWorktree({
@@ -1300,7 +1448,7 @@ describe("worktree control plane", () => {
       now,
       now,
       now,
-      JSON.stringify({ worktree_root: root }),
+      JSON.stringify({ worktree_root: root, claim_base_provenance: "explicit" }),
     );
 
     const result = claimWorktree({
@@ -1442,6 +1590,36 @@ describe("worktree control plane", () => {
     expect(replay.ok).toBe(true);
     expect(replay.idempotent).toBe(true);
     expect(replay.lease?.metadata["release_finalized"]).toBe(true);
+  });
+
+  it("rejects an intermediate-length object id in a persisted release plan", () => {
+    const result = claim("task/release-intermediate-object-id");
+    expect(result.ok).toBe(true);
+    const lease = result.lease!;
+    publishBranch(lease.canonical_path, lease.branch);
+    const intermediate = "c".repeat(48);
+    getDb().query(`UPDATE worktree_leases
+        SET status = 'releasing', head_sha = ?, metadata_json = ?
+      WHERE lease_id = ?`).run(
+        intermediate,
+        JSON.stringify({
+          ...lease.metadata,
+          release_expected_head_sha: intermediate,
+          release_finalized: false,
+        }),
+        lease.lease_id,
+      );
+
+    const resumed = releaseWorktree({
+      leaseId: lease.lease_id,
+      generation: lease.generation,
+      fencingToken: lease.fencing_token,
+    });
+
+    expect(resumed.ok).toBe(false);
+    expect(resumed.code).toBe("release_plan_missing");
+    expect(resumed.message).toContain("invalid object ID");
+    expect(resumed.lease?.status).toBe("worktree_failed");
   });
 
   it("holds Git mutation locks through terminal release", () => {
@@ -2536,6 +2714,70 @@ describe("worktree control plane", () => {
       cleanup: "quarantine",
     });
 
+    expect(resumed.ok).toBe(false);
+    expect(resumed.code).toBe("quarantine_failed");
+    expect(resumed.lease?.status).toBe("active");
+    expect(existsSync(lease.canonical_path)).toBe(true);
+    expect(existsSync(planned)).toBe(false);
+  });
+
+  it("serializes a direct quarantine compensation retry before rollback and CAS", () => {
+    const result = claim("task/quarantine-compensation-lock");
+    expect(result.ok).toBe(true);
+    const lease = result.lease!;
+    publishBranch(lease.canonical_path, lease.branch);
+    const planned = join(
+      root,
+      ".quarantine",
+      "machine-1",
+      "repos-dd2673d92bfc",
+      lease.lease_id,
+      "compensation-lock",
+      "repo",
+    );
+    const plannedRef = `refs/hasna/worktrees/${lease.lease_id}/${lease.generation}`;
+    mkdirSync(dirname(planned), { recursive: true });
+    git(["worktree", "move", lease.canonical_path, planned], source);
+    getDb().query("UPDATE worktree_leases SET status = 'quarantine_compensating', metadata_json = ? WHERE lease_id = ?")
+      .run(JSON.stringify({
+        ...lease.metadata,
+        planned_quarantine_path: planned,
+        planned_backup_ref: plannedRef,
+        quarantine_error: "simulated crash before locked rollback",
+        quarantine_finalization_claimed: false,
+      }), lease.lease_id);
+    const operationLock = join(
+      root,
+      ".control-plane-locks",
+      `quarantine-${lease.lease_id}-${lease.generation}.lock`,
+    );
+    mkdirSync(dirname(operationLock), { recursive: true });
+    writeFileSync(operationLock, JSON.stringify({
+      owner: "hasna-repos-worktree-control-plane",
+      pid: process.pid,
+      created_at_ms: Date.now(),
+    }));
+
+    const blocked = releaseWorktree({
+      leaseId: lease.lease_id,
+      generation: lease.generation,
+      fencingToken: lease.fencing_token,
+      cleanup: "quarantine",
+    });
+
+    expect(blocked.ok).toBe(false);
+    expect(blocked.code).toBe("terminal_lock_busy");
+    expect(blocked.lease?.status).toBe("quarantine_compensating");
+    expect(existsSync(lease.canonical_path)).toBe(false);
+    expect(existsSync(planned)).toBe(true);
+
+    rmSync(operationLock, { force: true });
+    const resumed = releaseWorktree({
+      leaseId: lease.lease_id,
+      generation: lease.generation,
+      fencingToken: lease.fencing_token,
+      cleanup: "quarantine",
+    });
     expect(resumed.ok).toBe(false);
     expect(resumed.code).toBe("quarantine_failed");
     expect(resumed.lease?.status).toBe("active");

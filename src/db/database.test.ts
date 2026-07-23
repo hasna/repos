@@ -406,6 +406,84 @@ describe("database", () => {
     }
   });
 
+  it("rolls back any migration whose marker trigger rewrites the exact migrations ledger", () => {
+    for (const scenario of [
+      "delete-earlier",
+      "rewrite-earlier",
+      "delete-current",
+      "rewrite-current",
+    ] as const) {
+      closeDb();
+      const dir = mkdtempSync(join(tmpdir(), `repos-generic-marker-${scenario}-`));
+      const path = join(dir, "repos.db");
+      try {
+        const initial = getDb(path);
+        initial.query("DELETE FROM migrations WHERE version = 4").run();
+        const before = initial.query("SELECT * FROM migrations ORDER BY id").all();
+        const triggerAction = scenario === "delete-earlier"
+          ? "DELETE FROM migrations WHERE version = 2;"
+          : scenario === "rewrite-earlier"
+            ? "UPDATE migrations SET applied_at = '2000-01-01 00:00:00' WHERE version = 2;"
+            : scenario === "delete-current"
+              ? "DELETE FROM migrations WHERE version = NEW.version;"
+              : "UPDATE migrations SET applied_at = '2000-01-01 00:00:00' WHERE version = NEW.version;";
+        initial.exec(`
+          CREATE TRIGGER mutate_generic_migration_marker AFTER INSERT ON migrations
+          WHEN NEW.version = 4
+          BEGIN
+            ${triggerAction}
+          END;
+        `);
+        closeDb();
+
+        expect(() => getDb(path)).toThrow("migration marker integrity verification failed");
+        closeDb();
+        const check = new Database(path, { readonly: true });
+        expect(check.query("SELECT * FROM migrations ORDER BY id").all()).toEqual(before);
+        check.close();
+      } finally {
+        closeDb();
+        rmSync(dir, { recursive: true, force: true });
+        process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+        getDb(":memory:");
+      }
+    }
+  });
+
+  it("rolls back a marker trigger that corrupts the external-content repository index", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-marker-fts-integrity-"));
+    const path = join(dir, "repos.db");
+    try {
+      const initial = getDb(path);
+      const repo = initial.query("INSERT INTO repos (path, name) VALUES (?, ?) RETURNING id")
+        .get(join(dir, "indexed-repo"), "marker-index-proof") as { id: number };
+      initial.query("DELETE FROM migrations WHERE version = 4").run();
+      initial.exec(`
+        CREATE TRIGGER corrupt_fts_after_marker AFTER INSERT ON migrations
+        WHEN NEW.version = 4
+        BEGIN
+          INSERT INTO fts_repos(fts_repos) VALUES ('delete-all');
+        END;
+      `);
+      closeDb();
+
+      expect(() => getDb(path)).toThrow("migration fts_repos integrity verification failed");
+      closeDb();
+      const check = new Database(path);
+      expect(check.query("SELECT 1 FROM migrations WHERE version = 4").get()).toBeNull();
+      expect(check.query("SELECT rowid FROM fts_repos WHERE fts_repos MATCH 'marker'").all())
+        .toEqual([{ rowid: repo.id }]);
+      check.exec("INSERT INTO fts_repos(fts_repos, rank) VALUES ('integrity-check', 1)");
+      check.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
   it("upgrades the live migration-5 worktree schema without skipping relocation audit", () => {
     closeDb();
     const dir = mkdtempSync(join(tmpdir(), "repos-live-v5-upgrade-"));
@@ -772,10 +850,10 @@ exec ${JSON.stringify(realGit)} "$@"
         base_sha, task_id, run_id, mode, cleanup_policy, status, created_at,
         updated_at, claimed_at
       ) VALUES
-        ('wt_aaaaaaaaaaaaaaaa', 'github:hasna/repos', '/legacy/repos', 'station01', '/legacy/a', 'task/shared', 'main', '${"a".repeat(40)}', 'task-a', 'run-a', 'required', 'retain', 'claimed', '2026-07-15', '2026-07-15', '2026-07-15'),
+        ('wt_aaaaaaaaaaaaaaaa', 'github:hasna/repos', '/legacy/repos', 'station01', '/legacy/a', 'task/shared', 'main', '${"a".repeat(40)}', 'task-a', 'run-a', 'required', 'retain', 'claimed', '2026-07-14', '2026-07-16', '2026-07-16'),
         ('wt_bbbbbbbbbbbbbbbb', 'github:hasna/repos', '/legacy/repos', 'station02', '/legacy/b', 'task/shared', 'main', '${"b".repeat(40)}', 'task-b', 'run-b', 'required', 'retain', 'claimed', '2026-07-15', '2026-07-15', '2026-07-15'),
-        ('wt_cccccccccccccccc', 'github:hasna/repos', '/legacy/repos', 'station03', '/legacy/c', 'task/quarantine-shared', 'main', '${"c".repeat(40)}', 'task-c', 'run-c', 'required', 'retain', 'quarantined', '2026-07-15', '2026-07-15', '2026-07-15'),
-        ('wt_dddddddddddddddd', 'github:hasna/repos', '/legacy/repos', 'station04', '/legacy/d', 'task/quarantine-shared', 'main', '${"d".repeat(40)}', 'task-d', 'run-d', 'required', 'retain', 'quarantined', '2026-07-15', '2026-07-15', '2026-07-15');
+        ('wt_cccccccccccccccc', 'github:hasna/repos', '/legacy/repos', 'station03', '/legacy/c', 'task/quarantine-shared', 'main', '${"c".repeat(40)}', 'task-c', 'run-c', 'required', 'retain', 'quarantined', '2026-07-16', '2026-07-17', '2026-07-18'),
+        ('wt_dddddddddddddddd', 'github:hasna/repos', '/legacy/repos', 'station04', '/legacy/d', 'task/quarantine-shared', 'main', '${"d".repeat(40)}', 'task-d', 'run-d', 'required', 'retain', 'quarantined', '2026-07-15', '2026-07-17', '2026-07-18');
     `);
     seed.close();
     try {
@@ -786,13 +864,133 @@ exec ${JSON.stringify(realGit)} "$@"
       expect(columns).not.toContain("repo_id");
       expect(columns).toContain("canonical_repo");
       expect(db.query("SELECT lease_id, status FROM worktree_leases ORDER BY lease_id").all()).toEqual([
-        { lease_id: "wt_aaaaaaaaaaaaaaaa", status: "worktree_failed" },
-        { lease_id: "wt_bbbbbbbbbbbbbbbb", status: "failed" },
-        { lease_id: "wt_cccccccccccccccc", status: "quarantine_failed" },
-        { lease_id: "wt_dddddddddddddddd", status: "failed" },
+        { lease_id: "wt_aaaaaaaaaaaaaaaa", status: "failed" },
+        { lease_id: "wt_bbbbbbbbbbbbbbbb", status: "worktree_failed" },
+        { lease_id: "wt_cccccccccccccccc", status: "failed" },
+        { lease_id: "wt_dddddddddddddddd", status: "quarantine_failed" },
       ]);
       expect(db.query("SELECT COUNT(*) AS count FROM worktree_leases WHERE status NOT IN ('released', 'failed', 'quarantined')").get())
         .toEqual({ count: 2 });
+      for (const [leaseId, keeperLeaseId] of [
+        ["wt_aaaaaaaaaaaaaaaa", "wt_bbbbbbbbbbbbbbbb"],
+        ["wt_cccccccccccccccc", "wt_dddddddddddddddd"],
+      ]) {
+        const metadata = JSON.parse((db.query("SELECT metadata_json FROM worktree_leases WHERE lease_id = ?")
+          .get(leaseId) as { metadata_json: string }).metadata_json) as Record<string, unknown>;
+        expect(metadata["legacy_collision_demoted"]).toBe(true);
+        expect(metadata["legacy_collision"]).toEqual({
+          keeper_lease_id: keeperLeaseId,
+          collision_key: {
+            kind: "canonical_repo_branch",
+            canonical_repo: "hasna/repos",
+            branch: leaseId === "wt_aaaaaaaaaaaaaaaa" ? "task/shared" : "task/quarantine-shared",
+          },
+          lineage_order: ["claimed_at_ms", "created_at_ms", "lease_id"],
+          keeper_lineage: expect.objectContaining({ lease_id: keeperLeaseId }),
+          demoted_lineage: expect.objectContaining({ lease_id: leaseId }),
+        });
+      }
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("never records a transitively demoted legacy collision row as a keeper", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-transitive-legacy-collision-"));
+    const path = join(dir, "repos.db");
+    try {
+      getDb(path);
+      closeDb();
+      const seed = new Database(path);
+      seed.exec(`
+        DELETE FROM migrations WHERE version = 21;
+        DROP INDEX idx_worktree_leases_active_path;
+        DROP INDEX idx_worktree_leases_active_repo_branch;
+      `);
+      const insert = seed.query(`INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token, expires_at_ms,
+          heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES (?, 'hasna/repos', ?, ?, 'station01', ?, ?, 'legacy-import',
+          'worktree_failed', 1, ?, 10, 10, ?, ?, ?)`);
+      const rows = [
+        {
+          leaseId: "wt_transitive_a",
+          path: join(dir, "shared-path"),
+          branch: "task/transitive-a",
+          lineage: 1,
+        },
+        {
+          leaseId: "wt_transitive_b",
+          path: join(dir, "shared-path"),
+          branch: "task/transitive-shared",
+          lineage: 2,
+        },
+        {
+          leaseId: "wt_transitive_c",
+          path: join(dir, "path-c"),
+          branch: "task/transitive-shared",
+          lineage: 3,
+        },
+        {
+          leaseId: "wt_transitive_d",
+          path: join(dir, "path-d"),
+          branch: "task/transitive-shared",
+          lineage: 4,
+        },
+      ];
+      for (const row of rows) {
+        insert.run(
+          row.leaseId,
+          `task-${row.leaseId}`,
+          `run-${row.leaseId}`,
+          row.path,
+          row.branch,
+          `${row.leaseId}:1`,
+          row.lineage,
+          row.lineage,
+          JSON.stringify({
+            legacy_layout: true,
+            legacy_import: { claimed_at_ms: row.lineage },
+          }),
+        );
+      }
+      seed.close();
+
+      const migrated = getDb(path);
+      expect(migrated.query("SELECT lease_id, status FROM worktree_leases ORDER BY lease_id").all())
+        .toEqual([
+          { lease_id: "wt_transitive_a", status: "worktree_failed" },
+          { lease_id: "wt_transitive_b", status: "failed" },
+          { lease_id: "wt_transitive_c", status: "worktree_failed" },
+          { lease_id: "wt_transitive_d", status: "failed" },
+        ]);
+      const metadata = Object.fromEntries(
+        (migrated.query("SELECT lease_id, metadata_json FROM worktree_leases ORDER BY lease_id").all() as Array<{
+          lease_id: string;
+          metadata_json: string;
+        }>).map((row) => [row.lease_id, JSON.parse(row.metadata_json) as Record<string, unknown>]),
+      );
+      expect(metadata["wt_transitive_b"]?.["legacy_collision"]).toEqual(expect.objectContaining({
+        keeper_lease_id: "wt_transitive_a",
+        collision_key: {
+          kind: "canonical_path",
+          canonical_path: join(dir, "shared-path"),
+        },
+      }));
+      expect(metadata["wt_transitive_c"]?.["legacy_collision_demoted"]).toBeUndefined();
+      expect(metadata["wt_transitive_d"]?.["legacy_collision"]).toEqual(expect.objectContaining({
+        keeper_lease_id: "wt_transitive_c",
+        collision_key: {
+          kind: "canonical_repo_branch",
+          canonical_repo: "hasna/repos",
+          branch: "task/transitive-shared",
+        },
+      }));
     } finally {
       closeDb();
       rmSync(dir, { recursive: true, force: true });
@@ -1060,6 +1258,8 @@ exec ${JSON.stringify(realGit)} "$@"
       "invalid-terminal-proof",
       "numeric-terminal-proof",
       "empty-terminal-proof",
+      "intermediate-terminal-proof",
+      "uppercase-terminal-proof",
       "duplicate-active",
       "unknown-status-duplicate",
     ] as const) {
@@ -1122,7 +1322,9 @@ exec ${JSON.stringify(realGit)} "$@"
           seed.query("CREATE UNIQUE INDEX idx_worktree_leases_unexpected ON worktree_leases(task_id)").run();
         } else if (scenario === "invalid-terminal-proof"
           || scenario === "numeric-terminal-proof"
-          || scenario === "empty-terminal-proof") {
+          || scenario === "empty-terminal-proof"
+          || scenario === "intermediate-terminal-proof"
+          || scenario === "uppercase-terminal-proof") {
           seed.exec(`
             INSERT INTO worktree_leases (
               lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
@@ -1131,12 +1333,16 @@ exec ${JSON.stringify(realGit)} "$@"
             ) VALUES (
               'wt_invalid_terminal_proof', 'hasna/repos', 'task-proof', 'run-proof',
               'station01', '/tmp/invalid-proof', 'task/invalid-proof', 'owner', 'released',
-              1, 'token-proof', '${"a".repeat(40)}', 1, 1, 1, 1,
+              1, 'token-proof', '${scenario === "uppercase-terminal-proof" ? "A".repeat(40) : "a".repeat(40)}', 1, 1, 1, 1,
               '${scenario === "numeric-terminal-proof"
                 ? `{"release_finalized":1,"release_verified_head_sha":"${"a".repeat(40)}","release_finalized_at_ms":1}`
                 : scenario === "empty-terminal-proof"
                   ? `{"release_finalized":true,"release_verified_head_sha":"","release_finalized_at_ms":-1}`
-                : `{"release_finalized":true}`}'
+                  : scenario === "intermediate-terminal-proof"
+                    ? `{"release_finalized":true,"release_verified_head_sha":"${"a".repeat(48)}","release_finalized_at_ms":1}`
+                    : scenario === "uppercase-terminal-proof"
+                      ? `{"release_finalized":true,"release_verified_head_sha":"${"A".repeat(40)}","release_finalized_at_ms":1}`
+                  : `{"release_finalized":true}`}'
             );
           `);
         } else {
@@ -1179,6 +1385,10 @@ exec ${JSON.stringify(realGit)} "$@"
               ? "terminal proof payload"
             : scenario === "empty-terminal-proof"
               ? "terminal proof payload"
+            : scenario === "intermediate-terminal-proof"
+              ? "terminal proof payload"
+            : scenario === "uppercase-terminal-proof"
+              ? "terminal proof payload"
             : "duplicate active worktree path";
         expect(() => getDb(path)).toThrow(expected);
         const check = new Database(path, { readonly: true });
@@ -1190,6 +1400,65 @@ exec ${JSON.stringify(realGit)} "$@"
         process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
         getDb(":memory:");
       }
+    }
+  });
+
+  it("accepts exact 64-hex terminal proofs in validation and ownership indexes", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-sha256-terminal-proof-"));
+    const path = join(dir, "repos.db");
+    try {
+      const initial = getDb(path);
+      const objectId = "a".repeat(64);
+      initial.exec(`
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token, head_sha,
+          expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES
+          (
+            'wt_sha256_released', 'hasna/repos', 'task-released', 'run-released',
+            'station01', '/tmp/sha256-released', 'task/sha256-released', 'owner',
+            'released', 1, 'token-released', '${objectId}', 1, 1, 1, 1,
+            '{"release_finalized":true,"release_verified_head_sha":"${objectId}","release_finalized_at_ms":1}'
+          ),
+          (
+            'wt_sha256_quarantined', 'hasna/repos', 'task-quarantined', 'run-quarantined',
+            'station01', '/tmp/sha256-quarantined', 'task/sha256-quarantined', 'owner',
+            'quarantined', 2, 'token-quarantined', '${objectId}', 1, 1, 1, 1,
+            '{"quarantine_finalized":true,"verified_head_sha":"${objectId}","quarantine_path":"/tmp/sha256-quarantined","backup_ref":"refs/hasna/worktrees/wt_sha256_quarantined/2","quarantine_finalized_at_ms":1}'
+          );
+      `);
+      closeDb();
+
+      const reopened = getDb(path);
+      reopened.exec(`
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token,
+          expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES
+          (
+            'wt_sha256_released_successor', 'hasna/repos', 'task-released-next', 'run-released-next',
+            'station02', '/tmp/sha256-released', 'task/sha256-released', 'next-owner',
+            'active', 1, 'token-released-next', 2, 2, 2, 2, '{}'
+          ),
+          (
+            'wt_sha256_quarantined_successor', 'hasna/repos', 'task-quarantined-next', 'run-quarantined-next',
+            'station02', '/tmp/sha256-quarantined', 'task/sha256-quarantined', 'next-owner',
+            'active', 1, 'token-quarantined-next', 2, 2, 2, 2, '{}'
+          );
+      `);
+      expect(reopened.query("SELECT lease_id FROM worktree_leases WHERE owner = 'next-owner' ORDER BY lease_id").all())
+        .toEqual([
+          { lease_id: "wt_sha256_quarantined_successor" },
+          { lease_id: "wt_sha256_released_successor" },
+        ]);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
     }
   });
 
