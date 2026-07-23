@@ -68,6 +68,123 @@ repos-serve  # http://localhost:19450
 | `repos ops workspace-worktree-hygiene` | Scan workspace repos for stale, dirty, detached, or missing loop worktrees |
 | `repos ops task-route-health` | Check that task-created lifecycle router loops are active and recently succeeding |
 | `repos ops protected-release` | Emit a protected release task only when release-candidate gates are green |
+| `repos worktrees claim` | Claim and create a lease-backed task worktree |
+| `repos worktrees inspect` | Inspect persisted lease and git state without implicit scans |
+| `repos worktrees verify` | Refuse unsafe local state and require exact validated-origin branch SHA proof |
+| `repos worktrees renew` | Heartbeat a lease with generation and fencing-token CAS |
+| `repos worktrees release` | Release a safe lease; optional cleanup quarantines only |
+| `repos worktrees inventory` | List persisted leases and discovered worktrees without mutation |
+| `repos worktrees import` | Import an existing safe worktree into the lease store |
+
+### Worktree control plane
+
+`repos worktrees` is a JSON-first local control plane for agent-created git
+worktrees. Claims are persisted in SQLite with the canonical repo, task, run,
+machine, path, branch, generation, fencing token, heartbeat, and monotonic
+expiry. Expired leases are not stolen automatically and paths are never deleted
+by TTL. A different owner trying to reuse an active or expired lease gets an
+owner/stale-owner refusal until the existing lease is explicitly verified and
+released.
+
+Claim paths are derived rather than caller-selected:
+`~/.hasna/repos/worktrees/<machine-id>/<repo-slug>-<repo-hash>/<lease-id>/repo`.
+The repo hash is stable for the canonical owner/name and lease IDs use the
+`wt_<hex>` form consumed by the worktree guard. Set
+`HASNA_REPOS_WORKTREES_ROOT` only when an isolated runtime needs a different
+managed root.
+
+```bash
+repos worktrees claim \
+  --repo hasna/repos \
+  --task-id 1d6b96e2-6921-43d0-9684-52211e0034fc \
+  --run-id 019f6596-bd43-75c3-90d8-0a77b231e2ba \
+  --machine-id station01 \
+  --owner pacuvius \
+  --base main \
+  --mode required \
+  --json
+```
+
+When `--branch` is omitted, Repos derives a non-protected task branch from the
+task and run IDs. An owner/name repo is resolved to its GitHub clone URL, so the
+minimal command emitted by the worktree guard is directly executable.
+
+Release and cleanup are fenced operations. `release` requires the current
+generation and fencing token, refuses dirty/staged/untracked/detached,
+non-origin-upstream, remote-probe, exact-SHA, unique-commit, and unknown-owner
+failures, and only quarantines on an explicit `--cleanup quarantine` request.
+Mutable local remote-tracking refs are diagnostic only; verify and release query
+the validated origin and require its exact branch SHA to equal the worktree
+HEAD. Network Git operations clear inherited `GIT_*` controls and global/system
+configuration plus proxy and CA override variables; canonical SSH claims with inherited transport commands and
+repositories with direct, included, or per-worktree custom transport programs
+fail closed. Effective upstream configuration must resolve to the matching
+`origin/<branch>` rather than only appearing correct in common config. Quarantine
+first locks the lease with a compare-and-swap transition, derives a canonical
+direct `refs/hasna/worktrees/...` backup ref, rejects symbolic or conflicting
+refs, moves the Git worktree with Git-aware metadata handling, and then records
+the final path. Recovery revalidates the actual source or quarantine path
+against the same release-safety proof after the move and before completion,
+requires the canonical machine/repository/lease path shape, and rolls back
+post-move failures or leaves terminally inspectable failed leases. A competing
+completion that wins the database transition is preserved rather than rolled
+back only when it carries a valid finalized proof, and incomplete recovery
+metadata is terminalized. Backup-ref creation and the completed lease row are
+both bound to the exact post-move proved HEAD. A distinct
+`quarantine_finalizing` state keeps the lease reserved while the combined
+HEAD/ref proof is checked after the ownership CAS; only the subsequent terminal
+CAS can mark the lease `quarantined`. Proof failures after that ownership claim
+remain failed even when the filesystem move can be rolled back.
+Plain release uses the same pattern through a reserved `releasing` state and a
+reserved `release_committing` state, with complete local/origin proof after the
+commit-state CAS and before the terminal `released` transition. Quarantine uses
+the equivalent `quarantine_committing` proof phase. Both final proof/CAS
+sections hold Git index and branch-ref mutation locks and verify again before
+returning success. Provisional terminal rows remain ownership-reserving until
+their post-CAS proof atomically marks the corresponding finalized metadata flag;
+retries resume that locked proof after a crash. Control-plane lock files carry
+owner PID metadata, so a later retry can remove only its own provably dead-owner
+locks while leaving foreign Git locks untouched.
+Rollback after a quarantine proof failure remains in
+`quarantine_compensating`, preserving path and repo/branch uniqueness until the
+filesystem and final lease state have both converged.
+If recovery cannot resolve a retained artifact, `quarantine_failed` continues
+to reserve path and repo/branch ownership for operator inspection.
+Creation and import completion use an exclusive `creating` owner; concurrent
+retries wait, failed owners return to recoverable `preparing`, and stale owners
+can be resumed without letting a losing observer fail the shared lease.
+Local sources are accepted only when both the local base and the exact
+validated-origin branch resolve to the claimed HEAD.
+
+Migration from the legacy lease schema preserves prior mode, cleanup, Git
+common-dir, raw repository ID, original timestamp strings and exact millisecond
+precision, verification, error, and owner metadata under a collision-free
+`legacy_import` namespace.
+Malformed legacy timestamps abort and roll back migration. Unvalidated legacy
+nonterminal leases are imported as inspectable `failed` rows rather than
+renewable active owners; they must be explicitly validated and imported before
+reuse. Timestamp validation follows proleptic Gregorian leap-year rules.
+Migration 5 creates the initial lease table. Migration 21 is the unified
+successor for the worktree-control-plane lineage and the current registry
+lineage; versions 9 through 20 are reserved because unpublished candidates used
+those marker numbers for conflicting schemas. The unified migration reconciles
+the complete lease state in one transaction, including the active uniqueness
+boundary for `quarantine_finalizing`, `releasing`,
+`quarantine_compensating`, `creating`, terminal commit proof states, unresolved
+quarantine artifacts, and provisional terminal rows whose finalized proof flag
+is not yet set. Unknown future nonterminal states remain ownership-reserving by
+default. Legacy upgrades reject unknown columns before any rename or projection
+so forward data cannot be silently discarded. Migration 21 also requires a
+structurally complete proof payload before a terminal row leaves ownership
+indexes, valid lowercase 40-hex SHAs, nonnegative proof timestamps, and
+preserves one ownership-reserving legacy in-flight row when legacy claims
+collide. Its post-marker verification compares exact snapshots of all affected
+registry and lease rows, preventing a migration marker trigger from hiding a
+write. Completion also requires the exact
+`repo_catalog_id -> repos(id) ON DELETE SET NULL` foreign key and zero foreign-key
+violations, plus the complete canonical column type and nullability contract.
+Lease IDs are explicit non-null single-column `TEXT` primary keys, and
+`repo_catalog_id` must remain nullable so `ON DELETE SET NULL` is valid.
 
 Legacy list/search/status commands support `--json` for machine-readable output.
 

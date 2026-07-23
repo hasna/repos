@@ -48,6 +48,47 @@ describe("MCP HTTP transport", () => {
     await client.close();
   });
 
+  it("registers the complete worktree control-plane contract with positive integer fences", async () => {
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/mcp`),
+    );
+    const client = new Client({ name: "repos-http-worktree-contract-test", version: "1.0.0" });
+    await client.connect(transport);
+
+    const tools = (await client.listTools()).tools;
+    const expectedNames = [
+      "worktree_claim",
+      "worktree_import",
+      "worktree_inspect",
+      "worktree_inventory",
+      "worktree_release",
+      "worktree_renew",
+      "worktree_verify",
+    ];
+    expect(tools.map((tool) => tool.name).filter((name) => name.startsWith("worktree_")).sort())
+      .toEqual(expectedNames);
+
+    for (const [toolName, propertyNames] of [
+      ["worktree_claim", ["ttl_seconds"]],
+      ["worktree_import", ["ttl_seconds"]],
+      ["worktree_inventory", ["limit"]],
+      ["worktree_release", ["generation"]],
+      ["worktree_renew", ["generation", "ttl_seconds"]],
+    ] as const) {
+      const tool = tools.find((candidate) => candidate.name === toolName);
+      expect(tool).toBeDefined();
+      const properties = tool!.inputSchema.properties as Record<string, Record<string, unknown>>;
+      for (const propertyName of propertyNames) {
+        expect(properties[propertyName]).toMatchObject({
+          type: "integer",
+          exclusiveMinimum: 0,
+        });
+      }
+    }
+
+    await client.close();
+  });
+
   it("sanitizes contaminated repo and remote rows over MCP HTTP", async () => {
     const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
     const db = getDb();

@@ -111,6 +111,31 @@ export {
   upsertTaskSeeds,
   writeLoopReport,
 } from "./lib/ops-loop-tasks.js";
+export {
+  canonicalizeRepo,
+  claimWorktree,
+  defaultWorktreeBranch,
+  defaultWorktreePath,
+  formatWorktreeResult,
+  importWorktree,
+  inspectGitWorktree,
+  inspectWorktree,
+  inventoryWorktrees,
+  releaseWorktree,
+  renewWorktreeLease,
+  verifyWorktree,
+} from "./lib/worktrees.js";
+export type {
+  ClaimWorktreeOptions,
+  FencedLeaseOptions,
+  GitInspection,
+  ImportWorktreeOptions,
+  InventoryOptions,
+  WorktreeIssue,
+  WorktreeLease,
+  WorktreeLeaseStatus,
+  WorktreeResult,
+} from "./lib/worktrees.js";
 export type {
   CliSmokeOptions,
   CliSmokeResult,

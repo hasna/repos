@@ -30,6 +30,15 @@ import {
   triagePullRequests,
   withTodos,
 } from "../lib/repo-ops.js";
+import {
+  claimWorktree,
+  importWorktree,
+  inspectWorktree,
+  inventoryWorktrees,
+  releaseWorktree,
+  renewWorktreeLease,
+  verifyWorktree,
+} from "../lib/worktrees.js";
 import { getDb } from "../db/database.js";
 import { getCliVersion } from "../cli/version.js";
 import { sanitizeRemoteOutput } from "../lib/remote-identity.js";
@@ -296,6 +305,99 @@ server.tool("release_pipeline_parity", "Check the standard ci.yml + tag-publish 
   includeRegistry: args.include_registry,
   limit: args.limit,
 }), todosArgs(args))));
+
+// ── Worktree control plane ──
+
+server.tool("worktree_claim", "Atomically claim and create a managed git worktree lease", {
+  repo: z.string().describe("Canonical repo, URL, or source path"),
+  task_id: z.string().describe("Todos task id"),
+  run_id: z.string().describe("Run/session id"),
+  machine_id: z.string().describe("Machine id"),
+  branch: z.string().optional().describe("Non-protected branch; derived from task/run when omitted"),
+  owner: z.string().describe("Lease owner"),
+  source: z.string().optional().describe("Git source path or URL; defaults to repo"),
+  base: z.string().optional().describe("Base ref"),
+  ttl_seconds: z.number().int().positive().optional().describe("Lease TTL seconds"),
+  idempotency_key: z.string().optional().describe("Idempotency key"),
+}, async (args) => jsonText(claimWorktree({
+  repo: args.repo,
+  source: args.source,
+  taskId: args.task_id,
+  runId: args.run_id,
+  machineId: args.machine_id,
+  branch: args.branch,
+  owner: args.owner,
+  baseRef: args.base,
+  ttlSeconds: args.ttl_seconds,
+  idempotencyKey: args.idempotency_key,
+})));
+
+server.tool("worktree_inspect", "Inspect a worktree lease and filesystem state without scanning", {
+  lease_id: z.string().optional().describe("Lease id"),
+  path: z.string().optional().describe("Worktree path"),
+}, async (args) => jsonText(inspectWorktree({ leaseId: args.lease_id, path: args.path })));
+
+server.tool("worktree_verify", "Verify that a worktree is safe to release or clean", {
+  lease_id: z.string().optional().describe("Lease id"),
+  path: z.string().optional().describe("Worktree path"),
+}, async (args) => jsonText(verifyWorktree({ leaseId: args.lease_id, path: args.path })));
+
+server.tool("worktree_renew", "Renew a lease heartbeat using generation and fencing token", {
+  lease_id: z.string().optional().describe("Lease id"),
+  path: z.string().optional().describe("Worktree path"),
+  generation: z.number().int().positive().describe("Expected generation"),
+  fencing_token: z.string().describe("Current fencing token"),
+  ttl_seconds: z.number().int().positive().optional().describe("Lease TTL seconds"),
+}, async (args) => jsonText(renewWorktreeLease({
+  leaseId: args.lease_id,
+  path: args.path,
+  generation: args.generation,
+  fencingToken: args.fencing_token,
+  ttlSeconds: args.ttl_seconds,
+})));
+
+server.tool("worktree_release", "Release a lease after safe-state verification; optional cleanup quarantines only", {
+  lease_id: z.string().optional().describe("Lease id"),
+  path: z.string().optional().describe("Worktree path"),
+  generation: z.number().int().positive().describe("Expected generation"),
+  fencing_token: z.string().describe("Current fencing token"),
+  cleanup: z.enum(["none", "quarantine"]).optional().describe("Cleanup mode"),
+}, async (args) => jsonText(releaseWorktree({
+  leaseId: args.lease_id,
+  path: args.path,
+  generation: args.generation,
+  fencingToken: args.fencing_token,
+  cleanup: args.cleanup || "none",
+})));
+
+server.tool("worktree_inventory", "List discovered worktrees and persisted leases without mutating them", {
+  root: z.string().optional().describe("Canonical worktree root"),
+  limit: z.number().int().positive().optional().describe("Max records"),
+}, async (args) => jsonText({ ok: true, action: "inventory", ...inventoryWorktrees({ root: args.root, limit: args.limit }) }));
+
+server.tool("worktree_import", "Import an existing safe git worktree into the lease store", {
+  repo: z.string().describe("Canonical repo"),
+  task_id: z.string().describe("Todos task id"),
+  run_id: z.string().describe("Run/session id"),
+  machine_id: z.string().describe("Machine id"),
+  branch: z.string().describe("Existing branch"),
+  owner: z.string().describe("Lease owner"),
+  path: z.string().describe("Existing worktree path under root"),
+  root: z.string().optional().describe("Canonical worktree root"),
+  ttl_seconds: z.number().int().positive().optional().describe("Lease TTL seconds"),
+  idempotency_key: z.string().optional().describe("Idempotency key"),
+}, async (args) => jsonText(importWorktree({
+  repo: args.repo,
+  taskId: args.task_id,
+  runId: args.run_id,
+  machineId: args.machine_id,
+  branch: args.branch,
+  owner: args.owner,
+  path: args.path,
+  root: args.root,
+  ttlSeconds: args.ttl_seconds,
+  idempotencyKey: args.idempotency_key,
+})));
 
 // ── GitHub Sync ──
 

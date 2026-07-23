@@ -2,6 +2,7 @@
 import { registerEventsCommands } from "@hasna/events/commander";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { hostname, userInfo } from "node:os";
 import { program } from "commander";
 import { getCliVersion } from "./version.js";
 import { parseIntOption } from "./args.js";
@@ -68,6 +69,16 @@ import {
   withTodos,
 } from "../lib/repo-ops.js";
 import { getNoCloudInventory } from "../lib/no-cloud-inventory.js";
+import {
+  claimWorktree,
+  formatWorktreeResult,
+  importWorktree,
+  inspectWorktree,
+  inventoryWorktrees,
+  releaseWorktree,
+  renewWorktreeLease,
+  verifyWorktree,
+} from "../lib/worktrees.js";
 
 const ORG_ALIASES: Record<string, string> = {
   oss: "hasna",
@@ -95,6 +106,7 @@ const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set([
   "no-cloud",
   "release-health",
   "registry",
+  "worktrees",
 ]);
 
 program
@@ -1934,6 +1946,162 @@ noCloudOps
     });
     printOpsJson(report, opts.pretty);
   });
+
+// ── Worktree control plane ──
+const worktrees = program.command("worktrees").description("Lease-backed git worktree control plane");
+
+function printWorktreeResult(result: any, opts: { pretty?: boolean }) {
+  console.log(formatWorktreeResult(result, Boolean(opts.pretty)));
+  if (result && result.ok === false) process.exitCode = 1;
+}
+
+function machineIdFlag(value: string | undefined): string {
+  return value || process.env["HASNA_MACHINE_ID"] || process.env["CODEWITH_MACHINE_ID"] || process.env["HOSTNAME"] || hostname();
+}
+
+function ownerFlag(value: string | undefined): string {
+  if (value) return value;
+  const configured = process.env["HASNA_AGENT_ID"] || process.env["CODEWITH_AGENT_NAME"] || process.env["USER"];
+  if (configured) return configured;
+  try { return userInfo().username; } catch { return "local-user"; }
+}
+
+function requireRequiredMode(mode: string | undefined) {
+  if (mode && mode !== "required") {
+    console.log(formatWorktreeResult({ ok: false, action: "claim", code: "unsupported_mode", message: "only --mode required is supported" }));
+    process.exit(1);
+  }
+}
+
+worktrees
+  .command("claim")
+  .description("Atomically claim and create a managed git worktree lease")
+  .requiredOption("--repo <repo>", "Canonical repo (owner/name, URL, or source path)")
+  .requiredOption("--task-id <id>", "Todos task id")
+  .requiredOption("--run-id <id>", "Run/session id")
+  .option("--branch <branch>", "Non-protected work branch; derived from task/run when omitted")
+  .option("--source <path-or-url>", "Git source path or URL; defaults to --repo")
+  .option("--machine-id <id>", "Machine id; defaults to CODEWITH_MACHINE_ID/HOSTNAME")
+  .option("--owner <agent>", "Lease owner; defaults to CODEWITH_AGENT_NAME/USER")
+  .option("--base <ref>", "Base ref for git worktree add", "main")
+  .option("--ttl-seconds <n>", "Lease TTL in seconds", "21600")
+  .option("--idempotency-key <key>", "Idempotency key for safe retries")
+  .option("--mode <mode>", "Worktree mode; only required is supported", "required")
+  .option("--json", "Output JSON")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => {
+    requireRequiredMode(opts.mode);
+    printWorktreeResult(claimWorktree({
+      repo: opts.repo,
+      source: opts.source,
+      taskId: opts.taskId,
+      runId: opts.runId,
+      machineId: machineIdFlag(opts.machineId),
+      branch: opts.branch,
+      owner: ownerFlag(opts.owner),
+      baseRef: opts.base,
+      ttlSeconds: intFlag(opts.ttlSeconds, "--ttl-seconds", 1),
+      idempotencyKey: opts.idempotencyKey,
+    }), opts);
+  });
+
+worktrees
+  .command("inspect")
+  .description("Inspect a worktree lease and filesystem state without scanning")
+  .option("--lease-id <id>", "Lease id")
+  .option("--path <path>", "Worktree path")
+  .option("--json", "Output JSON")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => printWorktreeResult(inspectWorktree({ leaseId: opts.leaseId, path: opts.path }), opts));
+
+worktrees
+  .command("verify")
+  .description("Verify that a worktree is safe to release or clean")
+  .option("--lease-id <id>", "Lease id")
+  .option("--path <path>", "Worktree path")
+  .option("--json", "Output JSON")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => printWorktreeResult(verifyWorktree({ leaseId: opts.leaseId, path: opts.path }), opts));
+
+worktrees
+  .command("renew")
+  .description("Renew a lease heartbeat using generation and fencing token")
+  .option("--lease-id <id>", "Lease id")
+  .option("--path <path>", "Worktree path")
+  .requiredOption("--generation <n>", "Expected lease generation")
+  .requiredOption("--fencing-token <token>", "Current fencing token")
+  .option("--ttl-seconds <n>", "Lease TTL in seconds", "21600")
+  .option("--json", "Output JSON")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => printWorktreeResult(renewWorktreeLease({
+    leaseId: opts.leaseId,
+    path: opts.path,
+    generation: intFlag(opts.generation, "--generation", 1),
+    fencingToken: opts.fencingToken,
+    ttlSeconds: intFlag(opts.ttlSeconds, "--ttl-seconds", 1),
+  }), opts));
+
+worktrees
+  .command("release")
+  .description("Release a lease after safe-state verification; optional cleanup quarantines only")
+  .option("--lease-id <id>", "Lease id")
+  .option("--path <path>", "Worktree path")
+  .requiredOption("--generation <n>", "Expected lease generation")
+  .requiredOption("--fencing-token <token>", "Current fencing token")
+  .option("--cleanup <mode>", "none or quarantine", "none")
+  .option("--json", "Output JSON")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => {
+    if (opts.cleanup !== "none" && opts.cleanup !== "quarantine") {
+      printWorktreeResult({ ok: false, action: "release", code: "invalid_cleanup", message: "--cleanup must be none or quarantine" }, opts);
+      return;
+    }
+    const cleanup = opts.cleanup as "none" | "quarantine";
+    printWorktreeResult(releaseWorktree({
+      leaseId: opts.leaseId,
+      path: opts.path,
+      generation: intFlag(opts.generation, "--generation", 1),
+      fencingToken: opts.fencingToken,
+      cleanup,
+    }), opts);
+  });
+
+worktrees
+  .command("inventory")
+  .description("List discovered worktrees and persisted leases without mutating them")
+  .option("--root <path>", "Canonical worktree root")
+  .option("-n, --limit <n>", "Max records", "500")
+  .option("--json", "Output JSON")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => printWorktreeResult({ ok: true, action: "inventory", ...inventoryWorktrees({ root: opts.root, limit: intFlag(opts.limit, "--limit", 1) }) }, opts));
+
+worktrees
+  .command("import")
+  .description("Import an existing safe git worktree into the lease store")
+  .requiredOption("--repo <repo>", "Canonical repo")
+  .requiredOption("--task-id <id>", "Todos task id")
+  .requiredOption("--run-id <id>", "Run/session id")
+  .requiredOption("--branch <branch>", "Existing branch")
+  .requiredOption("--path <path>", "Existing worktree path under the worktree root")
+  .option("--machine-id <id>", "Machine id; defaults to CODEWITH_MACHINE_ID/HOSTNAME")
+  .option("--owner <agent>", "Lease owner; defaults to CODEWITH_AGENT_NAME/USER")
+  .option("--root <path>", "Canonical worktree root")
+  .option("--ttl-seconds <n>", "Lease TTL in seconds", "21600")
+  .option("--idempotency-key <key>", "Idempotency key for safe retries")
+  .option("--json", "Output JSON")
+  .option("--pretty", "Pretty-print JSON")
+  .action((opts) => printWorktreeResult(importWorktree({
+    repo: opts.repo,
+    taskId: opts.taskId,
+    runId: opts.runId,
+    machineId: machineIdFlag(opts.machineId),
+    branch: opts.branch,
+    owner: ownerFlag(opts.owner),
+    path: opts.path,
+    root: opts.root,
+    ttlSeconds: intFlag(opts.ttlSeconds, "--ttl-seconds", 1),
+    idempotencyKey: opts.idempotencyKey,
+  }), opts));
 
 // ── Knowledge Graph ──
 const graph = program.command("graph").description("Knowledge graph commands");

@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDb, closeDb } from "./database";
 import { listRepos } from "./repos";
+import { importWorktree, inspectWorktree, renewWorktreeLease } from "../lib/worktrees";
 
 describe("database", () => {
   beforeAll(() => {
@@ -112,7 +113,7 @@ describe("database", () => {
       const migrated = getDb(path);
       expect(migrated).toBe(raw);
       expect(migrated.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11].map((version) => ({ version })));
+        .toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21].map((version) => ({ version })));
       expect(getDb(path)).toBe(migrated);
       expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get())
         .toEqual({ count: 1 });
@@ -185,6 +186,12 @@ describe("database", () => {
     expect(table).toBeTruthy();
   });
 
+  it("should create worktree_leases table", () => {
+    const db = getDb(":memory:");
+    const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get();
+    expect(tables).toBeTruthy();
+  });
+
   it("should create FTS5 tables", () => {
     const db = getDb(":memory:");
     const ftsRepos = db.query("SELECT name FROM sqlite_master WHERE name='fts_repos'").get();
@@ -199,63 +206,191 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21]);
   });
 
   it("migrates existing branch uniqueness to include remote classification", () => {
     closeDb();
     const dir = mkdtempSync(join(tmpdir(), "repos-branch-identity-upgrade-"));
     const path = join(dir, "repos.db");
-    const seed = new Database(path);
-    seed.exec(`
-      PRAGMA foreign_keys = ON;
-      CREATE TABLE migrations (
-        id INTEGER PRIMARY KEY,
-        version INTEGER NOT NULL UNIQUE,
-        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8), (9);
-      CREATE TABLE repos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        path TEXT NOT NULL UNIQUE,
-        name TEXT NOT NULL
-      );
-      INSERT INTO repos (id, path, name) VALUES (1, '/tmp/existing', 'existing');
-      CREATE TABLE branches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        is_remote INTEGER NOT NULL DEFAULT 0,
-        last_commit_sha TEXT,
-        last_commit_date TEXT,
-        ahead INTEGER NOT NULL DEFAULT 0,
-        behind INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(repo_id, name)
-      );
-      CREATE INDEX idx_branches_repo ON branches(repo_id);
-      INSERT INTO branches (repo_id, name, is_remote, last_commit_sha)
-        VALUES (1, 'origin/main', 0, 'local');
-    `);
-    seed.close();
-
     try {
+      const initial = getDb(path);
+      const repo = initial.query("INSERT INTO repos (path, name) VALUES ('/tmp/existing', 'existing') RETURNING id")
+        .get() as { id: number };
+      initial.query(`INSERT INTO branches (repo_id, name, is_remote, last_commit_sha)
+        VALUES (?, 'origin/main', 0, 'local')`).run(repo.id);
+      closeDb();
+
+      const seed = new Database(path);
+      seed.exec(`
+        PRAGMA foreign_keys = ON;
+        DELETE FROM migrations WHERE version IN (10, 21);
+        DROP INDEX idx_branches_repo;
+        ALTER TABLE branches RENAME TO branches_current;
+        CREATE TABLE branches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          is_remote INTEGER NOT NULL DEFAULT 0,
+          last_commit_sha TEXT,
+          last_commit_date TEXT,
+          ahead INTEGER NOT NULL DEFAULT 0,
+          behind INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(repo_id, name)
+        );
+        INSERT INTO branches SELECT * FROM branches_current;
+        DROP TABLE branches_current;
+        CREATE INDEX idx_branches_repo ON branches(repo_id);
+      `);
+      seed.close();
+
       const migrated = getDb(path);
       migrated.query(`INSERT INTO branches (repo_id, name, is_remote, last_commit_sha)
-        VALUES (1, 'origin/main', 1, 'remote')`).run();
+        VALUES (?, 'origin/main', 1, 'remote')`).run(repo.id);
       expect(migrated.query(`SELECT name, is_remote, last_commit_sha FROM branches
-        WHERE repo_id = 1 ORDER BY is_remote`).all()).toEqual([
+        WHERE repo_id = ? ORDER BY is_remote`).all(repo.id)).toEqual([
         { name: "origin/main", is_remote: 0, last_commit_sha: "local" },
         { name: "origin/main", is_remote: 1, last_commit_sha: "remote" },
       ]);
       expect(() => migrated.query(`INSERT INTO branches (repo_id, name, is_remote, last_commit_sha)
-        VALUES (1, 'origin/main', 1, 'duplicate-remote')`).run()).toThrow("UNIQUE constraint failed");
+        VALUES (?, 'origin/main', 1, 'duplicate-remote')`).run(repo.id)).toThrow("UNIQUE constraint failed");
       expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(migrated.query("SELECT version FROM migrations WHERE version = 10").get()).toEqual({ version: 10 });
+      expect(migrated.query("SELECT version FROM migrations WHERE version = 21").get()).toEqual({ version: 21 });
     } finally {
       closeDb();
       rmSync(dir, { recursive: true, force: true });
       process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
       getDb(":memory:");
+    }
+  });
+
+  it("rebuilds version-21 indexes for semantically proved terminal ownership", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v10-finalizing-index-"));
+    const path = join(dir, "repos.db");
+    try {
+      process.env["HASNA_REPOS_DB_PATH"] = path;
+      getDb(path);
+      closeDb();
+      const seed = new Database(path);
+      seed.exec(`
+        DELETE FROM migrations WHERE version = 21;
+        DROP INDEX idx_worktree_leases_active_path;
+        DROP INDEX idx_worktree_leases_active_repo_branch;
+        CREATE UNIQUE INDEX idx_worktree_leases_active_path
+          ON worktree_leases(canonical_path)
+          WHERE status IN ('preparing', 'active', 'releasing', 'quarantining', 'quarantine_finalizing');
+        CREATE UNIQUE INDEX idx_worktree_leases_active_repo_branch
+          ON worktree_leases(canonical_repo, branch)
+          WHERE status IN ('preparing', 'active', 'releasing', 'quarantining', 'quarantine_finalizing');
+      `);
+      seed.close();
+
+      const db = getDb(path);
+      expect(db.query("SELECT 1 FROM migrations WHERE version = 21").get()).toEqual({ 1: 1 });
+      const indexes = db.query(`SELECT name, sql FROM sqlite_master
+        WHERE type = 'index' AND name IN (
+          'idx_worktree_leases_active_path',
+          'idx_worktree_leases_active_repo_branch'
+        ) ORDER BY name`).all() as Array<{ name: string; sql: string }>;
+      expect(indexes).toHaveLength(2);
+      expect(indexes.every((index) =>
+        index.sql.includes("status NOT IN ('released', 'failed', 'quarantined')")
+        && index.sql.includes("$.release_finalized")
+        && index.sql.includes("$.release_verified_head_sha")
+        && index.sql.includes("$.quarantine_finalized")
+        && index.sql.includes("$.backup_ref"))).toBe(true);
+      db.exec(`
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token, expires_at_ms,
+          heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES (
+          'wt_provisional_release', 'hasna/repos', 'task-provisional', 'run-provisional',
+          'station01', '/tmp/provisional', 'task/provisional', 'owner', 'released',
+          1, 'token-provisional', 1, 1, 1, 1, '{"release_finalized":false}'
+        );
+      `);
+      expect(() => db.query(`
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token, expires_at_ms,
+          heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES (
+          'wt_provisional_competitor', 'hasna/repos', 'task-competitor', 'run-competitor',
+          'station01', '/tmp/provisional', 'task/provisional', 'competitor', 'active',
+          1, 'token-competitor', 1, 1, 1, 1, '{}'
+        );
+      `).run()).toThrow("UNIQUE constraint failed");
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back version 21 when its marker trigger mutates any integrated row set", () => {
+    for (const scenario of ["branch", "branch-audit", "worktree-lease"] as const) {
+      closeDb();
+      const dir = mkdtempSync(join(tmpdir(), `repos-v21-marker-${scenario}-`));
+      const path = join(dir, "repos.db");
+      try {
+        const initial = getDb(path);
+        const repo = initial.query("INSERT INTO repos (path, name) VALUES (?, ?) RETURNING id")
+          .get(join(dir, "repo"), `repo-${scenario}`) as { id: number };
+        const branch = initial.query(`INSERT INTO branches (
+          repo_id, name, is_remote, last_commit_sha
+        ) VALUES (?, 'codewith/v21-proof', 0, ?) RETURNING id`)
+          .get(repo.id, "a".repeat(40)) as { id: number };
+        initial.query(`INSERT INTO branch_adjudication_audit (
+          id, idempotency_key, request_hash, plan_hash, operation, actor,
+          row_count, before_json, after_json, rows_json
+        ) VALUES (
+          'audit-v21-proof', 'audit-v21-proof-key', 'request-hash', 'plan-hash',
+          'branch_adjudication', 'reviewed-actor', 1, '{}', '{}', '[]'
+        )`).run();
+        initial.query(`INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token, expires_at_ms,
+          heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+        ) VALUES (
+          'wt_v21_marker_proof', 'hasna/repos', 'task-v21', 'run-v21',
+          'station01', ?, 'codewith/v21-proof', 'reviewed-owner', 'failed',
+          1, 'wt_v21_marker_proof:1', 1, 1, 1, 1, '{}'
+        )`).run(join(dir, "worktree"));
+        initial.query("DELETE FROM migrations WHERE version = 21").run();
+        const triggerAction = scenario === "branch"
+          ? `DELETE FROM branches WHERE id = ${branch.id};`
+          : scenario === "branch-audit"
+            ? "UPDATE branch_adjudication_audit SET actor = 'substituted' WHERE id = 'audit-v21-proof';"
+            : "DELETE FROM worktree_leases WHERE lease_id = 'wt_v21_marker_proof';";
+        initial.exec(`
+          CREATE TRIGGER mutate_v21_target AFTER INSERT ON migrations
+          WHEN NEW.version = 21
+          BEGIN
+            ${triggerAction}
+          END;
+        `);
+        closeDb();
+
+        expect(() => getDb(path)).toThrow("integrated schema reconciliation failed exact-state verification");
+        closeDb();
+        const check = new Database(path, { readonly: true });
+        expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toBeNull();
+        expect(check.query("SELECT id FROM branches WHERE id = ?").get(branch.id)).toEqual({ id: branch.id });
+        expect(check.query("SELECT actor FROM branch_adjudication_audit WHERE id = 'audit-v21-proof'").get())
+          .toEqual({ actor: "reviewed-actor" });
+        expect(check.query("SELECT lease_id FROM worktree_leases WHERE lease_id = 'wt_v21_marker_proof'").get())
+          .toEqual({ lease_id: "wt_v21_marker_proof" });
+        check.close();
+      } finally {
+        closeDb();
+        rmSync(dir, { recursive: true, force: true });
+        process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+        getDb(":memory:");
+      }
     }
   });
 
@@ -270,7 +405,8 @@ describe("database", () => {
         version INTEGER NOT NULL UNIQUE,
         applied_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
-      INSERT INTO migrations (version) VALUES (5);
+      INSERT INTO migrations (version) VALUES
+        (5), (9), (10), (11), (12), (13), (14), (15), (16), (17), (18), (19), (20);
       CREATE TABLE worktree_leases (
         lease_id TEXT PRIMARY KEY,
         repo_id TEXT NOT NULL,
@@ -296,15 +432,160 @@ describe("database", () => {
         last_error TEXT,
         UNIQUE(repo_id, machine_id, task_id, run_id, base_ref)
       );
+      INSERT INTO worktree_leases (
+        lease_id, repo_id, repo_path, repo_catalog_id, machine_id,
+        worktree_path, branch, base_ref, base_sha, task_id, run_id, mode,
+        owner_metadata, cleanup_policy, status, git_common_dir, created_at,
+        updated_at, claimed_at, verified_at, released_at, last_error
+      ) VALUES (
+        'wt_aaaaaaaaaaaaaaaa', 'github:Hasna/Repos', '/legacy/repos', NULL, 'station01',
+        '/legacy/worktree', 'task/legacy', 'main', '${"a".repeat(40)}',
+        'task-legacy', 'run-legacy', 'required',
+        '{"agent":"legacy-agent","legacy_status":"owner-value","legacy_layout":"owner-layout","legacy_owner_metadata_raw":"owner-raw"}',
+        'retain', 'claimed', '/legacy/common', '1970-07-15T12:34:56.001Z',
+        '2026-07-15T00:00:00.250Z', '2026-07-15T00:00:00.375Z',
+        '0000-02-29T00:00:00.000Z', NULL, 'legacy failure'
+      );
+      INSERT INTO worktree_leases SELECT
+        'wt_bbbbbbbbbbbbbbbb', repo_id, repo_path, repo_catalog_id, machine_id,
+        '/legacy/worktree-b', branch, base_ref, base_sha, 'task-legacy-b', 'run-legacy-b',
+        mode, '[]', cleanup_policy, 'released', git_common_dir, created_at, updated_at,
+        claimed_at, verified_at, '2026-07-15T00:00:00.625Z', last_error
+      FROM worktree_leases WHERE lease_id = 'wt_aaaaaaaaaaaaaaaa';
+      INSERT INTO worktree_leases SELECT
+        'wt_cccccccccccccccc', repo_id, repo_path, repo_catalog_id, machine_id,
+        '/legacy/worktree-c', branch, base_ref, base_sha, 'task-legacy-c', 'run-legacy-c',
+        mode, '"scalar"', cleanup_policy, 'released', git_common_dir, created_at, updated_at,
+        claimed_at, verified_at, released_at, last_error
+      FROM worktree_leases WHERE lease_id = 'wt_aaaaaaaaaaaaaaaa';
+      INSERT INTO worktree_leases SELECT
+        'wt_dddddddddddddddd', repo_id, repo_path, repo_catalog_id, machine_id,
+        '/legacy/worktree-d', branch, base_ref, base_sha, 'task-legacy-d', 'run-legacy-d',
+        mode, 'null', cleanup_policy, 'released', git_common_dir, created_at, updated_at,
+        claimed_at, verified_at, released_at, last_error
+      FROM worktree_leases WHERE lease_id = 'wt_aaaaaaaaaaaaaaaa';
     `);
     seed.close();
     try {
+      process.env["HASNA_REPOS_DB_PATH"] = path;
       const db = getDb(path);
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        .map((row) => row.version)).toEqual(Array.from({ length: 21 }, (_, index) => index + 1));
+      const columns = (db.query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>).map((column) => column.name);
+      expect(columns).toContain("canonical_repo");
+      expect(columns).toContain("canonical_path");
+      expect(columns).toContain("repo_catalog_id");
+      expect(columns).toContain("repo_path");
+      expect(columns).toContain("worktree_path");
+      expect(db.query("SELECT canonical_repo, canonical_path, owner, status, repo_path, worktree_path FROM worktree_leases WHERE lease_id = ?")
+        .get("wt_aaaaaaaaaaaaaaaa")).toEqual({
+          canonical_repo: "hasna/repos",
+          canonical_path: "/legacy/worktree",
+          owner: "legacy-import",
+          status: "worktree_failed",
+          repo_path: "/legacy/repos",
+          worktree_path: "/legacy/worktree",
+        });
+      expect(db.query("SELECT created_at_ms, updated_at_ms, released_at_ms FROM worktree_leases WHERE lease_id = ?")
+        .get("wt_aaaaaaaaaaaaaaaa")).toEqual({
+          created_at_ms: Date.parse("1970-07-15T12:34:56.001Z"),
+          updated_at_ms: Date.parse("2026-07-15T00:00:00.250Z"),
+          released_at_ms: null,
+        });
+      expect(db.query("SELECT released_at_ms FROM worktree_leases WHERE lease_id = ?").get("wt_bbbbbbbbbbbbbbbb"))
+        .toEqual({ released_at_ms: Date.parse("2026-07-15T00:00:00.625Z") });
+      expect(inspectWorktree({ leaseId: "wt_aaaaaaaaaaaaaaaa" }).lease?.metadata).toEqual({
+        legacy_layout: true,
+        legacy_import: expect.objectContaining({
+          status: "claimed",
+          repo_id: "github:Hasna/Repos",
+          mode: "required",
+          cleanup_policy: "retain",
+          git_common_dir: "/legacy/common",
+          created_at: "1970-07-15T12:34:56.001Z",
+          created_at_ms: Date.parse("1970-07-15T12:34:56.001Z"),
+          updated_at: "2026-07-15T00:00:00.250Z",
+          claimed_at: "2026-07-15T00:00:00.375Z",
+          claimed_at_ms: Date.parse("2026-07-15T00:00:00.375Z"),
+          verified_at: "0000-02-29T00:00:00.000Z",
+          verified_at_ms: Date.parse("0000-02-29T00:00:00.000Z"),
+          released_at: null,
+          last_error: "legacy failure",
+          owner_metadata_raw: '{"agent":"legacy-agent","legacy_status":"owner-value","legacy_layout":"owner-layout","legacy_owner_metadata_raw":"owner-raw"}',
+          owner_metadata: {
+            agent: "legacy-agent",
+            legacy_status: "owner-value",
+            legacy_layout: "owner-layout",
+            legacy_owner_metadata_raw: "owner-raw",
+          },
+        }),
+      });
+      for (const leaseId of ["wt_bbbbbbbbbbbbbbbb", "wt_cccccccccccccccc", "wt_dddddddddddddddd"]) {
+        expect(inspectWorktree({ leaseId }).lease?.metadata).toEqual({
+          legacy_layout: true,
+          release_finalized: true,
+          release_verified_head_sha: "a".repeat(40),
+          release_finalized_at_ms: Date.parse("2026-07-15T00:00:00.250Z"),
+          legacy_import: expect.objectContaining({
+            mode: "required",
+            repo_id: "github:Hasna/Repos",
+            cleanup_policy: "retain",
+            git_common_dir: "/legacy/common",
+            created_at: "1970-07-15T12:34:56.001Z",
+            created_at_ms: Date.parse("1970-07-15T12:34:56.001Z"),
+            updated_at: "2026-07-15T00:00:00.250Z",
+            claimed_at: "2026-07-15T00:00:00.375Z",
+            claimed_at_ms: Date.parse("2026-07-15T00:00:00.375Z"),
+            verified_at: "0000-02-29T00:00:00.000Z",
+            verified_at_ms: Date.parse("0000-02-29T00:00:00.000Z"),
+            last_error: "legacy failure",
+          }),
+        });
+      }
+      expect((inspectWorktree({ leaseId: "wt_bbbbbbbbbbbbbbbb" }).lease?.metadata["legacy_import"] as Record<string, unknown>)["released_at"])
+        .toBe("2026-07-15T00:00:00.625Z");
+      const legacyRenewal = renewWorktreeLease({
+        leaseId: "wt_aaaaaaaaaaaaaaaa",
+        generation: 1,
+        fencingToken: "wt_aaaaaaaaaaaaaaaa:legacy-v5",
+        ttlSeconds: 60,
+      });
+      expect(legacyRenewal.ok).toBe(false);
+      expect(legacyRenewal.code).toBe("lease_not_active");
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+
+      const worktreeRoot = join(dir, "worktrees");
+      const source = join(worktreeRoot, "imported-source");
+      mkdirSync(source, { recursive: true });
+      const git = (...args: string[]) => execFileSync("git", ["-C", source, ...args], { encoding: "utf8" }).trim();
+      git("init", "-b", "main");
+      git("config", "user.email", "repos-test@invalid.example");
+      git("config", "user.name", "Repos Test");
+      git("remote", "add", "origin", "https://github.com/hasna/migrated-claim.git");
+      writeFileSync(join(source, "README.md"), "# migrated claim\n");
+      git("add", "README.md");
+      git("commit", "-m", "initial");
+      git("checkout", "-b", "codewith/migrated-claim");
+      const claim = importWorktree({
+        repo: "hasna/migrated-claim",
+        taskId: "task-migrated-claim",
+        runId: "run-migrated-claim",
+        machineId: "station01",
+        branch: "codewith/migrated-claim",
+        owner: "migration-test",
+        path: source,
+        root: worktreeRoot,
+      });
+      expect(claim.ok).toBe(true);
+      expect(inspectWorktree({ leaseId: claim.lease!.lease_id }).lease?.status).toBe("active");
+      expect(renewWorktreeLease({
+        leaseId: claim.lease!.lease_id,
+        generation: claim.lease!.generation,
+        fencingToken: claim.lease!.fencing_token,
+        ttlSeconds: 60,
+      }).ok).toBe(true);
     } finally {
       closeDb();
       rmSync(dir, { recursive: true, force: true });
@@ -313,57 +594,630 @@ describe("database", () => {
     }
   });
 
-  it("upgrades v6 receipts byte-for-byte and removes their current-state repo foreign key", () => {
+  it("refuses legacy schema drift without dropping unknown payload columns", () => {
     closeDb();
-    const dir = mkdtempSync(join(tmpdir(), "repos-v6-receipt-upgrade-"));
+    const dir = mkdtempSync(join(tmpdir(), "repos-legacy-unknown-column-"));
     const path = join(dir, "repos.db");
     const seed = new Database(path);
     seed.exec(`
-      PRAGMA foreign_keys = ON;
       CREATE TABLE migrations (
         id INTEGER PRIMARY KEY,
         version INTEGER NOT NULL UNIQUE,
         applied_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
-      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6);
-      CREATE TABLE repos (id INTEGER PRIMARY KEY);
-      INSERT INTO repos (id) VALUES (2), (3);
-      CREATE TABLE repo_relocation_audit (
-        id TEXT PRIMARY KEY,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        request_hash TEXT NOT NULL,
-        plan_hash TEXT NOT NULL,
-        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE RESTRICT,
-        target_repo_id INTEGER NOT NULL,
-        operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
-        actor TEXT NOT NULL,
-        expected_current_path TEXT NOT NULL,
-        target_path TEXT NOT NULL,
-        expected_remote TEXT NOT NULL,
-        expected_head TEXT NOT NULL,
-        source_revision TEXT NOT NULL,
-        target_revision TEXT NOT NULL,
-        source_json TEXT NOT NULL,
-        target_json TEXT NOT NULL,
-        after_json TEXT NOT NULL,
-        counts_json TEXT NOT NULL,
-        collisions_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9);
+      CREATE TABLE worktree_leases (
+        lease_id TEXT PRIMARY KEY,
+        repo_id TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        repo_catalog_id INTEGER,
+        machine_id TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        owner_metadata TEXT NOT NULL,
+        cleanup_policy TEXT NOT NULL,
+        status TEXT NOT NULL,
+        git_common_dir TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        verified_at TEXT,
+        released_at TEXT,
+        last_error TEXT,
+        future_payload TEXT
       );
-      CREATE INDEX idx_repo_relocation_audit_repo
-        ON repo_relocation_audit(repo_id, created_at);
-      INSERT INTO repo_relocation_audit VALUES (
+      INSERT INTO worktree_leases VALUES (
+        'wt_future_payload', 'github:hasna/repos', '/legacy/repos', NULL, 'station01',
+        '/legacy/worktree', 'task/future', 'main', '${"a".repeat(40)}',
+        'task-future', 'run-future', 'required', '{}', 'retain', 'claimed',
+        '/legacy/common', '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z',
+        '2026-07-16T00:00:00Z', NULL, NULL, NULL, 'must-preserve'
+      );
+    `);
+    seed.close();
+    try {
+      process.env["HASNA_REPOS_DB_PATH"] = path;
+      expect(() => getDb(path)).toThrow("unexpected columns future_payload");
+      const check = new Database(path, { readonly: true });
+      expect(check.query("SELECT future_payload FROM worktree_leases").get())
+        .toEqual({ future_payload: "must-preserve" });
+      expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toBeNull();
+      check.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("rolls back migration 21 when legacy timestamps are malformed", () => {
+    for (const scenario of [
+      { slug: "numeric", createdAt: "0", releasedAt: null },
+      { slug: "impossible-date", createdAt: "2026-07-15T00:00:00Z", releasedAt: "2026-02-30T00:00:00Z" },
+      { slug: "unsupported-offset", createdAt: "2026-07-15T00:00:00Z", releasedAt: "2026-07-15T00:00:00+15:00" },
+      { slug: "unsupported-max-offset-minutes", createdAt: "2026-07-15T00:00:00Z", releasedAt: "2026-07-15T00:00:00+14:01" },
+    ]) {
+      closeDb();
+      const dir = mkdtempSync(join(tmpdir(), `repos-live-v5-invalid-time-${scenario.slug}-`));
+      const path = join(dir, "repos.db");
+      const seed = new Database(path);
+      seed.exec(`
+        CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE, applied_at TEXT NOT NULL DEFAULT (datetime('now')));
+        INSERT INTO migrations (version) VALUES (5), (8);
+        CREATE TABLE worktree_leases (
+          lease_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, repo_path TEXT NOT NULL,
+          repo_catalog_id INTEGER, machine_id TEXT NOT NULL, worktree_path TEXT NOT NULL UNIQUE,
+          branch TEXT NOT NULL, base_ref TEXT NOT NULL, base_sha TEXT NOT NULL,
+          task_id TEXT NOT NULL, run_id TEXT NOT NULL, mode TEXT NOT NULL,
+          owner_metadata TEXT NOT NULL DEFAULT '{}', cleanup_policy TEXT NOT NULL,
+          status TEXT NOT NULL, git_common_dir TEXT, created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL, claimed_at TEXT NOT NULL, verified_at TEXT,
+          released_at TEXT, last_error TEXT,
+          UNIQUE(repo_id, machine_id, task_id, run_id, base_ref)
+        );
+        INSERT INTO worktree_leases (
+          lease_id, repo_id, repo_path, machine_id, worktree_path, branch, base_ref,
+          base_sha, task_id, run_id, mode, cleanup_policy, status, created_at,
+          updated_at, claimed_at, released_at
+        ) VALUES (
+          'wt_invalid_time', 'github:hasna/repos', '/legacy/repos', 'station01',
+          '/legacy/invalid-time', 'task/invalid-time', 'main', '${"a".repeat(40)}',
+          'task-invalid-time', 'run-invalid-time', 'required', 'retain', 'claimed',
+          '${scenario.createdAt}', '2026-07-15T00:00:00Z',
+          '2026-07-15T00:00:00Z', ${scenario.releasedAt ? `'${scenario.releasedAt}'` : "NULL"}
+        );
+      `);
+      seed.close();
+      try {
+        process.env["HASNA_REPOS_DB_PATH"] = path;
+        expect(() => getDb()).toThrow("invalid legacy worktree lease timestamp");
+        const check = new Database(path, { readonly: true });
+        expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toBeNull();
+        const columns = (check.query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>).map((row) => row.name);
+        expect(columns).toContain("repo_id");
+        expect(columns).not.toContain("canonical_repo");
+        expect(check.query("SELECT created_at, released_at FROM worktree_leases").get()).toEqual({
+          created_at: scenario.createdAt,
+          released_at: scenario.releasedAt,
+        });
+        check.close();
+      } finally {
+        closeDb();
+        rmSync(dir, { recursive: true, force: true });
+        process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+        getDb(":memory:");
+      }
+    }
+  });
+
+  it("reserves one colliding legacy claim and safely demotes the rest", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-live-v5-duplicate-"));
+    const path = join(dir, "repos.db");
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE, applied_at TEXT NOT NULL DEFAULT (datetime('now')));
+      INSERT INTO migrations (version) VALUES (5), (8);
+      CREATE TABLE worktree_leases (
+        lease_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, repo_path TEXT NOT NULL,
+        repo_catalog_id INTEGER, machine_id TEXT NOT NULL, worktree_path TEXT NOT NULL UNIQUE,
+        branch TEXT NOT NULL, base_ref TEXT NOT NULL, base_sha TEXT NOT NULL,
+        task_id TEXT NOT NULL, run_id TEXT NOT NULL, mode TEXT NOT NULL,
+        owner_metadata TEXT NOT NULL DEFAULT '{}', cleanup_policy TEXT NOT NULL,
+        status TEXT NOT NULL, git_common_dir TEXT, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, claimed_at TEXT NOT NULL, verified_at TEXT,
+        released_at TEXT, last_error TEXT,
+        UNIQUE(repo_id, machine_id, task_id, run_id, base_ref)
+      );
+      INSERT INTO worktree_leases (
+        lease_id, repo_id, repo_path, machine_id, worktree_path, branch, base_ref,
+        base_sha, task_id, run_id, mode, cleanup_policy, status, created_at,
+        updated_at, claimed_at
+      ) VALUES
+        ('wt_aaaaaaaaaaaaaaaa', 'github:hasna/repos', '/legacy/repos', 'station01', '/legacy/a', 'task/shared', 'main', '${"a".repeat(40)}', 'task-a', 'run-a', 'required', 'retain', 'claimed', '2026-07-15', '2026-07-15', '2026-07-15'),
+        ('wt_bbbbbbbbbbbbbbbb', 'github:hasna/repos', '/legacy/repos', 'station02', '/legacy/b', 'task/shared', 'main', '${"b".repeat(40)}', 'task-b', 'run-b', 'required', 'retain', 'claimed', '2026-07-15', '2026-07-15', '2026-07-15'),
+        ('wt_cccccccccccccccc', 'github:hasna/repos', '/legacy/repos', 'station03', '/legacy/c', 'task/quarantine-shared', 'main', '${"c".repeat(40)}', 'task-c', 'run-c', 'required', 'retain', 'quarantined', '2026-07-15', '2026-07-15', '2026-07-15'),
+        ('wt_dddddddddddddddd', 'github:hasna/repos', '/legacy/repos', 'station04', '/legacy/d', 'task/quarantine-shared', 'main', '${"d".repeat(40)}', 'task-d', 'run-d', 'required', 'retain', 'quarantined', '2026-07-15', '2026-07-15', '2026-07-15');
+    `);
+    seed.close();
+    try {
+      process.env["HASNA_REPOS_DB_PATH"] = path;
+      const db = getDb();
+      expect(db.query("SELECT 1 FROM migrations WHERE version = 21").get()).toEqual({ 1: 1 });
+      const columns = (db.query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>).map((row) => row.name);
+      expect(columns).not.toContain("repo_id");
+      expect(columns).toContain("canonical_repo");
+      expect(db.query("SELECT lease_id, status FROM worktree_leases ORDER BY lease_id").all()).toEqual([
+        { lease_id: "wt_aaaaaaaaaaaaaaaa", status: "worktree_failed" },
+        { lease_id: "wt_bbbbbbbbbbbbbbbb", status: "failed" },
+        { lease_id: "wt_cccccccccccccccc", status: "quarantine_failed" },
+        { lease_id: "wt_dddddddddddddddd", status: "failed" },
+      ]);
+      expect(db.query("SELECT COUNT(*) AS count FROM worktree_leases WHERE status NOT IN ('released', 'failed', 'quarantined')").get())
+        .toEqual({ count: 2 });
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("refuses canonical marker drift with a missing or violated repo catalog foreign key", () => {
+    for (const scenario of [
+      "missing",
+      "violated",
+      "not-null-set-null",
+      "conflicting",
+      "unrelated",
+      "update-cascade",
+    ] as const) {
+      closeDb();
+      const dir = mkdtempSync(join(tmpdir(), `repos-canonical-fk-${scenario}-`));
+      const path = join(dir, "repos.db");
+      const seed = new Database(path);
+      const foreignKey = scenario === "missing"
+        ? ""
+        : scenario === "not-null-set-null"
+          ? "NOT NULL REFERENCES repos(id) ON DELETE SET NULL"
+          : scenario === "update-cascade"
+            ? "REFERENCES repos(id) ON UPDATE CASCADE ON DELETE SET NULL"
+          : "REFERENCES repos(id) ON DELETE SET NULL";
+      const extraForeignKey = scenario === "conflicting"
+        ? ", FOREIGN KEY (repo_catalog_id) REFERENCES other(id) ON DELETE CASCADE"
+        : scenario === "unrelated"
+          ? ", FOREIGN KEY (task_id) REFERENCES other(id) ON DELETE CASCADE"
+          : "";
+      seed.exec(`
+        CREATE TABLE migrations (
+          id INTEGER PRIMARY KEY,
+          version INTEGER NOT NULL UNIQUE,
+          applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (5), (6), (7), (9), (10);
+        CREATE TABLE repos (id INTEGER PRIMARY KEY);
+        CREATE TABLE other (id INTEGER PRIMARY KEY);
+        INSERT INTO repos (id) VALUES (1);
+        INSERT INTO other (id) VALUES (1);
+        CREATE TABLE worktree_leases (
+          lease_id TEXT PRIMARY KEY NOT NULL,
+          canonical_repo TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          canonical_path TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          owner TEXT NOT NULL,
+          status TEXT NOT NULL,
+          generation INTEGER NOT NULL DEFAULT 1,
+          fencing_token TEXT NOT NULL,
+          idempotency_key TEXT,
+          source TEXT,
+          base_ref TEXT,
+          head_sha TEXT,
+          expires_at_ms INTEGER NOT NULL,
+          heartbeat_at_ms INTEGER NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          released_at_ms INTEGER,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          repo_catalog_id INTEGER ${foreignKey},
+          repo_path TEXT,
+          worktree_path TEXT
+          ${extraForeignKey}
+        );
+        INSERT INTO worktree_leases (
+          lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+          branch, owner, status, generation, fencing_token, expires_at_ms,
+          heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json,
+          repo_catalog_id, repo_path, worktree_path
+        ) VALUES (
+          'wt_canonical_fk', 'hasna/repos', 'task-fk', 'run-fk', 'station01',
+          '/tmp/fk-worktree', 'task/fk', 'legacy-import', 'failed', 1,
+          'wt_canonical_fk:legacy', 1, 1, 1, 1, '{}',
+          ${scenario === "violated"
+            ? "999"
+            : scenario === "not-null-set-null" || scenario === "conflicting"
+              ? "1"
+              : "NULL"},
+          '/tmp/repos', '/tmp/fk-worktree'
+        );
+      `);
+      seed.close();
+      try {
+        process.env["HASNA_REPOS_DB_PATH"] = path;
+        expect(() => getDb()).toThrow(/canonical table SQL|foreign-key verification/);
+        const check = new Database(path, { readonly: true });
+        expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toBeNull();
+        expect(check.query("SELECT repo_catalog_id FROM worktree_leases").get()).toEqual({
+          repo_catalog_id: scenario === "violated"
+            ? 999
+            : scenario === "not-null-set-null" || scenario === "conflicting"
+              ? 1
+              : null,
+        });
+        check.close();
+      } finally {
+        closeDb();
+        rmSync(dir, { recursive: true, force: true });
+        process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+        getDb(":memory:");
+      }
+    }
+  });
+
+  it("refuses nullable or composite canonical lease ID primary keys", () => {
+    for (const scenario of ["nullable", "composite", "wrong-type"] as const) {
+      closeDb();
+      const dir = mkdtempSync(join(tmpdir(), `repos-canonical-lease-id-${scenario}-`));
+      const path = join(dir, "repos.db");
+      const seed = new Database(path);
+      const leaseIdColumn = scenario === "nullable"
+        ? "lease_id TEXT PRIMARY KEY"
+        : scenario === "wrong-type"
+          ? "lease_id INTEGER PRIMARY KEY NOT NULL"
+          : "lease_id TEXT NOT NULL";
+      const tablePrimaryKey = scenario === "composite"
+        ? ", PRIMARY KEY (lease_id, task_id)"
+        : "";
+      const leaseIdValue = scenario === "nullable"
+        ? "NULL"
+        : scenario === "wrong-type"
+          ? "1"
+          : "'wt_duplicate'";
+      const secondLeaseIdValue = scenario === "wrong-type" ? "2" : leaseIdValue;
+      seed.exec(`
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (5), (6), (7), (9), (10);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY);
+      CREATE TABLE worktree_leases (
+        ${leaseIdColumn},
+        canonical_repo TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        machine_id TEXT NOT NULL,
+        canonical_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        status TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 1,
+        fencing_token TEXT NOT NULL,
+        idempotency_key TEXT,
+        source TEXT,
+        base_ref TEXT,
+        head_sha TEXT,
+        expires_at_ms INTEGER NOT NULL,
+        heartbeat_at_ms INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        released_at_ms INTEGER,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+        repo_path TEXT,
+        worktree_path TEXT
+        ${tablePrimaryKey}
+      );
+      INSERT INTO worktree_leases (
+        lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+        branch, owner, status, generation, fencing_token, expires_at_ms,
+        heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+      ) VALUES
+        (${leaseIdValue}, 'hasna/repos', 'task-a', 'run-a', 'station01', '/tmp/a',
+         'task/a', 'legacy-import', 'failed', 1, 'token-a', 1, 1, 1, 1, '{}'),
+        (${secondLeaseIdValue}, 'hasna/repos', 'task-b', 'run-b', 'station01', '/tmp/b',
+         'task/b', 'legacy-import', 'failed', 1, 'token-b', 1, 1, 1, 1, '{}');
+      `);
+      seed.close();
+      try {
+        process.env["HASNA_REPOS_DB_PATH"] = path;
+        expect(() => getDb()).toThrow("canonical table SQL");
+        const check = new Database(path, { readonly: true });
+        expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toBeNull();
+        const duplicateCount = scenario === "nullable"
+          ? check.query("SELECT count(*) AS count FROM worktree_leases WHERE lease_id IS NULL").get()
+          : scenario === "composite"
+            ? check.query("SELECT count(*) AS count FROM worktree_leases WHERE lease_id = 'wt_duplicate'").get()
+            : check.query("SELECT count(*) AS count FROM worktree_leases").get();
+        expect(duplicateCount).toEqual({ count: 2 });
+        check.close();
+      } finally {
+        closeDb();
+        rmSync(dir, { recursive: true, force: true });
+        process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+        getDb(":memory:");
+      }
+    }
+  });
+
+  it("refuses canonical marker drift with missing operational columns", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-canonical-missing-column-"));
+    const path = join(dir, "repos.db");
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (5), (6), (7), (9), (10);
+      CREATE TABLE repos (id INTEGER PRIMARY KEY);
+      CREATE TABLE worktree_leases (
+        lease_id TEXT PRIMARY KEY NOT NULL,
+        canonical_repo TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        machine_id TEXT NOT NULL,
+        canonical_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        status TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 1,
+        fencing_token TEXT NOT NULL,
+        idempotency_key TEXT,
+        source TEXT,
+        base_ref TEXT,
+        head_sha TEXT,
+        expires_at_ms INTEGER NOT NULL,
+        heartbeat_at_ms INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+        repo_path TEXT,
+        worktree_path TEXT
+      );
+    `);
+    seed.close();
+    try {
+      process.env["HASNA_REPOS_DB_PATH"] = path;
+      expect(() => getDb()).toThrow("canonical table SQL");
+      const check = new Database(path, { readonly: true });
+      expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toBeNull();
+      const columns = (check.query("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>)
+        .map((column) => column.name);
+      expect(columns).not.toContain("released_at_ms");
+      check.close();
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
+  it("validates canonical lease invariants after all migration markers exist", () => {
+    for (const scenario of [
+      "missing-column",
+      "extra-column",
+      "wrong-default",
+      "wrong-table-sql",
+      "missing-indexes",
+      "wrong-index-literal-case",
+      "extra-index",
+      "invalid-terminal-proof",
+      "numeric-terminal-proof",
+      "empty-terminal-proof",
+      "duplicate-active",
+      "unknown-status-duplicate",
+    ] as const) {
+      closeDb();
+      const dir = mkdtempSync(join(tmpdir(), `repos-completed-marker-drift-${scenario}-`));
+      const path = join(dir, "repos.db");
+      try {
+        process.env["HASNA_REPOS_DB_PATH"] = path;
+        getDb(path);
+        closeDb();
+        const seed = new Database(path);
+        if (scenario === "missing-column") {
+          seed.query("ALTER TABLE worktree_leases DROP COLUMN released_at_ms").run();
+        } else if (scenario === "extra-column") {
+          seed.query("ALTER TABLE worktree_leases ADD COLUMN unexpected TEXT").run();
+        } else if (scenario === "wrong-default" || scenario === "wrong-table-sql") {
+          seed.exec(`
+            DROP TABLE worktree_leases;
+            CREATE TABLE worktree_leases (
+              lease_id TEXT PRIMARY KEY NOT NULL,
+              canonical_repo TEXT NOT NULL,
+              task_id TEXT NOT NULL,
+              run_id TEXT NOT NULL,
+              machine_id TEXT NOT NULL,
+              canonical_path TEXT NOT NULL,
+              branch TEXT NOT NULL${scenario === "wrong-table-sql" ? " COLLATE NOCASE" : ""},
+              owner TEXT NOT NULL,
+              status TEXT NOT NULL,
+              generation INTEGER NOT NULL DEFAULT ${scenario === "wrong-default" ? "99" : "1"},
+              fencing_token TEXT NOT NULL,
+              idempotency_key TEXT,
+              source TEXT,
+              base_ref TEXT,
+              head_sha TEXT,
+              expires_at_ms INTEGER NOT NULL,
+              heartbeat_at_ms INTEGER NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              released_at_ms INTEGER,
+              metadata_json TEXT NOT NULL DEFAULT '{}',
+              repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+              repo_path TEXT,
+              worktree_path TEXT
+            );
+          `);
+        } else if (scenario === "wrong-index-literal-case") {
+          seed.exec(`
+            DROP INDEX idx_worktree_leases_active_path;
+            DROP INDEX idx_worktree_leases_active_repo_branch;
+            CREATE UNIQUE INDEX idx_worktree_leases_active_path ON worktree_leases(canonical_path)
+              WHERE (status NOT IN ('RELEASED', 'FAILED', 'QUARANTINED')
+                OR (status = 'RELEASED' AND COALESCE(json_extract(metadata_json, '$.release_finalized'), 0) != 1)
+                OR (status = 'QUARANTINED' AND COALESCE(json_extract(metadata_json, '$.quarantine_finalized'), 0) != 1));
+            CREATE UNIQUE INDEX idx_worktree_leases_active_repo_branch ON worktree_leases(canonical_repo, branch)
+              WHERE (status NOT IN ('RELEASED', 'FAILED', 'QUARANTINED')
+                OR (status = 'RELEASED' AND COALESCE(json_extract(metadata_json, '$.release_finalized'), 0) != 1)
+                OR (status = 'QUARANTINED' AND COALESCE(json_extract(metadata_json, '$.quarantine_finalized'), 0) != 1));
+          `);
+        } else if (scenario === "extra-index") {
+          seed.query("CREATE UNIQUE INDEX idx_worktree_leases_unexpected ON worktree_leases(task_id)").run();
+        } else if (scenario === "invalid-terminal-proof"
+          || scenario === "numeric-terminal-proof"
+          || scenario === "empty-terminal-proof") {
+          seed.exec(`
+            INSERT INTO worktree_leases (
+              lease_id, canonical_repo, task_id, run_id, machine_id, canonical_path,
+              branch, owner, status, generation, fencing_token, head_sha,
+              expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms, metadata_json
+            ) VALUES (
+              'wt_invalid_terminal_proof', 'hasna/repos', 'task-proof', 'run-proof',
+              'station01', '/tmp/invalid-proof', 'task/invalid-proof', 'owner', 'released',
+              1, 'token-proof', '${"a".repeat(40)}', 1, 1, 1, 1,
+              '${scenario === "numeric-terminal-proof"
+                ? `{"release_finalized":1,"release_verified_head_sha":"${"a".repeat(40)}","release_finalized_at_ms":1}`
+                : scenario === "empty-terminal-proof"
+                  ? `{"release_finalized":true,"release_verified_head_sha":"","release_finalized_at_ms":-1}`
+                : `{"release_finalized":true}`}'
+            );
+          `);
+        } else {
+          seed.query("DROP INDEX idx_worktree_leases_active_path").run();
+          seed.query("DROP INDEX idx_worktree_leases_active_repo_branch").run();
+          if (scenario === "duplicate-active" || scenario === "unknown-status-duplicate") {
+            seed.exec(`
+              INSERT INTO worktree_leases (
+                lease_id, canonical_repo, task_id, run_id, machine_id,
+                canonical_path, branch, owner, status, generation, fencing_token,
+                expires_at_ms, heartbeat_at_ms, created_at_ms, updated_at_ms,
+                metadata_json
+              ) VALUES
+                ('wt_marker_drift_a', 'hasna/repos', 'task-a', 'run-a', 'station01',
+                 '/tmp/marker-drift', 'task/marker-drift', 'a',
+                 '${scenario === "unknown-status-duplicate" ? "future_in_progress" : "preparing"}', 1,
+                 'token-a', 1, 1, 1, 1, '{}'),
+                ('wt_marker_drift_b', 'hasna/repos', 'task-b', 'run-b', 'station01',
+                 '/tmp/marker-drift', 'task/marker-drift', 'b', 'preparing', 1,
+                 'token-b', 1, 1, 1, 1, '{}');
+            `);
+          }
+        }
+        seed.close();
+
+        const expected = scenario === "missing-column"
+          || scenario === "extra-column"
+          || scenario === "wrong-default"
+          || scenario === "wrong-table-sql"
+          ? "table SQL"
+          : scenario === "missing-indexes"
+            ? "indexes"
+            : scenario === "wrong-index-literal-case"
+              ? "indexes"
+            : scenario === "extra-index"
+              ? "unexpected indexes"
+            : scenario === "invalid-terminal-proof"
+              ? "terminal proof payload"
+            : scenario === "numeric-terminal-proof"
+              ? "terminal proof payload"
+            : scenario === "empty-terminal-proof"
+              ? "terminal proof payload"
+            : "duplicate active worktree path";
+        expect(() => getDb(path)).toThrow(expected);
+        const check = new Database(path, { readonly: true });
+        expect(check.query("SELECT 1 FROM migrations WHERE version = 21").get()).toEqual({ 1: 1 });
+        check.close();
+      } finally {
+        closeDb();
+        rmSync(dir, { recursive: true, force: true });
+        process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+        getDb(":memory:");
+      }
+    }
+  });
+
+  it("upgrades v6 receipts byte-for-byte and removes their current-state repo foreign key", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-v6-receipt-upgrade-"));
+    const path = join(dir, "repos.db");
+    try {
+      const initial = getDb(path);
+      initial.exec(`
+        INSERT INTO repos (id, path, name) VALUES
+          (2, '/tmp/source', 'source'),
+          (3, '/tmp/target', 'target');
+        INSERT INTO repo_relocation_audit VALUES (
         'receipt-1', 'key-1', 'request-hash', 'plan-hash', 2, 3,
         'primary_relocation', 'test:actor', '/legacy', '/canonical',
         'github.com/hasna/accounts', '${"a".repeat(40)}', 'source-revision',
         'target-revision', '{"id":2}', '{"id":3}', '{"id":2}', '{}', '[]',
         '2026-07-15T00:00:00.000Z'
       );
-      CREATE TABLE repo_relocation_audit_v7 (sentinel TEXT);
-    `);
-    const before = seed.query("SELECT * FROM repo_relocation_audit").get();
-    seed.close();
-    try {
+      `);
+      const before = initial.query("SELECT * FROM repo_relocation_audit").get();
+      closeDb();
+
+      const seed = new Database(path);
+      seed.exec(`
+        PRAGMA foreign_keys = ON;
+        DELETE FROM migrations WHERE version = 7;
+        DROP INDEX idx_repo_relocation_audit_repo;
+        ALTER TABLE repo_relocation_audit RENAME TO repo_relocation_audit_current;
+        CREATE TABLE repo_relocation_audit (
+          id TEXT PRIMARY KEY,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          request_hash TEXT NOT NULL,
+          plan_hash TEXT NOT NULL,
+          repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE RESTRICT,
+          target_repo_id INTEGER NOT NULL,
+          operation TEXT NOT NULL CHECK (operation = 'primary_relocation'),
+          actor TEXT NOT NULL,
+          expected_current_path TEXT NOT NULL,
+          target_path TEXT NOT NULL,
+          expected_remote TEXT NOT NULL,
+          expected_head TEXT NOT NULL,
+          source_revision TEXT NOT NULL,
+          target_revision TEXT NOT NULL,
+          source_json TEXT NOT NULL,
+          target_json TEXT NOT NULL,
+          after_json TEXT NOT NULL,
+          counts_json TEXT NOT NULL,
+          collisions_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO repo_relocation_audit SELECT * FROM repo_relocation_audit_current;
+        DROP TABLE repo_relocation_audit_current;
+        CREATE INDEX idx_repo_relocation_audit_repo
+          ON repo_relocation_audit(repo_id, created_at);
+        CREATE TABLE repo_relocation_audit_v7 (sentinel TEXT);
+      `);
+      seed.close();
+
       expect(() => getDb(path)).toThrow();
       closeDb();
       const recovery = new Database(path);
@@ -373,11 +1227,6 @@ describe("database", () => {
       ).get()).toEqual({ name: "idx_repo_relocation_audit_repo" });
       expect(recovery.query("SELECT version FROM migrations WHERE version = 7").get()).toBeNull();
       recovery.exec("DROP TABLE repo_relocation_audit_v7");
-      // This fixture intentionally models only the v7 receipt shape. Mark the
-      // later remote-bearing migrations as handled so this test remains scoped
-      // to byte-preserving v7 recovery; v9 exact-schema behavior is covered
-      // independently below.
-      recovery.exec("INSERT INTO migrations (version) VALUES (8), (9)");
       recovery.close();
 
       const db = getDb(path);
@@ -482,48 +1331,40 @@ describe("database", () => {
     const dir = mkdtempSync(join(tmpdir(), "repos-v9-after-v8-"));
     const path = join(dir, "repos.db");
     const unsafe = `https://${["actor", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
-    const seed = new Database(path);
-    seed.exec(`
-      CREATE TABLE migrations (
-        id INTEGER PRIMARY KEY,
-        version INTEGER NOT NULL UNIQUE,
-        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
-      CREATE TABLE repos (
-        id INTEGER PRIMARY KEY,
-        path TEXT NOT NULL UNIQUE,
-        name TEXT NOT NULL,
-        remote_url TEXT
-      );
-      CREATE TABLE remotes (
-        id INTEGER PRIMARY KEY,
-        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        fetch_url TEXT
-      );
-      CREATE TABLE repo_relocation_audit (
-        id TEXT PRIMARY KEY,
-        expected_remote TEXT NOT NULL,
-        source_json TEXT NOT NULL,
-        target_json TEXT NOT NULL,
-        after_json TEXT NOT NULL
-      );
-    `);
-    seed.query("INSERT INTO repos (id, path, name, remote_url) VALUES (1, '/tmp/v9', 'v9', ?)").run(unsafe);
-    seed.query("INSERT INTO remotes (id, repo_id, name, url, fetch_url) VALUES (1, 1, 'origin', ?, ?)")
-      .run(unsafe, unsafe);
-    seed.query("INSERT INTO remotes (id, repo_id, name, url) VALUES (2, 1, 'local', 'file:///tmp/v9')").run();
     const snapshot = JSON.stringify({ id: 1, path: "/tmp/v9", name: "v9", remote_url: unsafe });
-    seed.query(`INSERT INTO repo_relocation_audit
-      (id, expected_remote, source_json, target_json, after_json) VALUES ('receipt-v9', ?, ?, ?, ?)`)
-      .run(unsafe, snapshot, snapshot, snapshot);
-    seed.close();
 
     try {
+      const initial = getDb(path);
+      const repo = initial.query("INSERT INTO repos (path, name, remote_url) VALUES ('/tmp/v9', 'v9', ?) RETURNING id")
+        .get(unsafe) as { id: number };
+      initial.query("INSERT INTO remotes (repo_id, name, url, fetch_url) VALUES (?, 'origin', ?, ?)")
+        .run(repo.id, unsafe, unsafe);
+      initial.query("INSERT INTO remotes (repo_id, name, url) VALUES (?, 'local', 'file:///tmp/v9')")
+        .run(repo.id);
+      initial.query(`INSERT INTO repo_relocation_audit (
+        id, idempotency_key, request_hash, plan_hash, repo_id, target_repo_id,
+        operation, actor, expected_current_path, target_path, expected_remote,
+        expected_head, source_revision, target_revision, source_json,
+        target_json, after_json, counts_json, collisions_json, created_at
+      ) VALUES (
+        'receipt-v9', 'receipt-v9-key', 'request-hash', 'plan-hash', ?, ?,
+        'primary_relocation', 'migration-test', '/tmp/v9', '/tmp/v9', ?,
+        ?, 'source-revision', 'target-revision', ?, ?, ?, '{}', '[]',
+        '2026-07-15T00:00:00.000Z'
+      )`).run(
+        repo.id,
+        repo.id,
+        unsafe,
+        "a".repeat(40),
+        snapshot,
+        snapshot,
+        snapshot,
+      );
+      initial.query("DELETE FROM migrations WHERE version = 9").run();
+      closeDb();
+
       const migrated = getDb(path);
-      expect(migrated.query("SELECT remote_url FROM repos WHERE id = 1").get()).toEqual({
+      expect(migrated.query("SELECT remote_url FROM repos WHERE id = ?").get(repo.id)).toEqual({
         remote_url: "git.example.test/team/tool",
       });
       expect(migrated.query("SELECT name, url, fetch_url FROM remotes ORDER BY id").all()).toEqual([{
@@ -563,7 +1404,7 @@ describe("database", () => {
         const seed = new Database(path);
         seed.exec(`
           CREATE TABLE migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL UNIQUE);
-          INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8);
+          INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8), (21);
           CREATE TABLE repos (${item.repos});
           CREATE TABLE remotes (${item.remotes});
           CREATE TABLE repo_relocation_audit (${item.audit});
@@ -820,7 +1661,7 @@ describe("database", () => {
       const results = await Promise.all(children.map(({ completed }) => completed));
       expect(results).toEqual(Array.from({ length: 8 }, () => ({
         code: 0,
-        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10, 11].map((version) => ({ version }))),
+        stdout: JSON.stringify([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21].map((version) => ({ version }))),
         stderr: "",
       })));
     } finally {

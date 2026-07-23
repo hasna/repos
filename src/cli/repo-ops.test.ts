@@ -120,6 +120,18 @@ describe("repo ops CLI commands", () => {
     expect(stdout).toContain("ports");
     expect(stdout).toContain("triage");
     expect(stdout).toContain("release-health");
+    expect(stdout).toContain("worktrees");
+  });
+
+  test("worktrees help lists the complete lease control plane", () => {
+    const result = runCli(["worktrees", "--help"]);
+    const stderr = new TextDecoder().decode(result.stderr);
+    const stdout = new TextDecoder().decode(result.stdout);
+
+    expect(result.exitCode, stderr).toBe(0);
+    for (const command of ["claim", "inspect", "verify", "renew", "release", "inventory", "import"]) {
+      expect(stdout).toContain(command);
+    }
   });
 
   test("no-cloud inventory CLI emits route-safe schema", () => {
