@@ -60,7 +60,8 @@ describe("MCP HTTP transport", () => {
     const client = new Client({ name: "repos-http-redaction-test", version: "1.0.0" });
     await client.connect(transport);
     for (const request of [
-      { name: "list_repos", arguments: { query: "mcp-output" } },
+      // Compact list_repos omits remotes; verbose exercises the full-record sanitization path.
+      { name: "list_repos", arguments: { query: "mcp-output", verbose: true } },
       { name: "get_repo", arguments: { id: String(repo.id) } },
       { name: "search_repos", arguments: { query: "mcp" } },
       { name: "list_remotes", arguments: { repo_id: repo.id } },
