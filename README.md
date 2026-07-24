@@ -33,7 +33,7 @@ repos-serve  # http://localhost:19450
 |---------|-------------|
 | `repos scan` | Discover and index all git repos |
 | `repos repos` | List repositories |
-| `repos repo <name>` | Get repo details |
+| `repos repo <name>` / `repos show <name>` / `repos inspect <name>` | Get repo details |
 | `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
@@ -69,7 +69,13 @@ repos-serve  # http://localhost:19450
 | `repos ops task-route-health` | Check that task-created lifecycle router loops are active and recently succeeding |
 | `repos ops protected-release` | Emit a protected release task only when release-candidate gates are green |
 
-Legacy list/search/status commands support `--json` for machine-readable output.
+CLI output is compact by default so it stays readable in agent terminals:
+
+- List/search/status-style commands show essential fields, truncate long text, and cap human rows by default.
+- Use `--verbose` for wider human rows and extra fields.
+- Use `--limit` plus `--cursor` or `--offset` on paginated list commands for more rows.
+- Use `repos show <name>` or `repos inspect <name>` for full repo detail.
+- Use `--json` for machine-readable records. JSON output keeps full fields where possible.
 
 ### Primary registry relocation
 
@@ -291,6 +297,8 @@ repos-mcp
 - `ports_scan`, `triage_branches`, `triage_prs`
 - `docs_drift`, `release_health`
 - `register_agent`, `heartbeat`, `list_agents`
+
+MCP list/search/detail tools return compact JSON summaries by default to avoid dumping large records into agent context. Pass `verbose: true` to a tool call when you need the full records, and use `limit`/`offset` where available to page through large result sets.
 
 ## REST API
 
