@@ -112,7 +112,7 @@ describe("database", () => {
       const migrated = getDb(path);
       expect(migrated).toBe(raw);
       expect(migrated.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11].map((version) => ({ version })));
+        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12].map((version) => ({ version })));
       expect(getDb(path)).toBe(migrated);
       expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get())
         .toEqual({ count: 1 });
@@ -199,7 +199,7 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12]);
   });
 
   it("migrates existing branch uniqueness to include remote classification", () => {
@@ -303,7 +303,7 @@ describe("database", () => {
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       closeDb();
@@ -820,7 +820,7 @@ describe("database", () => {
       const results = await Promise.all(children.map(({ completed }) => completed));
       expect(results).toEqual(Array.from({ length: 8 }, () => ({
         code: 0,
-        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10, 11].map((version) => ({ version }))),
+        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12].map((version) => ({ version }))),
         stderr: "",
       })));
     } finally {

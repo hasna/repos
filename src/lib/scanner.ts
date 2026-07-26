@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, statSync, watch } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync, watch } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import cliProgress from "cli-progress";
 import { getDb } from "../db/database.js";
@@ -79,6 +79,42 @@ function extractOrg(remoteUrl: string | null): string | null {
   return remoteUrl.split("/")[1] || null;
 }
 
+/**
+ * Read a repository's origin remote, separating "git told us nothing" from
+ * "git told us something we reject".
+ *
+ * A gutted, relocated or permission-denied .git directory makes the read fail
+ * outright. That is missing information, not evidence that the repository lost
+ * its remote, and it must not erase an identity the index already holds —
+ * otherwise a transiently unreadable checkout silently drops out of every
+ * remote-scoped query. Only a remote git actually reported is a claim about the
+ * repository, and an unsafe claim still clears the stored value.
+ */
+export function readRemoteIdentity(repoPath: string): { supplied: boolean; remoteUrl: string | null } {
+  // `git -C <path>` searches upwards. A directory with a gutted or partial .git
+  // therefore answers with its nearest ANCESTOR repository, which would stamp a
+  // parent project's identity onto an unrelated child directory. Only trust the
+  // answer when git considers this exact path the top of the working tree.
+  const toplevel = gitWithStatus(repoPath, ["rev-parse", "--show-toplevel"]);
+  if (!toplevel.ok || !isSamePath(toplevel.output, repoPath)) return { supplied: false, remoteUrl: null };
+
+  const result = gitWithStatus(repoPath, ["remote", "get-url", "origin"]);
+  if (!result.ok || result.output === "") return { supplied: false, remoteUrl: null };
+  return { supplied: true, remoteUrl: sanitizeRemoteIdentity(result.output) };
+}
+
+function isSamePath(left: string, right: string): boolean {
+  if (!left || !right) return false;
+  const canonical = (value: string): string => {
+    try {
+      return realpathSync(value);
+    } catch {
+      return resolve(value);
+    }
+  };
+  return canonical(left) === canonical(right);
+}
+
 function indexRepo(repoPath: string, full = false): {
   commits: number;
   branches: number;
@@ -89,7 +125,8 @@ function indexRepo(repoPath: string, full = false): {
   const name = basename(repoPath);
 
   // Get remote URL and default branch
-  const remoteUrl = sanitizeRemoteIdentity(git(repoPath, ["remote", "get-url", "origin"]));
+  const remote = readRemoteIdentity(repoPath);
+  const remoteUrl = remote.remoteUrl;
   const defaultBranch = git(repoPath, ["symbolic-ref", "--short", "HEAD"]) || "main";
   const org = extractOrg(remoteUrl);
 
@@ -109,7 +146,9 @@ function indexRepo(repoPath: string, full = false): {
     path: repoPath,
     name,
     org,
-    remote_url: remoteUrl,
+    // Omitted entirely when the remote could not be read, so upsertRepo leaves
+    // the previously indexed identity intact instead of nulling it.
+    ...(remote.supplied ? { remote_url: remoteUrl } : {}),
     default_branch: defaultBranch,
     last_scanned: new Date().toISOString(),
   });

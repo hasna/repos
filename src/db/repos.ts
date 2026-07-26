@@ -6,11 +6,13 @@ import type {
   Tag,
   Remote,
   PullRequest,
+  PullRequestRecord,
   SearchResult,
   RepoStats,
   ListOptions,
 } from "../types/index.js";
 import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
+import { resolvePullRequestOrigin } from "../lib/pr-identity.js";
 
 // ── Repos ──
 
@@ -56,6 +58,24 @@ export function listRepos(opts: ListOptions & { org?: string; query?: string } =
   return (db
     .query(`SELECT * FROM repos ${whereClause} ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?`)
     .all(...params) as Repo[]).map(sanitizeRepoForOutput);
+}
+
+/**
+ * Total repos matching a filter, ignoring limit/offset. `repos --json` used to
+ * stop at its default page size with nothing in the output to say so, which
+ * makes a truncated page indistinguishable from a complete one.
+ */
+export function countRepos(opts: { org?: string; query?: string } = {}): number {
+  const db = getDb();
+  const params: any[] = [];
+  const where: string[] = [];
+  if (opts.org) { where.push("org = ?"); params.push(opts.org); }
+  if (opts.query) {
+    where.push("(name LIKE ? OR description LIKE ? OR remote_url LIKE ?)");
+    params.push(`%${opts.query}%`, `%${opts.query}%`, `%${opts.query}%`);
+  }
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  return (db.query(`SELECT COUNT(*) AS c FROM repos ${whereClause}`).get(...params) as { c: number }).c;
 }
 
 export function listAllRepos(
@@ -108,9 +128,73 @@ export function getRepo(idOrPath: string | number): Repo | null {
   return byName[0] ? sanitizeRepoForOutput(byName[0]) : null;
 }
 
+export class AmbiguousRemoteError extends Error {
+  constructor(public readonly remote: string, public readonly paths: string[]) {
+    super(
+      `Remote '${remote}' is checked out ${paths.length} times; pass an explicit path:\n  ${paths.join("\n  ")}`
+    );
+    this.name = "AmbiguousRemoteError";
+  }
+}
+
+/**
+ * Resolve a repo by its GitHub remote identity — the only deterministic way to
+ * name a repository.
+ *
+ * `name` is the local directory name, which routinely differs from the GitHub
+ * repository name (`github.com/hasna/emails` is checked out as `open-emails`),
+ * and the fuzzy `cd`-style lookup happily resolves `todos` to whichever of
+ * `open-todos`, `platform-todos` or `hasnastudio/platform-todos` it reaches
+ * first. Automation needs a lookup that either matches exactly or fails.
+ *
+ * Accepts `github.com/org/name`, `org/name`, or any supported remote URL form.
+ * Returns null when nothing matches, and throws when a single remote has
+ * multiple local checkouts and no primary can be distinguished.
+ */
+export function getRepoByRemote(remote: string, opts: { allowAmbiguous?: boolean } = {}): Repo | null {
+  const db = getDb();
+  const normalized = sanitizeRemoteIdentity(remote)
+    ?? sanitizeRemoteIdentity(`github.com/${remote.replace(/^\/+/, "")}`);
+  if (!normalized) return null;
+
+  const rows = (db
+    .query("SELECT * FROM repos WHERE remote_url = ? COLLATE NOCASE ORDER BY id ASC")
+    .all(normalized) as Repo[]).map(sanitizeRepoForOutput);
+  if (rows.length === 0) return null;
+  if (rows.length === 1 || opts.allowAmbiguous) return rows[0]!;
+
+  // A worktree or throwaway build copy is never the answer when a real checkout
+  // exists, so narrow before declaring the remote ambiguous.
+  const primary = rows.filter((row) => !isDerivedCheckoutPath(row.path));
+  if (primary.length === 1) return primary[0]!;
+
+  throw new AmbiguousRemoteError(normalized, rows.map((row) => row.path));
+}
+
+/** Paths that are copies of a checkout rather than the checkout itself. */
+export function isDerivedCheckoutPath(path: string): boolean {
+  return /(^|\/)(worktrees|\.worktrees)\//.test(path) || path.startsWith("/dev/shm/");
+}
+
+/** Every local checkout of a remote, in index order. */
+export function listReposByRemote(remote: string): Repo[] {
+  const db = getDb();
+  const normalized = sanitizeRemoteIdentity(remote)
+    ?? sanitizeRemoteIdentity(`github.com/${remote.replace(/^\/+/, "")}`);
+  if (!normalized) return [];
+  return (db
+    .query("SELECT * FROM repos WHERE remote_url = ? COLLATE NOCASE ORDER BY id ASC")
+    .all(normalized) as Repo[]).map(sanitizeRepoForOutput);
+}
+
 export function upsertRepo(repo: Partial<Repo> & { path: string; name: string }): Repo {
   const db = getDb();
   const existing = db.query("SELECT id FROM repos WHERE path = ?").get(repo.path) as { id: number } | null;
+  // Supplying `remote_url` is a claim about the repository's current remote, so
+  // a value that fails sanitization still clears the stored identity rather
+  // than leaving a contaminated or superseded one behind. Callers that merely
+  // failed to READ a remote must omit the key instead of passing null — see
+  // readRemoteIdentity in lib/scanner.ts.
   const hasRemote = Object.prototype.hasOwnProperty.call(repo, "remote_url");
   const safeRemote = hasRemote ? sanitizeRemoteIdentity(repo.remote_url) : null;
 
@@ -327,38 +411,221 @@ export function bulkInsertRemotes(remotes: Array<Omit<Remote, "id">>): number {
 
 // ── Pull Requests ──
 
-export function listPullRequests(
-  opts: ListOptions & { repo_id?: number; state?: string; author?: string } = {}
-): PullRequest[] {
-  const db = getDb();
-  const { limit = 50, offset = 0, repo_id, state, author } = opts;
+export interface ListPullRequestOptions extends ListOptions {
+  repo_id?: number;
+  state?: string;
+  author?: string;
+  /** GitHub owner, resolved from each PR's own URL — not the local repo's org. */
+  org?: string;
+  /** GitHub repository name, resolved from each PR's own URL. */
+  repo_name?: string;
+  /**
+   * Return one row per local checkout instead of one row per pull request.
+   * Off by default: a repository checked out N times otherwise reports every
+   * one of its pull requests N times.
+   */
+  duplicates?: boolean;
+}
+
+/**
+ * Rank rows that describe the same pull request so the most trustworthy copy
+ * wins. Order of preference:
+ *
+ *   1. the row whose owning repo record's remote actually matches the PR URL —
+ *      a PR attached to an unrelated repo record is a mis-attributed sync;
+ *   2. a terminal state over `open` — `merged`/`closed` come with a timestamp
+ *      from GitHub and never revert, whereas `open` is exactly the value that
+ *      goes stale when a copy stops being synced;
+ *   3. the most recently updated row, then the newest row id.
+ */
+const PR_RANK_ORDER = `
+  CASE WHEN url IS NOT NULL AND owner_remote IS NOT NULL
+         AND url LIKE 'https://' || owner_remote || '/pull/%' THEN 0 ELSE 1 END,
+  CASE WHEN state = 'open' THEN 1 ELSE 0 END,
+  COALESCE(updated_at, '') DESC,
+  id DESC`;
+
+/**
+ * Partition on the PR's own URL, which is stable across every local checkout of
+ * the repository. Rows with no URL cannot be matched to anything else, so they
+ * partition on their own row id and always survive.
+ */
+const PR_IDENTITY = `CASE WHEN url IS NOT NULL AND url <> '' THEN lower(url) ELSE 'row:' || id END`;
+
+function buildPullRequestQuery(opts: ListPullRequestOptions): { cte: string; params: any[]; stateFilter: string; stateParams: any[] } {
+  const { repo_id, state, author, org, repo_name, duplicates } = opts;
   const params: any[] = [];
   const where: string[] = [];
 
-  if (repo_id) { where.push("repo_id = ?"); params.push(repo_id); }
-  if (state) { where.push("state = ?"); params.push(state); }
-  if (author) { where.push("author LIKE ?"); params.push(`%${author}%`); }
+  // Identity filters are properties of the pull request itself, so every row in
+  // a de-duplication group shares them and they can be applied before ranking.
+  if (repo_id) { where.push("p.repo_id = ?"); params.push(repo_id); }
+  if (author) { where.push("p.author LIKE ?"); params.push(`%${author}%`); }
+  if (org) { where.push("p.gh_owner = ? COLLATE NOCASE"); params.push(org); }
+  if (repo_name) { where.push("p.gh_repo = ? COLLATE NOCASE"); params.push(repo_name); }
 
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-  params.push(limit, offset);
 
-  return db.query(`SELECT * FROM pull_requests ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params) as PullRequest[];
+  // The state filter must be applied AFTER de-duplication. Filtering first
+  // would keep a stale `open` copy alive and discard the reconciled `merged`
+  // row that supersedes it — the exact bug this surface had.
+  const stateFilter = state ? "WHERE state = ?" : "";
+  const stateParams = state ? [state] : [];
+
+  const cte = duplicates
+    ? `WITH candidate AS (
+         SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org
+         FROM pull_requests p LEFT JOIN repos r ON r.id = p.repo_id
+         ${whereClause}
+       ), ranked AS (SELECT candidate.*, 1 AS rn FROM candidate)`
+    : `WITH candidate AS (
+         SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org
+         FROM pull_requests p LEFT JOIN repos r ON r.id = p.repo_id
+         ${whereClause}
+       ), ranked AS (
+         SELECT candidate.*,
+           ROW_NUMBER() OVER (PARTITION BY ${PR_IDENTITY} ORDER BY ${PR_RANK_ORDER}) AS rn
+         FROM candidate
+       )`;
+
+  return { cte, params, stateFilter, stateParams };
 }
 
-export function bulkInsertPullRequests(prs: Array<Omit<PullRequest, "id">>): number {
+function toPullRequestRecord(row: any): PullRequestRecord {
+  const origin = resolvePullRequestOrigin(row.url, row.owner_remote, row.owner_org);
+  const { owner_remote, owner_org, rn, ...pr } = row;
+  return {
+    ...(pr as PullRequest),
+    is_draft: Boolean(row.is_draft),
+    org: row.gh_owner ?? origin.org,
+    repo: row.gh_repo ?? origin.repo,
+  };
+}
+
+export function listPullRequests(opts: ListPullRequestOptions = {}): PullRequestRecord[] {
   const db = getDb();
-  const stmt = db.query(`INSERT OR REPLACE INTO pull_requests
-    (repo_id, number, title, state, author, created_at, updated_at, merged_at, closed_at, url, base_branch, head_branch, additions, deletions, changed_files)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const { limit = 50, offset = 0 } = opts;
+  const { cte, params, stateFilter, stateParams } = buildPullRequestQuery(opts);
+
+  const rows = db
+    .query(`${cte}
+      SELECT * FROM (SELECT * FROM ranked WHERE rn = 1) ${stateFilter}
+      ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`)
+    .all(...params, ...stateParams, limit, offset) as any[];
+
+  return rows.map(toPullRequestRecord);
+}
+
+/**
+ * Total pull requests matching a filter, ignoring limit/offset, so callers can
+ * tell a full page from a truncated one instead of silently losing rows.
+ */
+export function countPullRequests(opts: ListPullRequestOptions = {}): number {
+  const db = getDb();
+  const { cte, params, stateFilter, stateParams } = buildPullRequestQuery(opts);
+  const row = db
+    .query(`${cte}
+      SELECT COUNT(*) AS c FROM (SELECT * FROM ranked WHERE rn = 1) ${stateFilter}`)
+    .get(...params, ...stateParams) as { c: number };
+  return row.c;
+}
+
+/**
+ * A pull request as supplied by a sync. Merge-gate fields are optional so that
+ * callers written against the pre-0.1.36 shape keep compiling and their rows
+ * simply carry null gate data.
+ */
+export type PullRequestInput =
+  Omit<PullRequest, "id" | "head_sha" | "mergeable" | "merge_state_status" | "ci_state" | "is_draft" | "review_decision">
+  & Partial<Pick<PullRequest, "head_sha" | "mergeable" | "merge_state_status" | "ci_state" | "is_draft" | "review_decision">>;
+
+export function bulkInsertPullRequests(prs: PullRequestInput[]): number {
+  const db = getDb();
+  // Upsert rather than INSERT OR REPLACE: REPLACE deletes and re-inserts the
+  // row, which changes its rowid and appends a duplicate entry to the
+  // contentless FTS index on every sync.
+  const stmt = db.query(`INSERT INTO pull_requests
+    (repo_id, number, title, state, author, created_at, updated_at, merged_at, closed_at, url,
+     base_branch, head_branch, additions, deletions, changed_files,
+     head_sha, mergeable, merge_state_status, ci_state, is_draft, review_decision, gh_owner, gh_repo)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(repo_id, number) DO UPDATE SET
+      title = excluded.title, state = excluded.state, author = excluded.author,
+      created_at = excluded.created_at, updated_at = excluded.updated_at,
+      merged_at = excluded.merged_at, closed_at = excluded.closed_at, url = excluded.url,
+      base_branch = excluded.base_branch, head_branch = excluded.head_branch,
+      additions = excluded.additions, deletions = excluded.deletions,
+      changed_files = excluded.changed_files,
+      head_sha = excluded.head_sha, mergeable = excluded.mergeable,
+      merge_state_status = excluded.merge_state_status, ci_state = excluded.ci_state,
+      is_draft = excluded.is_draft, review_decision = excluded.review_decision,
+      gh_owner = excluded.gh_owner, gh_repo = excluded.gh_repo`);
   let count = 0;
   const tx = db.transaction(() => {
     for (const pr of prs) {
-      stmt.run(pr.repo_id, pr.number, pr.title, pr.state, pr.author, pr.created_at, pr.updated_at, pr.merged_at, pr.closed_at, pr.url, pr.base_branch, pr.head_branch, pr.additions, pr.deletions, pr.changed_files);
+      const origin = resolvePullRequestOrigin(pr.url, null, null);
+      stmt.run(
+        pr.repo_id, pr.number, pr.title, pr.state, pr.author, pr.created_at, pr.updated_at,
+        pr.merged_at, pr.closed_at, pr.url, pr.base_branch, pr.head_branch,
+        pr.additions, pr.deletions, pr.changed_files,
+        pr.head_sha ?? null, pr.mergeable ?? null, pr.merge_state_status ?? null,
+        pr.ci_state ?? null, pr.is_draft ? 1 : 0, pr.review_decision ?? null,
+        origin.org, origin.repo,
+      );
       count++;
     }
   });
   tx();
   return count;
+}
+
+/** Numbers of every pull request still recorded as open for a repo record. */
+export function listOpenPullRequestNumbers(repo_id: number): number[] {
+  const db = getDb();
+  return (db
+    .query("SELECT number FROM pull_requests WHERE repo_id = ? AND state = 'open' ORDER BY number")
+    .all(repo_id) as Array<{ number: number }>).map((row) => row.number);
+}
+
+export interface PullRequestTerminalState {
+  number: number;
+  state: "closed" | "merged";
+  merged_at?: string | null;
+  closed_at?: string | null;
+  updated_at?: string | null;
+}
+
+/**
+ * Drive rows out of `open` once GitHub no longer reports them as open.
+ *
+ * Without this, a sync only ever inserts and updates what it saw, so a pull
+ * request that was merged or closed upstream stays `open` in the index forever
+ * and `--state open` grows without bound.
+ */
+export function applyPullRequestTerminalStates(repo_id: number, states: PullRequestTerminalState[]): number {
+  const db = getDb();
+  const stmt = db.query(`UPDATE pull_requests
+    SET state = ?,
+        merged_at = COALESCE(?, merged_at),
+        closed_at = COALESCE(?, closed_at),
+        updated_at = COALESCE(?, updated_at)
+    WHERE repo_id = ? AND number = ? AND state = 'open'`);
+  // Count the rows that were actually open beforehand rather than trusting the
+  // driver's change count, which also includes rows written by FTS triggers.
+  const isOpen = db.query("SELECT 1 FROM pull_requests WHERE repo_id = ? AND number = ? AND state = 'open'");
+  let changed = 0;
+  const tx = db.transaction(() => {
+    for (const entry of states) {
+      if (!isOpen.get(repo_id, entry.number)) continue;
+      stmt.run(
+        entry.state, entry.merged_at ?? null, entry.closed_at ?? null,
+        entry.updated_at ?? null, repo_id, entry.number,
+      );
+      changed++;
+    }
+  });
+  tx();
+  return changed;
 }
 
 export function searchPullRequests(query: string, limit = 20): Array<PullRequest & { repo_name: string }> {
