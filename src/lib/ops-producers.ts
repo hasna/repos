@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { getDb } from "../db/database.js";
+import { getRepo, listPullRequestsWithRepo } from "../db/repos.js";
 import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
 import { getReleasePipelineParity, type OpsCommandRunner } from "./repo-ops.js";
 import type { PullRequest } from "../types/index.js";
@@ -19,9 +20,17 @@ export interface TaskSeed {
 export interface RepoPrQueueItem {
   repo: {
     id: number;
+    /** Local directory name of the checkout — not the GitHub repository name. */
     name: string;
+    /** GitHub `owner/name`, resolved from the pull request itself. */
     full_name: string;
+    /** GitHub repository name, when the pull request identifies one. */
+    github_repo: string | null;
+    /** Local checkout's org. */
     org: string | null;
+    /** GitHub owner, resolved from the pull request itself. */
+    github_org: string | null;
+    /** Absolute path of the local checkout. */
     path: string;
   };
   pr: {
@@ -44,9 +53,12 @@ export interface RepoPrQueueResult {
   schema: "open-repos.pr-queue.v1";
   generated_at: string;
   synced?: {
+    /** Local checkouts behind the remotes that were considered. */
     repos_seen: number;
+    /** Distinct GitHub repositories fetched; the unit --sync-max-repos budgets. */
     repos_checked: number;
     repos_synced: number;
+    /** Distinct pull requests synced, not rows written across checkouts. */
     total_synced: number;
     truncated: boolean;
     errors: string[];
@@ -76,10 +88,23 @@ export interface PrQueueOptions {
   limit?: number;
 }
 
+/**
+ * Placeholders for a pull request whose owning repo record has been deleted.
+ * Explicitly not-a-path and not-a-name, so nothing downstream mistakes them for
+ * a directory to cd into.
+ */
+const UNKNOWN_LOCAL_REPO = "unknown";
+const UNKNOWN_LOCAL_PATH = "";
+
 interface PrRow extends PullRequest {
-  repo_name: string;
+  /** GitHub owner/name resolved from the pull request's own URL. */
+  org: string | null;
+  repo: string | null;
+  // Sourced from an outer join against repos, so a pull request whose owning
+  // repo record was deleted yields nulls rather than strings.
+  repo_name: string | null;
   repo_org: string | null;
-  repo_path: string;
+  repo_path: string | null;
   repo_remote_url: string | null;
 }
 
@@ -89,17 +114,31 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
   let synced: RepoPrQueueResult["synced"];
 
   if (options.sync) {
+    // Every counter in this object is denominated in REMOTES (distinct GitHub
+    // repositories), except repos_seen which reports the local checkouts behind
+    // them. Sync work — network calls, rate limit, the --sync-max-repos budget —
+    // is per remote, because one fetch updates every checkout of it.
     if (options.repo) {
       const result = syncGithubPRs(options.repo, { limit, state });
-      synced = { repos_seen: 1, repos_checked: 1, repos_synced: 1, total_synced: result.synced, truncated: false, errors: [], skipped: [] };
+      synced = {
+        repos_seen: result.checkouts,
+        repos_checked: 1,
+        repos_synced: 1,
+        // Distinct pull requests, not rows written. Reporting rows would count
+        // the same PR once per checkout and overstate this by 23x for codewith.
+        total_synced: result.synced,
+        truncated: false,
+        errors: [],
+        skipped: [],
+      };
     } else if (options.syncOrgs?.length) {
       synced = { repos_seen: 0, repos_checked: 0, repos_synced: 0, total_synced: 0, truncated: false, errors: [], skipped: [] };
       // When --sync-max-repos is omitted the budget is unbounded and EVERY repo in
       // every org is paginated (no 100-repo cap starving later orgs/repos).
       const bounded = Boolean(options.syncMaxRepos);
-      let remainingRepos = normalizePositiveInteger(options.syncMaxRepos, 0);
+      let remainingRemotes = normalizePositiveInteger(options.syncMaxRepos, 0);
       for (const org of options.syncOrgs) {
-        if (bounded && remainingRepos <= 0) {
+        if (bounded && remainingRemotes <= 0) {
           synced.truncated = true;
           break;
         }
@@ -107,7 +146,7 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
           org,
           limit,
           state,
-          ...(bounded ? { maxRepos: remainingRepos } : {}),
+          ...(bounded ? { maxRepos: remainingRemotes } : {}),
         });
         synced.repos_seen += result.repos_seen;
         synced.repos_checked += result.repos_checked;
@@ -116,10 +155,23 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
         synced.truncated = synced.truncated || result.truncated;
         synced.errors.push(...result.errors.map((error) => `${org}: ${error}`));
         synced.skipped.push(...result.skipped.map((skip) => `${org}: ${skip}`));
-        remainingRepos -= result.repos_checked;
+        // Spends the same unit the budget is expressed in: remotes checked.
+        remainingRemotes -= result.repos_checked;
       }
     } else {
-      synced = syncAllGithubPRs({ org: options.org, limit, state, maxRepos: options.syncMaxRepos });
+      const result = syncAllGithubPRs({ org: options.org, limit, state, maxRepos: options.syncMaxRepos });
+      // Projected field by field rather than passed through: syncAllGithubPRs
+      // returns a superset, and emitting it directly gave this v1 payload a key
+      // set that depended on which branch produced it.
+      synced = {
+        repos_seen: result.repos_seen,
+        repos_checked: result.repos_checked,
+        repos_synced: result.repos_synced,
+        total_synced: result.total_synced,
+        truncated: result.truncated,
+        errors: result.errors,
+        skipped: result.skipped,
+      };
     }
   }
 
@@ -989,28 +1041,33 @@ export function buildProtectedRelease(options: ProtectedReleaseOptions): Protect
   };
 }
 
+/**
+ * Rows for the pr-queue producer.
+ *
+ * Delegates to the shared de-duplicated listing rather than re-joining
+ * pull_requests to repos. The hand-rolled join returned one row per local
+ * checkout, so on this machine a 50-item queue was 23 copies of two pull
+ * requests and `limit` was consumed entirely by duplicates.
+ *
+ * `org` is likewise the GitHub owner resolved from the pull request itself, not
+ * the owning repo record's org — the two disagree whenever a PR was recorded
+ * against an unrelated checkout.
+ */
 function listPrRows(opts: { org?: string; repo?: string; state: string; limit: number }): PrRow[] {
-  const db = getDb();
-  const params: Array<string | number> = [];
-  const where = ["pr.state = ?"];
-  params.push(opts.state);
-  if (opts.org) {
-    where.push("r.org = ?");
-    params.push(opts.org);
-  }
+  let repo_id: number | undefined;
   if (opts.repo) {
-    where.push("(r.name = ? OR r.path = ?)");
-    params.push(opts.repo, opts.repo);
+    const repo = getRepo(opts.repo);
+    // An unresolvable --repo must match nothing, not silently match everything.
+    if (!repo) return [];
+    repo_id = repo.id;
   }
-  params.push(opts.limit);
-  return db.query<PrRow, Array<string | number>>(`
-    SELECT pr.*, r.name AS repo_name, r.org AS repo_org, r.path AS repo_path, r.remote_url AS repo_remote_url
-    FROM pull_requests pr
-    JOIN repos r ON r.id = pr.repo_id
-    WHERE ${where.join(" AND ")}
-    ORDER BY COALESCE(pr.updated_at, pr.created_at) DESC
-    LIMIT ?
-  `).all(...params);
+  return listPullRequestsWithRepo({
+    org: opts.org,
+    repo_id,
+    state: opts.state,
+    limit: opts.limit,
+    orderBy: "updated",
+  }) as unknown as PrRow[];
 }
 
 function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
@@ -1019,10 +1076,19 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
   return {
     repo: {
       id: row.repo_id,
-      name: row.repo_name,
+      // `name`, `org` and `path` describe the LOCAL checkout and keep their
+      // v1 meaning: `name` is the directory on disk, which is routinely
+      // different from the GitHub repository name (github.com/hasna/emails is
+      // checked out as open-emails). Redefining it to the GitHub name would
+      // leave `name` and `path` describing different things and break any
+      // consumer that uses `name` to locate a checkout. The GitHub identity is
+      // carried by `full_name`, and `github_repo` below exposes it on its own.
+      name: row.repo_name ?? UNKNOWN_LOCAL_REPO,
       full_name: fullName,
+      github_repo: row.repo ?? null,
       org: row.repo_org,
-      path: row.repo_path,
+      github_org: row.org ?? null,
+      path: row.repo_path ?? UNKNOWN_LOCAL_PATH,
     },
     pr: {
       number: row.number,
@@ -1041,7 +1107,9 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
       fingerprint: `github-pr:${fullName}#${row.number}`,
       title: `Review and safely merge ${fullName}#${row.number}: ${row.title}`,
       body: [
-        `Repository: ${row.repo_path}`,
+        // Routing reads this path, so an orphaned row must not render the
+        // string "null" as though it were a directory.
+        `Repository: ${row.repo_path ?? UNKNOWN_LOCAL_PATH}`,
         `PR: ${prUrl}`,
         `GitHub author is ${row.author}`,
         `Base: ${row.base_branch ?? "unknown"}`,
@@ -1087,7 +1155,19 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
   };
 }
 
-function githubFullNameFromRepoRow(row: Pick<PrRow, "repo_org" | "repo_name" | "repo_remote_url">): string {
+/**
+ * Name the GitHub repository a queue item belongs to.
+ *
+ * The pull request's own org/repo win: they are resolved from its URL, whereas
+ * the repo record is merely the local checkout the row happens to be attached
+ * to — and those disagree whenever a PR was recorded against an unrelated
+ * checkout. This string becomes the task fingerprint, so taking it from the
+ * wrong record makes tasks collide or route to the wrong repository.
+ */
+function githubFullNameFromRepoRow(
+  row: Pick<PrRow, "repo_org" | "repo_name" | "repo_remote_url"> & { org?: string | null; repo?: string | null },
+): string {
+  if (row.org && row.repo) return `${row.org}/${row.repo}`;
   const identity = sanitizeRemoteIdentity(row.repo_remote_url);
   if (identity?.startsWith("github.com/")) return identity.slice("github.com/".length);
   return `${row.repo_org ?? "unknown"}/${row.repo_name}`;

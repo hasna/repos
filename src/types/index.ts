@@ -74,6 +74,28 @@ export interface PullRequest {
   additions: number;
   deletions: number;
   changed_files: number;
+  /** Tip commit of the head ref, for `gh pr merge --match-head-commit`. */
+  head_sha: string | null;
+  /** GitHub `mergeable`: MERGEABLE | CONFLICTING | UNKNOWN. */
+  mergeable: string | null;
+  /** GitHub `mergeStateStatus`: CLEAN | BLOCKED | DIRTY | UNSTABLE | BEHIND | DRAFT | HAS_HOOKS | UNKNOWN. */
+  merge_state_status: string | null;
+  /** Rolled-up status check state: SUCCESS | FAILURE | PENDING | ERROR | EXPECTED. */
+  ci_state: string | null;
+  is_draft: boolean;
+  /** GitHub `reviewDecision`: APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED. */
+  review_decision: string | null;
+}
+
+/**
+ * A pull request as returned by the listing surface: the stored row plus the
+ * GitHub identity (`org`/`repo`) resolved from the PR's own URL, which is the
+ * only trustworthy owner of that PR when a repository is checked out more than
+ * once locally.
+ */
+export interface PullRequestRecord extends PullRequest {
+  org: string | null;
+  repo: string | null;
 }
 
 export interface Agent {

@@ -9,3 +9,6 @@ dist/
 .secrets/
 coverage/
 .git-local/
+# Scratch git repositories created by the scanner test suites
+.test-repos/
+.test-remote-preservation/

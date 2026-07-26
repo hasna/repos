@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
+import { resolvePullRequestOrigin } from "../lib/pr-identity.js";
 
 function findNearestReposDb(startDir: string): string | null {
   let dir = resolve(startDir);
@@ -779,4 +780,139 @@ const MIGRATIONS: Migration[] = [
         ON branch_adjudication_audit(created_at);
     `,
   },
+  {
+    // Merge-gate columns for pull_requests plus the identity index the
+    // cross-checkout de-duplication read path depends on. The same GitHub PR is
+    // indexed once per local checkout of that repository, so `url` — not
+    // (repo_id, number) — is the stable identity of a pull request.
+    version: 12,
+    run: (db) => upgradePullRequestGateColumns(db),
+  },
 ];
+
+function tableExists(db: Database, name: string): boolean {
+  return db.query("SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?").get(name) !== null;
+}
+
+function columnNames(db: Database, table: string): Set<string> {
+  const rows = db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+const PR_GATE_COLUMNS: Array<[string, string]> = [
+  ["head_sha", "TEXT"],
+  ["mergeable", "TEXT"],
+  ["merge_state_status", "TEXT"],
+  ["ci_state", "TEXT"],
+  ["is_draft", "INTEGER NOT NULL DEFAULT 0"],
+  ["review_decision", "TEXT"],
+  // GitHub identity resolved from the PR's own URL. Stored rather than derived
+  // per query so --org filtering and de-duplication stay indexed instead of
+  // loading the whole table into memory.
+  ["gh_owner", "TEXT"],
+  ["gh_repo", "TEXT"],
+];
+
+/**
+ * Add the merge-gate and identity columns, then repair identities the old write
+ * path lost.
+ *
+ * Written imperatively rather than as a static SQL blob because it has to run
+ * against databases that reached this point by different routes — including
+ * ones whose earlier migrations were recorded without every table being
+ * created. Each step therefore checks for what it is about to touch, and adding
+ * an already-present column is a no-op rather than a failure.
+ */
+function upgradePullRequestGateColumns(db: Database): number {
+  if (!tableExists(db, "pull_requests")) return 0;
+
+  const existing = columnNames(db, "pull_requests");
+  for (const [name, definition] of PR_GATE_COLUMNS) {
+    if (existing.has(name)) continue;
+    db.exec(`ALTER TABLE pull_requests ADD COLUMN ${name} ${definition}`);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_prs_url ON pull_requests(url);
+    CREATE INDEX IF NOT EXISTS idx_prs_updated ON pull_requests(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_prs_owner ON pull_requests(gh_owner, gh_repo);
+  `);
+
+  // Repair the FTS mirror before touching row data.
+  //
+  // Writes used INSERT OR REPLACE, which resolves a conflict by deleting the
+  // existing row and inserting a new one — and with PRAGMA recursive_triggers
+  // OFF (the default; nothing here enables it) that delete never fired prs_ad.
+  // Every re-sync therefore appended another entry and orphaned the previous
+  // one. On the live index this left roughly seven stale entries per live row.
+  // The join in searchPullRequests hides them, so this is bloat rather than
+  // wrong results, but it grows without bound. A rebuild re-derives the whole
+  // index from the external content table.
+  if (tableExists(db, "fts_prs")) {
+    db.exec("INSERT INTO fts_prs(fts_prs) VALUES('rebuild')");
+  }
+
+  // A scan that could not read `git remote get-url origin` used to overwrite a
+  // known-good remote identity with NULL. Restore what the per-repo remotes
+  // table still knows; lib/scanner.ts stops the bleeding going forward.
+  if (tableExists(db, "repos") && tableExists(db, "remotes")) {
+    db.exec(`
+      UPDATE repos
+      SET remote_url = (
+        SELECT url FROM remotes
+        WHERE remotes.repo_id = repos.id AND remotes.name = 'origin' AND remotes.url IS NOT NULL
+        LIMIT 1
+      )
+      WHERE remote_url IS NULL
+        AND EXISTS (
+          SELECT 1 FROM remotes
+          WHERE remotes.repo_id = repos.id AND remotes.name = 'origin' AND remotes.url IS NOT NULL
+        );
+
+      UPDATE repos
+      SET org = substr(remote_url, instr(remote_url, '/') + 1,
+                       instr(substr(remote_url, instr(remote_url, '/') + 1), '/') - 1)
+      WHERE org IS NULL AND remote_url IS NOT NULL AND instr(remote_url, '/') > 0;
+    `);
+  }
+
+  const updated = backfillPullRequestOrigins(db);
+
+  // Created only after the backfill so that rewriting every row's gh_owner does
+  // not push two FTS writes per row through the trigger.
+  if (tableExists(db, "fts_prs")) {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS prs_au AFTER UPDATE ON pull_requests BEGIN
+        INSERT INTO fts_prs(fts_prs, rowid, title, author)
+        VALUES ('delete', old.id, old.title, old.author);
+        INSERT INTO fts_prs(rowid, title, author)
+        VALUES (new.id, new.title, new.author);
+      END;
+    `);
+  }
+
+  return updated;
+}
+
+/**
+ * Populate gh_owner/gh_repo for rows written before migration 12. Parsing is
+ * done in TypeScript so it uses the same parser the write path uses, instead of
+ * a second, divergent SQL implementation.
+ */
+function backfillPullRequestOrigins(db: Database): number {
+  const hasRepos = tableExists(db, "repos");
+  const rows = db
+    .query(hasRepos
+      ? "SELECT p.id, p.url, r.remote_url, r.org FROM pull_requests p LEFT JOIN repos r ON r.id = p.repo_id"
+      : "SELECT id, url, NULL AS remote_url, NULL AS org FROM pull_requests")
+    .all() as Array<{ id: number; url: string | null; remote_url: string | null; org: string | null }>;
+  const update = db.query("UPDATE pull_requests SET gh_owner = ?, gh_repo = ? WHERE id = ?");
+  let updated = 0;
+  for (const row of rows) {
+    const origin = resolvePullRequestOrigin(row.url, row.remote_url, row.org);
+    if (!origin.org && !origin.repo) continue;
+    update.run(origin.org, origin.repo, row.id);
+    updated++;
+  }
+  return updated;
+}

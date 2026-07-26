@@ -13,10 +13,14 @@ import {
   listBranches,
   listTags,
   listPullRequests,
+  countPullRequests,
+  countRepos,
+  getRepoByRemote,
   searchAll,
   getGlobalStats,
   getRepoStats,
   AmbiguousRepoNameError,
+  AmbiguousRemoteError,
 } from "../db/repos.js";
 import {
   BranchAdjudicationError,
@@ -34,6 +38,7 @@ import {
   startAutoIndexWorker,
 } from "../lib/auto-index.js";
 import { getFilterAlias } from "../lib/config.js";
+import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
 import { getReposStatus } from "../lib/status.js";
 import { formatRepoNotFoundMessage } from "./messages.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
@@ -273,6 +278,22 @@ function resolveOffset(opts: any): number {
   return intFlag(String(opts.cursor ?? opts.offset ?? "0"), flagName, 0);
 }
 
+/**
+ * Announce, on stderr, that a JSON page did not contain every matching record.
+ *
+ * A default page size that silently drops rows is a correctness bug for
+ * scripted callers: `repos repos --json` returning 50 of 1243 looks exactly
+ * like a complete answer. stderr keeps the JSON on stdout machine-readable.
+ */
+function warnIfTruncated(opts: { shown: number; total: number; limit: number; offset: number; noun: string }): void {
+  const seen = opts.offset + opts.shown;
+  if (seen >= opts.total) return;
+  console.error(chalk.yellow(
+    `warning: showing ${opts.shown} of ${opts.total} ${opts.noun} (offset ${opts.offset}, limit ${opts.limit}). ` +
+    `Pass -n ${opts.total} or page with --cursor ${seen} to see the rest.`
+  ));
+}
+
 function printCompactHint(opts: {
   count: number;
   noun: string;
@@ -424,8 +445,10 @@ program
     const limit = resolveLimit(opts, COMPACT_LIMIT, 50);
     const offset = resolveOffset(opts);
     const repos = listRepos({ org, query, limit, offset });
+    const total = countRepos({ org, query });
     if (opts.json) {
       console.log(JSON.stringify(repos, null, 2));
+      warnIfTruncated({ shown: repos.length, total, limit, offset, noun: "repo(s)" });
     } else {
       if (repos.length === 0) { console.log(chalk.dim("No repos found. Run: repos scan")); return; }
       for (const r of repos) {
@@ -443,13 +466,57 @@ program
         offset,
         pageable: true,
         verbose: opts.verbose,
-        detail: "use `repos show <name>` for repo details",
+        detail: `${total} match this filter. Use \`repos show <name>\` for repo details`,
       });
     }
   });
 
-function printRepoDetails(name: string, opts: any) {
-    const repo = requireRepo(name);
+/**
+ * Resolve the repo a command should act on.
+ *
+ * `--remote github.com/<org>/<name>` is the deterministic form: it matches the
+ * GitHub identity exactly and fails loudly when a remote has several local
+ * checkouts, instead of silently picking one. The positional name remains
+ * available and unchanged for interactive use.
+ */
+function resolveTargetRepo(name: string | undefined, opts: any) {
+  if (opts.remote) {
+    if (name) {
+      console.error(chalk.red("Error: pass either a repo name or --remote, not both"));
+      process.exit(1);
+    }
+    let repo;
+    try {
+      repo = getRepoByRemote(opts.remote);
+    } catch (error) {
+      if (error instanceof AmbiguousRemoteError) {
+        console.error(chalk.red(error.message));
+        process.exit(1);
+      }
+      throw error;
+    }
+    if (!repo) {
+      // Echo only the sanitized identity, never the caller's raw argument: a
+      // rejected remote is exactly the case where the input may still carry
+      // embedded credentials (https://user:token@host/org/repo).
+      const safe = sanitizeRemoteIdentity(opts.remote)
+        ?? sanitizeRemoteIdentity(`github.com/${String(opts.remote).replace(/^\/+/, "")}`);
+      console.error(chalk.red(safe
+        ? `No indexed repo has remote '${safe}'`
+        : "No indexed repo matched --remote (value was not a usable host/org/name identity)"));
+      process.exit(1);
+    }
+    return repo;
+  }
+  if (!name) {
+    console.error(chalk.red("Error: provide a repo name or --remote <host/org/name>"));
+    process.exit(1);
+  }
+  return requireRepo(name);
+}
+
+function printRepoDetails(name: string | undefined, opts: any) {
+    const repo = resolveTargetRepo(name, opts);
     const stats = getRepoStats(repo.id);
     if (opts.json) {
       console.log(JSON.stringify({ ...repo, ...stats }, null, 2));
@@ -478,23 +545,29 @@ function printRepoDetails(name: string, opts: any) {
     }
 }
 
+const REMOTE_OPTION = "--remote <host/org/name>";
+const REMOTE_OPTION_HELP = "Resolve by exact GitHub remote, e.g. github.com/hasna/emails";
+
 program
-  .command("repo <name>")
+  .command("repo [name]")
   .description("Get repo details")
+  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
   .option("--verbose", "Show larger detail sections")
   .option("--json", "Output as JSON")
   .action(printRepoDetails);
 
 program
-  .command("show <name>")
+  .command("show [name]")
   .description("Show repo details")
+  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
   .option("--verbose", "Show larger detail sections")
   .option("--json", "Output as JSON")
   .action(printRepoDetails);
 
 program
-  .command("inspect <name>")
+  .command("inspect [name]")
   .description("Inspect repo details")
+  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
   .option("--verbose", "Show larger detail sections")
   .option("--json", "Output as JSON")
   .action(printRepoDetails);
@@ -802,8 +875,11 @@ program
 program
   .command("prs")
   .description("List pull requests")
-  .option("--repo <name>", "Filter by repo")
+  .option("--repo <name>", "Filter by local repo record")
+  .option("--org <org>", "Filter by GitHub owner, resolved from each PR's URL")
+  .option("--repo-name <name>", "Filter by GitHub repository name, resolved from each PR's URL")
   .option("--state <state>", "Filter: open, closed, merged")
+  .option("--duplicates", "Emit one row per local checkout instead of one row per PR")
   .option("--author <author>", "Filter by author")
   .option("--mine", "Show only your PRs (via gh)")
   .option("--review", "Show PRs awaiting your review (via gh)")
@@ -842,15 +918,28 @@ program
         }
       } catch { /* gh not available */ }
     }
-    const prs = listPullRequests({ repo_id, state: opts.state, author, limit, offset });
+    const filter = {
+      repo_id,
+      state: opts.state,
+      author,
+      org: opts.org,
+      repo_name: opts.repoName,
+      duplicates: Boolean(opts.duplicates),
+    };
+    const prs = listPullRequests({ ...filter, limit, offset });
+    const total = countPullRequests(filter);
     if (opts.json) {
       console.log(JSON.stringify(prs, null, 2));
+      warnIfTruncated({ shown: prs.length, total, limit, offset, noun: "pull request(s)" });
     } else {
       for (const pr of prs) {
         const stateColor = pr.state === "open" ? chalk.green : pr.state === "merged" ? chalk.magenta : chalk.red;
-        console.log(`  ${stateColor(`[${pr.state}]`)} #${pr.number} ${compactText(pr.title, opts.verbose ? 160 : 100)}`);
+        const slug = pr.org && pr.repo ? `${pr.org}/${pr.repo}` : "";
+        const draft = pr.is_draft ? chalk.dim(" (draft)") : "";
+        console.log(`  ${stateColor(`[${pr.state}]`)} ${slug}#${pr.number}${draft} ${compactText(pr.title, opts.verbose ? 160 : 100)}`);
         if (opts.verbose) {
           console.log(chalk.dim(`    by ${pr.author} ${day(pr.created_at)} +${pr.additions}/-${pr.deletions} files ${pr.changed_files}${pr.url ? ` ${pr.url}` : ""}`));
+          console.log(chalk.dim(`    head ${pr.head_sha?.slice(0, 12) ?? "-"} mergeable ${pr.mergeable ?? "-"} merge-state ${pr.merge_state_status ?? "-"} ci ${pr.ci_state ?? "-"} review ${pr.review_decision ?? "-"}`));
         }
       }
       printCompactHint({
@@ -860,7 +949,7 @@ program
         offset,
         pageable: true,
         verbose: opts.verbose,
-        detail: "filter with --repo, --state, --author, --mine, or --review",
+        detail: `${total} match this filter. Filter with --org, --repo, --repo-name, --state, --author, --mine, or --review`,
       });
     }
   });
@@ -1050,16 +1139,21 @@ program
   .description("Sync PRs and metadata from GitHub")
   .option("--repo <name>", "Sync specific repo")
   .option("--org <org>", "Sync repos for a specific org")
-  .option("-n, --limit <n>", "Max PRs per repo", "100")
+  .option("-n, --limit <n>", "Max closed/merged PRs to refresh per repo", "100")
+  .option("--no-reconcile", "Skip driving vanished open PRs to their terminal state")
   .option("--json", "Output as JSON")
   .action((opts) => {
+    const reconcile = opts.reconcile !== false;
     if (opts.repo) {
       try {
-        const result = syncGithubPRs(opts.repo, { limit: intFlag(opts.limit, "--limit", 1) });
+        const result = syncGithubPRs(opts.repo, { limit: intFlag(opts.limit, "--limit", 1), reconcile });
         if (opts.json) {
           console.log(JSON.stringify(result));
         } else {
-          console.log(chalk.green(`✓ Synced ${result.synced} PRs for ${result.repo_name}`));
+          console.log(chalk.green(`✓ Synced ${result.synced} PRs for ${result.repo_name} (${result.rows_written} rows across ${result.checkouts} checkout(s)), reconciled ${result.reconciled}`));
+          if (!result.merge_state_available) {
+            console.log(chalk.yellow("  merge_state_status unavailable (preview header refused); other gate fields indexed"));
+          }
         }
       } catch (err: any) {
         console.log(chalk.red(`Error: ${err.message}`));
@@ -1069,12 +1163,13 @@ program
       const result = syncAllGithubPRs({
         org: opts.org,
         limit: intFlag(opts.limit, "--limit", 1),
+        reconcile,
         onProgress: opts.json ? undefined : (msg: string) => console.log(chalk.dim(msg)),
       });
       if (opts.json) {
         console.log(JSON.stringify(result));
       } else {
-        console.log(chalk.green(`\n✓ Synced ${result.total_synced} PRs across ${result.repos_synced} repos`));
+        console.log(chalk.green(`\n✓ Synced ${result.total_synced} PRs across ${result.repos_synced} remotes (${result.total_rows_written} rows over ${result.repos_seen} local checkouts), reconciled ${result.total_reconciled} to a terminal state`));
         if (result.errors.length > 0) {
           console.log(chalk.yellow(`  ${result.errors.length} errors (repos without GitHub remote)`));
         }
@@ -1858,22 +1953,44 @@ program
   });
 
 // ── CD / Open ──
+/**
+ * `cd`/`open` resolve fuzzily by default, which is convenient interactively and
+ * unsafe for automation — `repos cd todos` will happily return `open-todos`
+ * while `platform-todos` also exists. `--exact` and `--remote` opt into a
+ * deterministic lookup that fails rather than guessing.
+ */
+function resolveRepoPath(name: string | undefined, opts: any): string {
+  if (opts.remote || opts.exact) {
+    // `name` is passed through even alongside --remote so that supplying both
+    // is rejected here exactly as it is for `repo`/`show`/`inspect`, rather
+    // than the positional being silently ignored.
+    return resolveTargetRepo(name, opts).path;
+  }
+  if (!name) {
+    console.error("Repo not found");
+    process.exit(1);
+  }
+  const path = getRepoPath(name);
+  if (!path) { console.error("Repo not found"); process.exit(1); }
+  return path;
+}
+
 program
-  .command("cd <name>")
+  .command("cd [name]")
   .description("Print repo path (use: cd $(repos cd open-todos))")
-  .action((name) => {
-    const path = getRepoPath(name);
-    if (!path) { console.error("Repo not found"); process.exit(1); }
-    console.log(path);
+  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
+  .option("--exact", "Match the local name or path exactly; never fuzzy-match")
+  .action((name, opts) => {
+    console.log(resolveRepoPath(name, opts));
   });
 
 program
-  .command("open <name>")
+  .command("open [name]")
   .description("Open repo in VS Code")
-  .action((name) => {
-    const path = getRepoPath(name);
-    if (!path) { console.error("Repo not found"); process.exit(1); }
-    execSync(`code "${path}"`);
+  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
+  .option("--exact", "Match the local name or path exactly; never fuzzy-match")
+  .action((name, opts) => {
+    execSync(`code "${resolveRepoPath(name, opts)}"`);
   });
 
 // ── Report ──
