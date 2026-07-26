@@ -223,6 +223,22 @@ describe("sync reconciliation", () => {
     expect(countPullRequests({ state: "merged" })).toBe(0);
   });
 
+  it("counts distinct pull requests, not rows written across checkouts", () => {
+    // `synced` is reported as "PRs synced". Counting rows instead multiplies it
+    // by the checkout count — 23x for codewith on the live index — which then
+    // flows straight into the pr-queue producer's total_synced.
+    for (const path of ["/w/a", "/w/b", "/w/c"]) {
+      upsertRepo({ path, name: path.slice(3), org: "hasna", remote_url: "github.com/hasna/codewith" });
+    }
+    const client = stubClient({ open: [ghPr(1), ghPr(2)] });
+
+    const result = syncRemotePullRequests("github.com/hasna/codewith", "hasna/codewith", { client });
+
+    expect(result.synced).toBe(2);
+    expect(result.rows_written).toBe(6);
+    expect(result.checkouts).toBe(3);
+  });
+
   it("stores the merge-gate fields the GraphQL connection returns", () => {
     upsertRepo({ path: "/w/codewith", name: "codewith", org: "hasna", remote_url: "github.com/hasna/codewith" });
     const client = stubClient({

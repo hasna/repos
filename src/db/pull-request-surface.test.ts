@@ -11,6 +11,8 @@ import {
   getRepoByRemote,
   listReposByRemote,
   countRepos,
+  listPullRequestsWithRepo,
+  isDerivedCheckoutPath,
   AmbiguousRemoteError,
   type PullRequestInput,
 } from "./repos";
@@ -64,6 +66,48 @@ describe("cross-checkout de-duplication", () => {
     const rows = listPullRequests({ state: "open" });
     expect(rows).toHaveLength(1);
     expect(rows[0]!.number).toBe(415);
+  });
+
+  it("picks the primary clone, not a worktree, as the surviving copy", () => {
+    // The surviving row's path is what downstream consumers route work to.
+    // Worktrees are indexed after the clone they came from, so without an
+    // explicit rank term the final `id DESC` tiebreak always selects one —
+    // pointing callers at another task's working directory.
+    const primary = upsertRepo({ path: "/home/u/workspace/open-codewith", name: "open-codewith", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const wtA = upsertRepo({ path: "/home/u/.hasna/repos/worktrees/codewith/task-a", name: "task-a", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const wtB = upsertRepo({ path: "/home/u/.hasna/repos/worktrees/station01/open-codewith/task-b", name: "task-b", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const shm = upsertRepo({ path: "/dev/shm/build-20260710/repos/codewith", name: "codewith", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    // Identical timestamps, exactly as one fan-out sync writes them.
+    for (const id of [primary.id, wtA.id, wtB.id, shm.id]) {
+      bulkInsertPullRequests([pr({ repo_id: id, number: 424, updated_at: "2026-07-26T01:00:00Z" })]);
+    }
+
+    const rows = listPullRequestsWithRepo({ state: "open" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.repo_path).toBe("/home/u/workspace/open-codewith");
+    expect(isDerivedCheckoutPath(rows[0]!.repo_path!)).toBe(false);
+  });
+
+  it("falls back to a worktree only when no primary clone holds the PR", () => {
+    const wt = upsertRepo({ path: "/home/u/.hasna/repos/worktrees/codewith/only", name: "only", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    bulkInsertPullRequests([pr({ repo_id: wt.id, number: 7 })]);
+
+    const rows = listPullRequestsWithRepo({ state: "open" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.repo_path).toBe("/home/u/.hasna/repos/worktrees/codewith/only");
+  });
+
+  it("does not let the primary preference override fresher data", () => {
+    // Path preference ranks below freshness: a stale primary must not beat a
+    // worktree that actually saw the merge.
+    const primary = upsertRepo({ path: "/home/u/workspace/open-codewith", name: "open-codewith", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const wt = upsertRepo({ path: "/home/u/.hasna/repos/worktrees/codewith/fresh", name: "fresh", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    bulkInsertPullRequests([
+      pr({ repo_id: primary.id, number: 8, state: "open", updated_at: "2026-07-01T00:00:00Z" }),
+      pr({ repo_id: wt.id, number: 8, state: "merged", merged_at: "2026-07-20T00:00:00Z", updated_at: "2026-07-20T00:00:00Z" }),
+    ]);
+
+    expect(listPullRequests({})[0]!.state).toBe("merged");
   });
 
   it("still exposes every stored copy behind --duplicates", () => {

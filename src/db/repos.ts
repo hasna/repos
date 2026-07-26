@@ -171,9 +171,36 @@ export function getRepoByRemote(remote: string, opts: { allowAmbiguous?: boolean
   throw new AmbiguousRemoteError(normalized, rows.map((row) => row.path));
 }
 
+/**
+ * Path markers that identify a copy of a checkout rather than the checkout
+ * itself. Kept as data so the TypeScript predicate and the SQL rank term below
+ * cannot drift apart into two different definitions of "derived".
+ */
+const DERIVED_CHECKOUT_SEGMENTS = ["worktrees", ".worktrees"] as const;
+const DERIVED_CHECKOUT_PREFIXES = ["/dev/shm/"] as const;
+
 /** Paths that are copies of a checkout rather than the checkout itself. */
 export function isDerivedCheckoutPath(path: string): boolean {
-  return /(^|\/)(worktrees|\.worktrees)\//.test(path) || path.startsWith("/dev/shm/");
+  const segments = DERIVED_CHECKOUT_SEGMENTS.some((segment) => {
+    const escaped = segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|/)${escaped}/`).test(path);
+  });
+  return segments || DERIVED_CHECKOUT_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+/**
+ * SQL ordering term that sorts primary clones (0) ahead of derived copies (1).
+ * The markers contain no LIKE metacharacters, so they inline safely.
+ */
+function derivedCheckoutRankSql(column: string): string {
+  const tests = [
+    ...DERIVED_CHECKOUT_SEGMENTS.flatMap((segment) => [
+      `${column} LIKE '%/${segment}/%'`,
+      `${column} LIKE '${segment}/%'`,
+    ]),
+    ...DERIVED_CHECKOUT_PREFIXES.map((prefix) => `${column} LIKE '${prefix}%'`),
+  ];
+  return `CASE WHEN ${column} IS NOT NULL AND (${tests.join(" OR ")}) THEN 1 ELSE 0 END`;
 }
 
 /** Every local checkout of a remote, in index order. */
@@ -441,16 +468,24 @@ export interface ListPullRequestOptions extends ListOptions {
  *      terminal state first would keep reporting a reopened PR as closed. The
  *      merge/close/create timestamps stand in when `updated_at` is missing, so
  *      a terminal row without one is not ranked as though it had no history;
- *   3. a terminal state over `open`, to break ties when copies share a
+ *   3. a primary clone over a worktree or throwaway build copy. The winning
+ *      row's `path` is what downstream consumers route work to, and a sync
+ *      writes every checkout of a remote in one pass, so copies normally tie on
+ *      the timestamp above and this is what actually decides. Without it the
+ *      final `id DESC` tiebreak systematically selects the newest-indexed row,
+ *      which is a worktree — pointing callers at another task's working
+ *      directory;
+ *   4. a terminal state over `open`, to break ties when copies share a
  *      timestamp — `open` is the value that goes stale when a copy stops being
  *      synced, whereas `merged`/`closed` carry a timestamp from GitHub;
- *   4. the newest row id, so the ordering is always total and deterministic.
+ *   5. the newest row id, so the ordering is always total and deterministic.
  */
 const PR_RANK_ORDER = `
   CASE WHEN url IS NOT NULL AND owner_remote IS NOT NULL
          AND url LIKE 'https://' || replace(replace(owner_remote, '\\', '\\\\'), '_', '\\_') || '/pull/%'
          ESCAPE '\\' THEN 0 ELSE 1 END,
   COALESCE(updated_at, merged_at, closed_at, created_at, '') DESC,
+  ${derivedCheckoutRankSql("owner_path")},
   CASE WHEN state = 'open' THEN 1 ELSE 0 END,
   id DESC`;
 
@@ -650,6 +685,9 @@ export function listOpenPullRequestNumbers(repo_id: number): number[] {
     .all(repo_id) as Array<{ number: number }>).map((row) => row.number);
 }
 
+/** Stays well under SQLite's default 999-parameter ceiling. */
+const SQL_VARIABLE_CHUNK = 500;
+
 export interface PullRequestTerminalState {
   number: number;
   state: "closed" | "merged";
@@ -675,14 +713,21 @@ export function applyPullRequestTerminalStates(repo_id: number, states: PullRequ
     WHERE repo_id = ? AND number = ? AND state = 'open'`);
   if (states.length === 0) return 0;
 
-  // Which rows are still open is read once, not once per number: the count has
-  // to reflect rows this call actually transitioned, and the driver's own
-  // change count is inflated by the writes the FTS trigger performs.
-  const placeholders = states.map(() => "?").join(",");
-  const stillOpen = new Set((db
-    .query(`SELECT number FROM pull_requests WHERE repo_id = ? AND state = 'open' AND number IN (${placeholders})`)
-    .all(repo_id, ...states.map((entry) => entry.number)) as Array<{ number: number }>)
-    .map((row) => row.number));
+  // Which rows are still open is read in bulk, not once per number: the count
+  // has to reflect rows this call actually transitioned, and the driver's own
+  // change count is inflated by the writes the FTS trigger performs. Chunked so
+  // the statement can never exceed SQLite's variable limit (999 by default).
+  const stillOpen = new Set<number>();
+  const numbers = states.map((entry) => entry.number);
+  for (let i = 0; i < numbers.length; i += SQL_VARIABLE_CHUNK) {
+    const chunk = numbers.slice(i, i + SQL_VARIABLE_CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    for (const row of db
+      .query(`SELECT number FROM pull_requests WHERE repo_id = ? AND state = 'open' AND number IN (${placeholders})`)
+      .all(repo_id, ...chunk) as Array<{ number: number }>) {
+      stillOpen.add(row.number);
+    }
+  }
 
   let changed = 0;
   const tx = db.transaction(() => {

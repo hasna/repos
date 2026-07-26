@@ -120,6 +120,46 @@ describe("ops producers", () => {
     expect(result.items).toHaveLength(1);
     expect(result.items[0]!.repo.full_name).toBe("hasna/codewith");
     expect(result.task_suggestions).toHaveLength(1);
+    // The surviving copy must be the primary clone. The seed body's
+    // `Repository: <path>` line routes an agent to this directory, and a
+    // worktree belongs to some other task — operating rule 8.
+    expect(result.items[0]!.repo.path).toBe("/workspace/open-codewith");
+    expect(result.items[0]!.repo.path).not.toContain("/worktrees/");
+    expect(result.items[0]!.task_seed.body).toContain("/workspace/open-codewith");
+  });
+
+  test("names the repository that owns the PR, not the checkout it was recorded against", () => {
+    // The full_name becomes the task fingerprint. Taking it from the winning
+    // repo record rather than the pull request makes tasks collide or route to
+    // the wrong repository.
+    const repo = upsertRepo({
+      path: "/workspace/platform-aicopilot",
+      name: "platform-aicopilot",
+      org: "hasnatools",
+      remote_url: "git@github.com:hasnatools/platform-aicopilot.git",
+    });
+    bulkInsertPullRequests([{
+      repo_id: repo.id,
+      number: 9,
+      title: "Mis-attributed",
+      state: "open",
+      author: "andrei-hasna",
+      created_at: "2026-07-01T00:00:00Z",
+      updated_at: "2026-07-01T00:00:00Z",
+      merged_at: null,
+      closed_at: null,
+      url: "https://github.com/hasna/aicopilot/pull/9",
+      base_branch: "main",
+      head_branch: "fix/x",
+      additions: 1,
+      deletions: 0,
+      changed_files: 1,
+    }]);
+
+    const item = buildPrQueue({ org: "hasna" }).items[0]!;
+    expect(item.repo.full_name).toBe("hasna/aicopilot");
+    expect(item.task_seed.fingerprint).toBe("github-pr:hasna/aicopilot#9");
+    expect(item.repo.org).toBe("hasna");
   });
 
   test("scopes the queue by the org that owns the PR, not the repo record's org", () => {

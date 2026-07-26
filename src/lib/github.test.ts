@@ -1,5 +1,37 @@
 import { describe, expect, test } from "bun:test";
-import { isMissingRepoError } from "./github.js";
+import { collectPullRequestNodes, isMissingRepoError } from "./github.js";
+
+describe("collectPullRequestNodes", () => {
+  test("drops the null holes in a partially-resolved page", () => {
+    // GitHub returns nodes with nulls alongside an `errors` entry when only
+    // some of the page could be resolved. Dereferencing one throws
+    // "null is not an object (evaluating 'pr.number')" and aborts the sync.
+    const nodes = [null, { number: 2 }, undefined, { number: 3 }];
+    expect(collectPullRequestNodes(nodes).map((pr) => pr.number)).toEqual([2, 3]);
+  });
+
+  test("rejects entries that are not pull request shaped", () => {
+    expect(collectPullRequestNodes([{ number: "12" }, {}, "nope", 7])).toEqual([]);
+  });
+
+  test("tolerates a missing or non-array nodes field", () => {
+    expect(collectPullRequestNodes(undefined)).toEqual([]);
+    expect(collectPullRequestNodes(null)).toEqual([]);
+    expect(collectPullRequestNodes({})).toEqual([]);
+  });
+});
+
+describe("transient failures are not mistaken for missing repositories", () => {
+  test("an empty pull request connection is an error, not a skip", () => {
+    // Classifying this as missing would file a transient failure alongside
+    // renamed and deleted repositories, and a fleet sync would report success.
+    expect(isMissingRepoError("GitHub GraphQL returned no pull request connection")).toBe(false);
+  });
+
+  test("a genuinely absent repository is still classified as missing", () => {
+    expect(isMissingRepoError("GitHub repository is unavailable")).toBe(true);
+  });
+});
 
 describe("isMissingRepoError", () => {
   test("classifies a renamed/deleted GitHub repo (GraphQL resolve error) as missing", () => {

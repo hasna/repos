@@ -45,9 +45,12 @@ export interface RepoPrQueueResult {
   schema: "open-repos.pr-queue.v1";
   generated_at: string;
   synced?: {
+    /** Local checkouts behind the remotes that were considered. */
     repos_seen: number;
+    /** Distinct GitHub repositories fetched; the unit --sync-max-repos budgets. */
     repos_checked: number;
     repos_synced: number;
+    /** Distinct pull requests synced, not rows written across checkouts. */
     total_synced: number;
     truncated: boolean;
     errors: string[];
@@ -78,9 +81,14 @@ export interface PrQueueOptions {
 }
 
 interface PrRow extends PullRequest {
-  repo_name: string;
+  /** GitHub owner/name resolved from the pull request's own URL. */
+  org: string | null;
+  repo: string | null;
+  // Sourced from an outer join against repos, so a pull request whose owning
+  // repo record was deleted yields nulls rather than strings.
+  repo_name: string | null;
   repo_org: string | null;
-  repo_path: string;
+  repo_path: string | null;
   repo_remote_url: string | null;
 }
 
@@ -90,17 +98,31 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
   let synced: RepoPrQueueResult["synced"];
 
   if (options.sync) {
+    // Every counter in this object is denominated in REMOTES (distinct GitHub
+    // repositories), except repos_seen which reports the local checkouts behind
+    // them. Sync work — network calls, rate limit, the --sync-max-repos budget —
+    // is per remote, because one fetch updates every checkout of it.
     if (options.repo) {
       const result = syncGithubPRs(options.repo, { limit, state });
-      synced = { repos_seen: 1, repos_checked: 1, repos_synced: 1, total_synced: result.synced, truncated: false, errors: [], skipped: [] };
+      synced = {
+        repos_seen: result.checkouts,
+        repos_checked: 1,
+        repos_synced: 1,
+        // Distinct pull requests, not rows written. Reporting rows would count
+        // the same PR once per checkout and overstate this by 23x for codewith.
+        total_synced: result.synced,
+        truncated: false,
+        errors: [],
+        skipped: [],
+      };
     } else if (options.syncOrgs?.length) {
       synced = { repos_seen: 0, repos_checked: 0, repos_synced: 0, total_synced: 0, truncated: false, errors: [], skipped: [] };
       // When --sync-max-repos is omitted the budget is unbounded and EVERY repo in
       // every org is paginated (no 100-repo cap starving later orgs/repos).
       const bounded = Boolean(options.syncMaxRepos);
-      let remainingRepos = normalizePositiveInteger(options.syncMaxRepos, 0);
+      let remainingRemotes = normalizePositiveInteger(options.syncMaxRepos, 0);
       for (const org of options.syncOrgs) {
-        if (bounded && remainingRepos <= 0) {
+        if (bounded && remainingRemotes <= 0) {
           synced.truncated = true;
           break;
         }
@@ -108,7 +130,7 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
           org,
           limit,
           state,
-          ...(bounded ? { maxRepos: remainingRepos } : {}),
+          ...(bounded ? { maxRepos: remainingRemotes } : {}),
         });
         synced.repos_seen += result.repos_seen;
         synced.repos_checked += result.repos_checked;
@@ -117,7 +139,8 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
         synced.truncated = synced.truncated || result.truncated;
         synced.errors.push(...result.errors.map((error) => `${org}: ${error}`));
         synced.skipped.push(...result.skipped.map((skip) => `${org}: ${skip}`));
-        remainingRepos -= result.repos_checked;
+        // Spends the same unit the budget is expressed in: remotes checked.
+        remainingRemotes -= result.repos_checked;
       }
     } else {
       synced = syncAllGithubPRs({ org: options.org, limit, state, maxRepos: options.syncMaxRepos });
@@ -1025,10 +1048,13 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
   return {
     repo: {
       id: row.repo_id,
-      name: row.repo_name,
+      // The GitHub repository name, falling back to the local directory name.
+      // `Repository: <path>` is read by routing, so an orphaned row must not
+      // render the string "null".
+      name: row.repo ?? row.repo_name ?? fullName.split("/")[1] ?? "unknown",
       full_name: fullName,
-      org: row.repo_org,
-      path: row.repo_path,
+      org: row.org ?? row.repo_org,
+      path: row.repo_path ?? "",
     },
     pr: {
       number: row.number,
@@ -1093,7 +1119,19 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
   };
 }
 
-function githubFullNameFromRepoRow(row: Pick<PrRow, "repo_org" | "repo_name" | "repo_remote_url">): string {
+/**
+ * Name the GitHub repository a queue item belongs to.
+ *
+ * The pull request's own org/repo win: they are resolved from its URL, whereas
+ * the repo record is merely the local checkout the row happens to be attached
+ * to — and those disagree whenever a PR was recorded against an unrelated
+ * checkout. This string becomes the task fingerprint, so taking it from the
+ * wrong record makes tasks collide or route to the wrong repository.
+ */
+function githubFullNameFromRepoRow(
+  row: Pick<PrRow, "repo_org" | "repo_name" | "repo_remote_url"> & { org?: string | null; repo?: string | null },
+): string {
+  if (row.org && row.repo) return `${row.org}/${row.repo}`;
   const identity = sanitizeRemoteIdentity(row.repo_remote_url);
   if (identity?.startsWith("github.com/")) return identity.slice("github.com/".length);
   return `${row.repo_org ?? "unknown"}/${row.repo_name}`;

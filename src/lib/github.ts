@@ -164,6 +164,20 @@ function graphqlWithOptionalMergeState<T>(build: (withMergeState: boolean) => { 
  * pull requests as open while omitting genuinely open ones, which is precisely
  * the error this sync exists to correct.
  */
+/**
+ * Keep only usable pull request nodes from a connection page.
+ *
+ * A partially-resolved page arrives as `nodes` containing null holes alongside
+ * an `errors` entry — and since partial responses are deliberately allowed
+ * through, those holes reach this code. Dereferencing one throws and aborts the
+ * whole sync, so they are dropped rather than trusted.
+ */
+export function collectPullRequestNodes(nodes: unknown): GraphqlPr[] {
+  if (!Array.isArray(nodes)) return [];
+  return nodes.filter((node): node is GraphqlPr =>
+    Boolean(node) && typeof node === "object" && typeof (node as GraphqlPr).number === "number");
+}
+
 export function fetchPullRequests(
   ghRepo: string,
   opts: { states: string[]; limit: number; state: { mergeStateSupported: boolean } },
@@ -189,9 +203,14 @@ export function fetchPullRequests(
       variables: (cursorArg ? { owner, name, after: cursorArg } : { owner, name }) as Record<string, string>,
     }), opts.state);
 
-    const connection: any = data?.repository?.pullRequests;
-    if (!connection) throw new Error("GitHub repository is unavailable");
-    collected.push(...(connection.nodes ?? []));
+    // Distinguish "this repository is gone" from "this request did not come
+    // back cleanly". Only the former may be classified as skipped-and-continued
+    // by a fleet-wide sync; a transient failure must surface as an error rather
+    // than be silently filed alongside renamed and deleted repositories.
+    if (!data?.repository) throw new Error("GitHub repository is unavailable");
+    const connection: any = data.repository.pullRequests;
+    if (!connection) throw new Error("GitHub GraphQL returned no pull request connection");
+    collected.push(...collectPullRequestNodes(connection.nodes));
     if (!connection.pageInfo?.hasNextPage) break;
     after = connection.pageInfo.endCursor;
     if (!after) break;
@@ -292,7 +311,14 @@ function toPullRequestInput(repoId: number, pr: GraphqlPr): PullRequestInput {
 }
 
 export interface SyncPullRequestsResult {
+  /**
+   * Distinct pull requests synced. NOT the number of rows written: the same
+   * pull request is stored once per local checkout, so reporting rows would
+   * overstate a 3-PR repository as 69 on a remote checked out 23 times.
+   */
   synced: number;
+  /** Rows written across every checkout of this remote. */
+  rows_written: number;
   reconciled: number;
   repo_name: string;
   remote: string;
@@ -356,8 +382,10 @@ export function syncRemotePullRequests(
   // The complete open set is what reconciliation is judged against, so it is
   // never truncated by --limit. Open sets are small; closed history is not.
   const open = client.fetchPullRequests(ghRepo, { states: ["OPEN"], limit: OPEN_SET_CAP, state: caps });
-  // `state: "open"` means the caller only wants open pull requests, so the
-  // closed-history page is skipped rather than silently fetched anyway.
+  // `state` selects how much history to page, not which rows are written. The
+  // open set is always fetched because reconciliation is judged against it.
+  // "open" therefore skips the merged/closed page; "all" (the default),
+  // "closed" and "merged" all page it, since each needs closed history.
   const wantsClosedHistory = stateFilter !== "open" && limit > 0;
   const recent = wantsClosedHistory
     ? client.fetchPullRequests(ghRepo, { states: ["MERGED", "CLOSED"], limit, state: caps })
@@ -369,11 +397,11 @@ export function syncRemotePullRequests(
   const openNumbers = new Set(open.map((pr) => pr.number));
 
   const checkouts = listReposByRemote(remoteUrl);
-  let synced = 0;
+  let rows_written = 0;
   let reconciled = 0;
 
   for (const checkout of checkouts) {
-    synced += bulkInsertPullRequests(fetched.map((pr) => toPullRequestInput(checkout.id, pr)));
+    rows_written += bulkInsertPullRequests(fetched.map((pr) => toPullRequestInput(checkout.id, pr)));
   }
 
   if (reconcile && checkouts.length > 0) {
@@ -415,7 +443,8 @@ export function syncRemotePullRequests(
   }
 
   return {
-    synced,
+    synced: fetched.length,
+    rows_written,
     reconciled,
     repo_name: opts.repoName ?? ghRepo,
     remote: remoteUrl,
@@ -441,7 +470,7 @@ export function isMissingRepoError(message: string): boolean {
 
 export function syncAllGithubPRs(
   opts: { org?: string; limit?: number; state?: string; maxRepos?: number; reconcile?: boolean; client?: GithubPullRequestClient; onProgress?: (msg: string) => void } = {}
-): { total_synced: number; total_reconciled: number; repos_seen: number; repos_checked: number; repos_synced: number; remotes_seen: number; truncated: boolean; errors: string[]; skipped: string[] } {
+): { total_synced: number; total_rows_written: number; total_reconciled: number; repos_seen: number; repos_checked: number; repos_synced: number; remotes_seen: number; truncated: boolean; errors: string[]; skipped: string[] } {
   const { org, limit = 50, state, maxRepos, reconcile = true, client, onProgress } = opts;
 
   const repos = listAllRepos(org ? { org } : {})
@@ -463,6 +492,7 @@ export function syncAllGithubPRs(
   if (normalizedMaxRepos && entries.length > normalizedMaxRepos) entries = entries.slice(0, normalizedMaxRepos);
 
   let total_synced = 0;
+  let total_rows_written = 0;
   let total_reconciled = 0;
   let repos_synced = 0;
   const errors: string[] = [];
@@ -474,6 +504,7 @@ export function syncAllGithubPRs(
     try {
       const result = syncRemotePullRequests(remoteUrl, ghRepo, { limit, state, reconcile, client });
       total_synced += result.synced;
+      total_rows_written += result.rows_written;
       total_reconciled += result.reconciled;
       repos_synced++;
     } catch (err) {
@@ -489,6 +520,7 @@ export function syncAllGithubPRs(
 
   return {
     total_synced,
+    total_rows_written,
     total_reconciled,
     repos_seen,
     repos_checked: entries.length,

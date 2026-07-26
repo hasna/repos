@@ -1150,7 +1150,7 @@ program
         if (opts.json) {
           console.log(JSON.stringify(result));
         } else {
-          console.log(chalk.green(`✓ Synced ${result.synced} PRs for ${result.repo_name} across ${result.checkouts} checkout(s), reconciled ${result.reconciled}`));
+          console.log(chalk.green(`✓ Synced ${result.synced} PRs for ${result.repo_name} (${result.rows_written} rows across ${result.checkouts} checkout(s)), reconciled ${result.reconciled}`));
           if (!result.merge_state_available) {
             console.log(chalk.yellow("  merge_state_status unavailable (preview header refused); other gate fields indexed"));
           }
@@ -1169,7 +1169,7 @@ program
       if (opts.json) {
         console.log(JSON.stringify(result));
       } else {
-        console.log(chalk.green(`\n✓ Synced ${result.total_synced} PRs across ${result.repos_synced} remotes (${result.repos_seen} local checkouts), reconciled ${result.total_reconciled} to a terminal state`));
+        console.log(chalk.green(`\n✓ Synced ${result.total_synced} PRs across ${result.repos_synced} remotes (${result.total_rows_written} rows over ${result.repos_seen} local checkouts), reconciled ${result.total_reconciled} to a terminal state`));
         if (result.errors.length > 0) {
           console.log(chalk.yellow(`  ${result.errors.length} errors (repos without GitHub remote)`));
         }
