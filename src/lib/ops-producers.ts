@@ -20,9 +20,17 @@ export interface TaskSeed {
 export interface RepoPrQueueItem {
   repo: {
     id: number;
+    /** Local directory name of the checkout — not the GitHub repository name. */
     name: string;
+    /** GitHub `owner/name`, resolved from the pull request itself. */
     full_name: string;
+    /** GitHub repository name, when the pull request identifies one. */
+    github_repo: string | null;
+    /** Local checkout's org. */
     org: string | null;
+    /** GitHub owner, resolved from the pull request itself. */
+    github_org: string | null;
+    /** Absolute path of the local checkout. */
     path: string;
   };
   pr: {
@@ -79,6 +87,14 @@ export interface PrQueueOptions {
   state?: string;
   limit?: number;
 }
+
+/**
+ * Placeholders for a pull request whose owning repo record has been deleted.
+ * Explicitly not-a-path and not-a-name, so nothing downstream mistakes them for
+ * a directory to cd into.
+ */
+const UNKNOWN_LOCAL_REPO = "unknown";
+const UNKNOWN_LOCAL_PATH = "";
 
 interface PrRow extends PullRequest {
   /** GitHub owner/name resolved from the pull request's own URL. */
@@ -143,7 +159,19 @@ export function buildPrQueue(options: PrQueueOptions = {}): RepoPrQueueResult {
         remainingRemotes -= result.repos_checked;
       }
     } else {
-      synced = syncAllGithubPRs({ org: options.org, limit, state, maxRepos: options.syncMaxRepos });
+      const result = syncAllGithubPRs({ org: options.org, limit, state, maxRepos: options.syncMaxRepos });
+      // Projected field by field rather than passed through: syncAllGithubPRs
+      // returns a superset, and emitting it directly gave this v1 payload a key
+      // set that depended on which branch produced it.
+      synced = {
+        repos_seen: result.repos_seen,
+        repos_checked: result.repos_checked,
+        repos_synced: result.repos_synced,
+        total_synced: result.total_synced,
+        truncated: result.truncated,
+        errors: result.errors,
+        skipped: result.skipped,
+      };
     }
   }
 
@@ -1048,13 +1076,19 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
   return {
     repo: {
       id: row.repo_id,
-      // The GitHub repository name, falling back to the local directory name.
-      // `Repository: <path>` is read by routing, so an orphaned row must not
-      // render the string "null".
-      name: row.repo ?? row.repo_name ?? fullName.split("/")[1] ?? "unknown",
+      // `name`, `org` and `path` describe the LOCAL checkout and keep their
+      // v1 meaning: `name` is the directory on disk, which is routinely
+      // different from the GitHub repository name (github.com/hasna/emails is
+      // checked out as open-emails). Redefining it to the GitHub name would
+      // leave `name` and `path` describing different things and break any
+      // consumer that uses `name` to locate a checkout. The GitHub identity is
+      // carried by `full_name`, and `github_repo` below exposes it on its own.
+      name: row.repo_name ?? UNKNOWN_LOCAL_REPO,
       full_name: fullName,
-      org: row.org ?? row.repo_org,
-      path: row.repo_path ?? "",
+      github_repo: row.repo ?? null,
+      org: row.repo_org,
+      github_org: row.org ?? null,
+      path: row.repo_path ?? UNKNOWN_LOCAL_PATH,
     },
     pr: {
       number: row.number,
@@ -1073,7 +1107,9 @@ function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
       fingerprint: `github-pr:${fullName}#${row.number}`,
       title: `Review and safely merge ${fullName}#${row.number}: ${row.title}`,
       body: [
-        `Repository: ${row.repo_path}`,
+        // Routing reads this path, so an orphaned row must not render the
+        // string "null" as though it were a directory.
+        `Repository: ${row.repo_path ?? UNKNOWN_LOCAL_PATH}`,
         `PR: ${prUrl}`,
         `GitHub author is ${row.author}`,
         `Base: ${row.base_branch ?? "unknown"}`,

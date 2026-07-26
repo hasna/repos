@@ -88,6 +88,25 @@ describe("cross-checkout de-duplication", () => {
     expect(isDerivedCheckoutPath(rows[0]!.repo_path!)).toBe(false);
   });
 
+  it("classifies derived paths identically in SQL and in TypeScript", () => {
+    // SQLite LIKE is ASCII case-insensitive and JS RegExp is not, so a
+    // case-variant marker used to be derived to one and primary to the other.
+    expect(isDerivedCheckoutPath("/home/u/WorkTrees/codewith/a")).toBe(true);
+    expect(isDerivedCheckoutPath("/home/u/worktrees/codewith/a")).toBe(true);
+    expect(isDerivedCheckoutPath("/DEV/SHM/build/codewith")).toBe(true);
+    expect(isDerivedCheckoutPath("/home/u/workspace/open-codewith")).toBe(false);
+    // Not a path segment, so not derived.
+    expect(isDerivedCheckoutPath("/home/u/workspace/my-worktrees-notes")).toBe(false);
+
+    const primary = upsertRepo({ path: "/home/u/workspace/open-codewith", name: "open-codewith", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const cased = upsertRepo({ path: "/home/u/WorkTrees/codewith/a", name: "a", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    for (const id of [cased.id, primary.id]) {
+      bulkInsertPullRequests([pr({ repo_id: id, number: 90, updated_at: "2026-07-26T01:00:00Z" })]);
+    }
+    // The SQL term must agree, or the case-variant worktree wins the tiebreak.
+    expect(listPullRequestsWithRepo({ state: "open" })[0]!.repo_path).toBe("/home/u/workspace/open-codewith");
+  });
+
   it("falls back to a worktree only when no primary clone holds the PR", () => {
     const wt = upsertRepo({ path: "/home/u/.hasna/repos/worktrees/codewith/only", name: "only", org: "hasna", remote_url: "github.com/hasna/codewith" });
     bulkInsertPullRequests([pr({ repo_id: wt.id, number: 7 })]);
@@ -95,6 +114,34 @@ describe("cross-checkout de-duplication", () => {
     const rows = listPullRequestsWithRepo({ state: "open" });
     expect(rows).toHaveLength(1);
     expect(rows[0]!.repo_path).toBe("/home/u/.hasna/repos/worktrees/codewith/only");
+  });
+
+  it("resolves an equal-timestamp state disagreement the same way regardless of which copy is a worktree", () => {
+    // Reachable, not theoretical: applyPullRequestTerminalStates writes
+    // `updated_at = COALESCE(?, updated_at)`, so a row reconciled from a GitHub
+    // response with a null updatedAt flips state while keeping its old
+    // timestamp — leaving copies tied on the ranking key but disagreeing on
+    // state. If the path preference outranked the state test, the answer would
+    // depend purely on which of the two happened to be the worktree.
+    const stamp = "2026-07-20T00:00:00Z";
+    const primaryOpen = upsertRepo({ path: "/w/primary-a", name: "primary-a", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const worktreeMerged = upsertRepo({ path: "/w/worktrees/codewith/a", name: "a", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    bulkInsertPullRequests([
+      pr({ repo_id: primaryOpen.id, number: 60, state: "open", updated_at: stamp }),
+      pr({ repo_id: worktreeMerged.id, number: 60, state: "merged", merged_at: stamp, updated_at: stamp }),
+    ]);
+    expect(listPullRequests({})[0]!.state).toBe("merged");
+
+    // Mirror image: the terminal copy is now the primary clone. The answer must
+    // be identical.
+    const worktreeOpen = upsertRepo({ path: "/w/worktrees/codewith/b", name: "b", org: "hasna", remote_url: "github.com/hasna/other" });
+    const primaryMerged = upsertRepo({ path: "/w/primary-b", name: "primary-b", org: "hasna", remote_url: "github.com/hasna/other" });
+    const url = "https://github.com/hasna/other/pull/61";
+    bulkInsertPullRequests([
+      pr({ repo_id: worktreeOpen.id, number: 61, url, state: "open", updated_at: stamp }),
+      pr({ repo_id: primaryMerged.id, number: 61, url, state: "merged", merged_at: stamp, updated_at: stamp }),
+    ]);
+    expect(listPullRequests({ repo_name: "other" })[0]!.state).toBe("merged");
   });
 
   it("does not let the primary preference override fresher data", () => {

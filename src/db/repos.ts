@@ -179,18 +179,38 @@ export function getRepoByRemote(remote: string, opts: { allowAmbiguous?: boolean
 const DERIVED_CHECKOUT_SEGMENTS = ["worktrees", ".worktrees"] as const;
 const DERIVED_CHECKOUT_PREFIXES = ["/dev/shm/"] as const;
 
+/**
+ * SQLite's LIKE is ASCII case-insensitive and treats `%` and `_` as wildcards.
+ * The TypeScript predicate has to match that exactly, so the markers are
+ * required to be plain ASCII with no LIKE metacharacters and both sides compare
+ * case-insensitively. `node_modules` is the obvious future marker, and its `_`
+ * would silently become a wildcard — so this fails loudly at load instead.
+ */
+function assertLikeSafeMarker(marker: string): string {
+  if (!/^[A-Za-z0-9./-]+$/.test(marker)) {
+    throw new Error(`derived-checkout marker '${marker}' must be ASCII and free of LIKE metacharacters`);
+  }
+  return marker;
+}
+
+for (const marker of [...DERIVED_CHECKOUT_SEGMENTS, ...DERIVED_CHECKOUT_PREFIXES]) {
+  assertLikeSafeMarker(marker);
+}
+
 /** Paths that are copies of a checkout rather than the checkout itself. */
 export function isDerivedCheckoutPath(path: string): boolean {
+  const lower = path.toLowerCase();
   const segments = DERIVED_CHECKOUT_SEGMENTS.some((segment) => {
-    const escaped = segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(^|/)${escaped}/`).test(path);
+    const escaped = segment.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|/)${escaped}/`).test(lower);
   });
-  return segments || DERIVED_CHECKOUT_PREFIXES.some((prefix) => path.startsWith(prefix));
+  return segments || DERIVED_CHECKOUT_PREFIXES.some((prefix) => lower.startsWith(prefix.toLowerCase()));
 }
 
 /**
  * SQL ordering term that sorts primary clones (0) ahead of derived copies (1).
- * The markers contain no LIKE metacharacters, so they inline safely.
+ * Kept in lockstep with isDerivedCheckoutPath by construction: same markers,
+ * same case-insensitive comparison, metacharacters rejected at load.
  */
 function derivedCheckoutRankSql(column: string): string {
   const tests = [
@@ -468,26 +488,33 @@ export interface ListPullRequestOptions extends ListOptions {
  *      terminal state first would keep reporting a reopened PR as closed. The
  *      merge/close/create timestamps stand in when `updated_at` is missing, so
  *      a terminal row without one is not ranked as though it had no history;
- *   3. a primary clone over a worktree or throwaway build copy. The winning
- *      row's `path` is what downstream consumers route work to, and a sync
- *      writes every checkout of a remote in one pass, so copies normally tie on
- *      the timestamp above and this is what actually decides. Without it the
- *      final `id DESC` tiebreak systematically selects the newest-indexed row,
- *      which is a worktree — pointing callers at another task's working
- *      directory;
- *   4. a terminal state over `open`, to break ties when copies share a
+ *   3. a terminal state over `open`, to break ties when copies share a
  *      timestamp — `open` is the value that goes stale when a copy stops being
- *      synced, whereas `merged`/`closed` carry a timestamp from GitHub;
- *   5. the newest row id, so the ordering is always total and deterministic.
+ *      synced, whereas `merged`/`closed` carry a timestamp from GitHub. This
+ *      MUST stay above the path preference: reconciliation writes
+ *      `updated_at = COALESCE(?, updated_at)`, so a row whose GitHub
+ *      `updatedAt` came back null flips state while keeping its old timestamp,
+ *      leaving copies tied on the key above but disagreeing on state. Ranking
+ *      the path first would resolve that disagreement differently depending on
+ *      which copy happened to be a worktree;
+ *   4. a primary clone over a worktree or throwaway build copy. The winning
+ *      row's `path` is what downstream consumers route work to, and a sync
+ *      writes every checkout of a remote in one pass, so copies normally agree
+ *      on state and this is what actually decides. Without it the final id
+ *      tiebreak systematically selected a worktree — pointing callers at
+ *      another task's working directory;
+ *   5. the LOWEST row id. Among otherwise indistinguishable copies the
+ *      earliest-indexed one is the original clone; recency buys nothing here
+ *      and picking it routes work to whichever side clone was added last.
  */
 const PR_RANK_ORDER = `
   CASE WHEN url IS NOT NULL AND owner_remote IS NOT NULL
          AND url LIKE 'https://' || replace(replace(owner_remote, '\\', '\\\\'), '_', '\\_') || '/pull/%'
          ESCAPE '\\' THEN 0 ELSE 1 END,
   COALESCE(updated_at, merged_at, closed_at, created_at, '') DESC,
-  ${derivedCheckoutRankSql("owner_path")},
   CASE WHEN state = 'open' THEN 1 ELSE 0 END,
-  id DESC`;
+  ${derivedCheckoutRankSql("owner_path")},
+  id ASC`;
 
 /**
  * Partition on the PR's own URL, which is stable across every local checkout of

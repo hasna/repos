@@ -159,7 +159,13 @@ describe("ops producers", () => {
     const item = buildPrQueue({ org: "hasna" }).items[0]!;
     expect(item.repo.full_name).toBe("hasna/aicopilot");
     expect(item.task_seed.fingerprint).toBe("github-pr:hasna/aicopilot#9");
-    expect(item.repo.org).toBe("hasna");
+    expect(item.repo.github_org).toBe("hasna");
+    expect(item.repo.github_repo).toBe("aicopilot");
+    // The local-checkout fields keep describing the checkout on disk, so
+    // `name`/`org`/`path` stay internally consistent with each other.
+    expect(item.repo.name).toBe("platform-aicopilot");
+    expect(item.repo.org).toBe("hasnatools");
+    expect(item.repo.path).toBe("/workspace/platform-aicopilot");
   });
 
   test("scopes the queue by the org that owns the PR, not the repo record's org", () => {

@@ -174,8 +174,17 @@ function graphqlWithOptionalMergeState<T>(build: (withMergeState: boolean) => { 
  */
 export function collectPullRequestNodes(nodes: unknown): GraphqlPr[] {
   if (!Array.isArray(nodes)) return [];
-  return nodes.filter((node): node is GraphqlPr =>
-    Boolean(node) && typeof node === "object" && typeof (node as GraphqlPr).number === "number");
+  return nodes.filter((node): node is GraphqlPr => {
+    if (!node || typeof node !== "object") return false;
+    const pr = node as Partial<GraphqlPr>;
+    // Everything the writer stores into a NOT NULL column is required here, so
+    // a half-resolved node is dropped at the boundary rather than aborting a
+    // write transaction further in.
+    return typeof pr.number === "number" && Number.isSafeInteger(pr.number) && pr.number > 0
+      && typeof pr.title === "string"
+      && typeof pr.createdAt === "string" && pr.createdAt !== ""
+      && typeof pr.state === "string" && pr.state !== "";
+  });
 }
 
 export function fetchPullRequests(
