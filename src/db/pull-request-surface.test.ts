@@ -13,6 +13,7 @@ import {
   countRepos,
   listPullRequestsWithRepo,
   isDerivedCheckoutPath,
+  assertLikeSafeMarker,
   AmbiguousRemoteError,
   type PullRequestInput,
 } from "./repos";
@@ -447,5 +448,22 @@ describe("remote identity preservation", () => {
     const repo = upsertRepo({ path: "/w/x", name: "x", remote_url: "github.com/hasna/x" });
     const updated = upsertRepo({ path: repo.path, name: repo.name, remote_url: "file:///tmp/x" });
     expect(updated.remote_url).toBeNull();
+  });
+});
+
+describe("derived-checkout marker safety", () => {
+  it("accepts the markers the ranking actually uses", () => {
+    expect(assertLikeSafeMarker("worktrees")).toBe("worktrees");
+    expect(assertLikeSafeMarker(".worktrees")).toBe(".worktrees");
+    expect(assertLikeSafeMarker("/dev/shm/")).toBe("/dev/shm/");
+  });
+
+  it("rejects a marker whose LIKE metacharacters would become wildcards", () => {
+    // node_modules is the plausible next marker and its underscore would match
+    // any character, silently classifying unrelated paths as derived.
+    expect(() => assertLikeSafeMarker("node_modules")).toThrow(/LIKE metacharacters/);
+    expect(() => assertLikeSafeMarker("build%")).toThrow(/LIKE metacharacters/);
+    expect(() => assertLikeSafeMarker("wörktrees")).toThrow(/ASCII/);
+    expect(() => assertLikeSafeMarker("")).toThrow();
   });
 });

@@ -186,7 +186,7 @@ const DERIVED_CHECKOUT_PREFIXES = ["/dev/shm/"] as const;
  * case-insensitively. `node_modules` is the obvious future marker, and its `_`
  * would silently become a wildcard — so this fails loudly at load instead.
  */
-function assertLikeSafeMarker(marker: string): string {
+export function assertLikeSafeMarker(marker: string): string {
   if (!/^[A-Za-z0-9./-]+$/.test(marker)) {
     throw new Error(`derived-checkout marker '${marker}' must be ASCII and free of LIKE metacharacters`);
   }
@@ -503,9 +503,35 @@ export interface ListPullRequestOptions extends ListOptions {
  *      on state and this is what actually decides. Without it the final id
  *      tiebreak systematically selected a worktree — pointing callers at
  *      another task's working directory;
- *   5. the LOWEST row id. Among otherwise indistinguishable copies the
- *      earliest-indexed one is the original clone; recency buys nothing here
- *      and picking it routes work to whichever side clone was added last.
+ *   5. the LOWEST pull request row id.
+ *
+ *      This is `pull_requests.id` — the id of the PR ROW, not of the owning
+ *      repo record. It therefore orders by which checkout first acquired this
+ *      pull request, which turns out to be an accidental but real liveness
+ *      signal: a repo record that stopped being synced never acquires an early
+ *      row for a recent PR.
+ *
+ *      Two seemingly better signals were measured end-to-end against the live
+ *      index (758 pull requests) and both are WORSE. Counting winners whose
+ *      `path` no longer exists on disk: this rule 31, `last_scanned DESC` 38,
+ *      `owner_id ASC` 43.
+ *
+ *      `last_scanned` looks like the right answer and is not, because it
+ *      records when the scanner last VISITED a path, not whether that path
+ *      still exists — a vanished checkout keeps the timestamp from its final
+ *      successful visit. Live and dead rows are ~2.6 days apart with heavily
+ *      overlapping distributions, and because the rules above resolve most
+ *      comparisons first, this rule only fires on checkouts scanned in the same
+ *      pass, where the timestamps differ by seconds of directory-walk order.
+ *      One remote, hasnaxyz/iapp-wallets, has a dead checkout that beats its
+ *      live one by 1.7 seconds.
+ *
+ *      None of these is a real fix. 273 of 524 remote-bearing repo records
+ *      point at paths that no longer exist, and no ordering over a proxy can
+ *      repair that — the index needs to record path existence directly, after
+ *      which any tiebreak works. Measure end-to-end before changing this rule:
+ *      evaluating a candidate tiebreak in isolation is misleading, because the
+ *      rules above it decide most cases first.
  */
 const PR_RANK_ORDER = `
   CASE WHEN url IS NOT NULL AND owner_remote IS NOT NULL
