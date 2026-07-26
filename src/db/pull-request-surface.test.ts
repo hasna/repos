@@ -13,6 +13,7 @@ import {
   countRepos,
   listPullRequestsWithRepo,
   isDerivedCheckoutPath,
+  assertLikeSafeMarker,
   AmbiguousRemoteError,
   type PullRequestInput,
 } from "./repos";
@@ -105,6 +106,60 @@ describe("cross-checkout de-duplication", () => {
     }
     // The SQL term must agree, or the case-variant worktree wins the tiebreak.
     expect(listPullRequestsWithRepo({ state: "open" })[0]!.repo_path).toBe("/home/u/workspace/open-codewith");
+  });
+
+  it("prefers the most recently scanned checkout once the other criteria tie", () => {
+    // The real casualty of ranking on row id: hasna/hasna-xyz-infra has 7
+    // checkouts and no primary clone, so the path criterion ties them all and
+    // the id tiebreak took the OLDEST — a /dev/shm recovery copy wiped on
+    // reboot — over a live worktree scanned the same day.
+    const dead = upsertRepo({
+      path: "/dev/shm/hasna-recovery/repos/infra", name: "infra", org: "hasna",
+      remote_url: "github.com/hasna/infra", last_scanned: "2026-07-10T00:00:00Z",
+    });
+    const live = upsertRepo({
+      path: "/home/u/.hasna/repos/worktrees/infra/roa-00001-pr63", name: "roa-00001-pr63", org: "hasna",
+      remote_url: "github.com/hasna/infra", last_scanned: "2026-07-26T00:00:00Z",
+    });
+    const url = "https://github.com/hasna/infra/pull/63";
+    for (const id of [dead.id, live.id]) {
+      bulkInsertPullRequests([pr({ repo_id: id, number: 63, url, updated_at: "2026-07-26T01:00:00Z" })]);
+    }
+
+    const row = listPullRequestsWithRepo({ state: "open" })[0]!;
+    expect(row.repo_path).toBe("/home/u/.hasna/repos/worktrees/infra/roa-00001-pr63");
+  });
+
+  it("keeps last_scanned below the primary-clone preference", () => {
+    // A freshly scanned worktree must still not outrank a primary clone.
+    const primary = upsertRepo({
+      path: "/home/u/workspace/open-infra", name: "open-infra", org: "hasna",
+      remote_url: "github.com/hasna/infra", last_scanned: "2026-07-01T00:00:00Z",
+    });
+    const worktree = upsertRepo({
+      path: "/home/u/.hasna/repos/worktrees/infra/recent", name: "recent", org: "hasna",
+      remote_url: "github.com/hasna/infra", last_scanned: "2026-07-26T00:00:00Z",
+    });
+    const url = "https://github.com/hasna/infra/pull/70";
+    for (const id of [primary.id, worktree.id]) {
+      bulkInsertPullRequests([pr({ repo_id: id, number: 70, url, updated_at: "2026-07-26T01:00:00Z" })]);
+    }
+
+    expect(listPullRequestsWithRepo({ state: "open" })[0]!.repo_path).toBe("/home/u/workspace/open-infra");
+  });
+
+  it("stays deterministic when checkouts have never been scanned", () => {
+    const first = upsertRepo({ path: "/w/a-first", name: "a-first", org: "hasna", remote_url: "github.com/hasna/infra" });
+    const second = upsertRepo({ path: "/w/b-second", name: "b-second", org: "hasna", remote_url: "github.com/hasna/infra" });
+    const url = "https://github.com/hasna/infra/pull/80";
+    for (const id of [second.id, first.id]) {
+      bulkInsertPullRequests([pr({ repo_id: id, number: 80, url, updated_at: "2026-07-26T01:00:00Z" })]);
+    }
+
+    // Null last_scanned ties, so the lowest OWNING REPO id decides — the repo
+    // record's id, not the pull request row's.
+    expect(listPullRequestsWithRepo({ state: "open" })[0]!.repo_path).toBe("/w/a-first");
+    expect(first.id).toBeLessThan(second.id);
   });
 
   it("falls back to a worktree only when no primary clone holds the PR", () => {
@@ -447,5 +502,22 @@ describe("remote identity preservation", () => {
     const repo = upsertRepo({ path: "/w/x", name: "x", remote_url: "github.com/hasna/x" });
     const updated = upsertRepo({ path: repo.path, name: repo.name, remote_url: "file:///tmp/x" });
     expect(updated.remote_url).toBeNull();
+  });
+});
+
+describe("derived-checkout marker safety", () => {
+  it("accepts the markers the ranking actually uses", () => {
+    expect(assertLikeSafeMarker("worktrees")).toBe("worktrees");
+    expect(assertLikeSafeMarker(".worktrees")).toBe(".worktrees");
+    expect(assertLikeSafeMarker("/dev/shm/")).toBe("/dev/shm/");
+  });
+
+  it("rejects a marker whose LIKE metacharacters would become wildcards", () => {
+    // node_modules is the plausible next marker and its underscore would match
+    // any character, silently classifying unrelated paths as derived.
+    expect(() => assertLikeSafeMarker("node_modules")).toThrow(/LIKE metacharacters/);
+    expect(() => assertLikeSafeMarker("build%")).toThrow(/LIKE metacharacters/);
+    expect(() => assertLikeSafeMarker("wörktrees")).toThrow(/ASCII/);
+    expect(() => assertLikeSafeMarker("")).toThrow();
   });
 });
