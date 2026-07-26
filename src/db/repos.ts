@@ -503,17 +503,35 @@ export interface ListPullRequestOptions extends ListOptions {
  *      on state and this is what actually decides. Without it the final id
  *      tiebreak systematically selected a worktree — pointing callers at
  *      another task's working directory;
- *   5. the most recently scanned checkout. Once the criteria above tie, what
- *      remains is choosing between checkouts of equal standing, and the only
- *      question that matters is which one still exists: 288 of 1248 indexed
- *      repos point at paths that are gone. `last_scanned` answers that
- *      directly, whereas row id merely records insertion order and correlates
- *      with liveness by accident. Measured across the 37 multi-checkout remotes
- *      that have at least one live path, the winner is a dead path for 3
- *      remotes by last_scanned, 7 by lowest id and 4 by highest id;
- *   6. the LOWEST owning repo id, purely so the ordering is total. Note this is
- *      the repo record's id, not the pull request row's — the pull request id
- *      records when a row was written, which says nothing about the checkout.
+ *   5. the LOWEST pull request row id.
+ *
+ *      This is `pull_requests.id` — the id of the PR ROW, not of the owning
+ *      repo record. It therefore orders by which checkout first acquired this
+ *      pull request, which turns out to be an accidental but real liveness
+ *      signal: a repo record that stopped being synced never acquires an early
+ *      row for a recent PR.
+ *
+ *      Two seemingly better signals were measured end-to-end against the live
+ *      index (758 pull requests) and both are WORSE. Counting winners whose
+ *      `path` no longer exists on disk: this rule 31, `last_scanned DESC` 38,
+ *      `owner_id ASC` 43.
+ *
+ *      `last_scanned` looks like the right answer and is not, because it
+ *      records when the scanner last VISITED a path, not whether that path
+ *      still exists — a vanished checkout keeps the timestamp from its final
+ *      successful visit. Live and dead rows are ~2.6 days apart with heavily
+ *      overlapping distributions, and because the rules above resolve most
+ *      comparisons first, this rule only fires on checkouts scanned in the same
+ *      pass, where the timestamps differ by seconds of directory-walk order.
+ *      One remote, hasnaxyz/iapp-wallets, has a dead checkout that beats its
+ *      live one by 1.7 seconds.
+ *
+ *      None of these is a real fix. 273 of 524 remote-bearing repo records
+ *      point at paths that no longer exist, and no ordering over a proxy can
+ *      repair that — the index needs to record path existence directly, after
+ *      which any tiebreak works. Measure end-to-end before changing this rule:
+ *      evaluating a candidate tiebreak in isolation is misleading, because the
+ *      rules above it decide most cases first.
  */
 const PR_RANK_ORDER = `
   CASE WHEN url IS NOT NULL AND owner_remote IS NOT NULL
@@ -522,8 +540,6 @@ const PR_RANK_ORDER = `
   COALESCE(updated_at, merged_at, closed_at, created_at, '') DESC,
   CASE WHEN state = 'open' THEN 1 ELSE 0 END,
   ${derivedCheckoutRankSql("owner_path")},
-  COALESCE(owner_last_scanned, '') DESC,
-  COALESCE(owner_id, 0) ASC,
   id ASC`;
 
 /**
@@ -556,15 +572,13 @@ function buildPullRequestQuery(opts: ListPullRequestOptions): { cte: string; par
   const cte = duplicates
     ? `WITH candidate AS (
          SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org,
-                r.name AS owner_name, r.path AS owner_path,
-                r.last_scanned AS owner_last_scanned, r.id AS owner_id
+                r.name AS owner_name, r.path AS owner_path
          FROM pull_requests p LEFT JOIN repos r ON r.id = p.repo_id
          ${whereClause}
        ), ranked AS (SELECT candidate.*, 1 AS rn FROM candidate)`
     : `WITH candidate AS (
          SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org,
-                r.name AS owner_name, r.path AS owner_path,
-                r.last_scanned AS owner_last_scanned, r.id AS owner_id
+                r.name AS owner_name, r.path AS owner_path
          FROM pull_requests p LEFT JOIN repos r ON r.id = p.repo_id
          ${whereClause}
        ), ranked AS (
