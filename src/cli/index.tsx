@@ -38,6 +38,7 @@ import {
   startAutoIndexWorker,
 } from "../lib/auto-index.js";
 import { getFilterAlias } from "../lib/config.js";
+import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
 import { getReposStatus } from "../lib/status.js";
 import { formatRepoNotFoundMessage } from "./messages.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
@@ -495,7 +496,14 @@ function resolveTargetRepo(name: string | undefined, opts: any) {
       throw error;
     }
     if (!repo) {
-      console.error(chalk.red(`No indexed repo has remote '${opts.remote}'`));
+      // Echo only the sanitized identity, never the caller's raw argument: a
+      // rejected remote is exactly the case where the input may still carry
+      // embedded credentials (https://user:token@host/org/repo).
+      const safe = sanitizeRemoteIdentity(opts.remote)
+        ?? sanitizeRemoteIdentity(`github.com/${String(opts.remote).replace(/^\/+/, "")}`);
+      console.error(chalk.red(safe
+        ? `No indexed repo has remote '${safe}'`
+        : "No indexed repo matched --remote (value was not a usable host/org/name identity)"));
       process.exit(1);
     }
     return repo;
@@ -1953,8 +1961,10 @@ program
  */
 function resolveRepoPath(name: string | undefined, opts: any): string {
   if (opts.remote || opts.exact) {
-    const repo = resolveTargetRepo(opts.remote ? undefined : name, opts);
-    return repo.path;
+    // `name` is passed through even alongside --remote so that supplying both
+    // is rejected here exactly as it is for `repo`/`show`/`inspect`, rather
+    // than the positional being silently ignored.
+    return resolveTargetRepo(name, opts).path;
   }
   if (!name) {
     console.error("Repo not found");

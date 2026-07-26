@@ -43,7 +43,15 @@ export type {
 } from "./lib/auto-index.js";
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
 export { discoverRepos, scanRepoPaths, scanRepos, watchRepos } from "./lib/scanner.js";
-export { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "./lib/github.js";
+export {
+  syncGithubPRs,
+  syncAllGithubPRs,
+  syncRemotePullRequests,
+  fetchRepoMetadata,
+  parseGithubRemote,
+  type GithubPullRequestClient,
+  type SyncPullRequestsResult,
+} from "./lib/github.js";
 export {
   applyGithubCatalogFilter,
   enumerateGithubRepoCatalog,
@@ -90,10 +98,18 @@ export {
   listBranches,
   listTags,
   listPullRequests,
+  listPullRequestsWithRepo,
+  countPullRequests,
+  countRepos,
+  getRepoByRemote,
+  listReposByRemote,
   searchAll,
   getRepoStats,
   getGlobalStats,
   AmbiguousRepoNameError,
+  AmbiguousRemoteError,
+  type ListPullRequestOptions,
+  type PullRequestInput,
 } from "./db/repos.js";
 export {
   buildDependencyRefresh,

@@ -9,6 +9,7 @@ import {
   listBranches,
   listTags,
   listPullRequests,
+  countPullRequests,
   searchPullRequests,
   searchAll,
   getRepoStats,
@@ -279,26 +280,39 @@ server.tool("list_tags", "List git tags", {
 
 // ── Pull Requests ──
 
-server.tool("list_prs", "List pull requests", {
+server.tool("list_prs", "List pull requests, one row per pull request", {
   repo_id: z.number().optional().describe("Filter by repo ID"),
+  org: z.string().optional().describe("Filter by GitHub owner, resolved from each PR's URL"),
+  repo_name: z.string().optional().describe("Filter by GitHub repository name, resolved from each PR's URL"),
   state: z.string().optional().describe("Filter by state: open, closed, merged"),
   author: z.string().optional().describe("Filter by author"),
+  duplicates: z.boolean().optional().describe("Emit one row per local checkout instead of one row per PR"),
   limit: limitArg("Max results (default 20 compact, 50 verbose)"),
   offset: offsetArg(),
   verbose: z.boolean().optional().describe("Return full PR records instead of compact summaries"),
 }, async (args) => {
   const limit = compactLimit(args, 50);
   const prs = listPullRequests({ ...args, limit });
+  const total = countPullRequests(args);
   if (args.verbose) return textResponse(prs);
   return textResponse(compactPage("pull_requests", prs, { ...args, limit, pageable: true }, (pr) => ({
     id: pr.id,
     repo_id: pr.repo_id,
+    org: pr.org,
+    repo: pr.repo,
     number: pr.number,
     title: compactText(pr.title, 140),
     state: pr.state,
     author: pr.author,
     created_at: pr.created_at,
-  }), "Set verbose=true for branch names, URLs, and diff stats"));
+    // The fields a merge gate needs, so callers do not have to ask twice.
+    head_sha: pr.head_sha,
+    mergeable: pr.mergeable,
+    merge_state_status: pr.merge_state_status,
+    ci_state: pr.ci_state,
+    is_draft: pr.is_draft,
+    review_decision: pr.review_decision,
+  }), `${total} match this filter. Set verbose=true for branch names, URLs, and diff stats`));
 });
 
 server.tool("search_prs", "Full-text search on PR titles", {
@@ -521,7 +535,7 @@ server.tool("release_pipeline_parity", "Check the standard ci.yml + tag-publish 
 server.tool("sync_github_prs", "Sync PRs from GitHub for a specific repo", {
   repo: z.string().describe("Repo name, path, or ID"),
   limit: limitArg("Max PRs to fetch (default 100)"),
-  state: z.string().optional().describe("PR state: all, open, closed (default all)"),
+  state: z.string().optional().describe("PR state to fetch: 'all' (default) also pages merged/closed history; 'open' fetches only the open set"),
 }, async ({ repo, limit, state }) => {
   try {
     const result = syncGithubPRs(repo, { limit, state });

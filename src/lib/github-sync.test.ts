@@ -183,7 +183,44 @@ describe("sync reconciliation", () => {
     expect(result.reconciled).toBe(3);
     // One open fetch plus one closed-history fetch, regardless of checkout count.
     expect(client.fetchCalls).toBe(2);
+    // And exactly ONE state-reconciliation query for the whole remote. Asking
+    // per checkout would re-send the same question once per local directory;
+    // this machine has a remote checked out 115 times.
+    expect(client.stateQueries).toEqual([[1]]);
     expect(countPullRequests({ state: "open", duplicates: true })).toBe(0);
+  });
+
+  it("asks GitHub once for the union of stale numbers across checkouts", () => {
+    const a = upsertRepo({ path: "/w/a", name: "a", org: "hasna", remote_url: "github.com/hasna/codewith" }).id;
+    const b = upsertRepo({ path: "/w/b", name: "b", org: "hasna", remote_url: "github.com/hasna/codewith" }).id;
+    // The checkouts disagree about which PRs they still call open.
+    seedPr(a, 1); seedPr(a, 2);
+    seedPr(b, 2); seedPr(b, 3);
+
+    const client = stubClient({
+      open: [],
+      states: {
+        1: { state: "MERGED", mergedAt: "2026-07-10T00:00:00Z", closedAt: null, updatedAt: "2026-07-10T00:00:00Z" },
+        2: { state: "CLOSED", mergedAt: null, closedAt: "2026-07-11T00:00:00Z", updatedAt: "2026-07-11T00:00:00Z" },
+        3: { state: "MERGED", mergedAt: "2026-07-12T00:00:00Z", closedAt: null, updatedAt: "2026-07-12T00:00:00Z" },
+      },
+    });
+    const result = syncRemotePullRequests("github.com/hasna/codewith", "hasna/codewith", { client });
+
+    expect(client.stateQueries).toEqual([[1, 2, 3]]);
+    expect(result.reconciled).toBe(4);
+    expect(countPullRequests({ state: "open", duplicates: true })).toBe(0);
+  });
+
+  it("skips the closed-history fetch when the caller only wants open PRs", () => {
+    upsertRepo({ path: "/w/codewith", name: "codewith", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const client = stubClient({ open: [ghPr(1)], closed: [ghPr(9, { state: "MERGED", mergedAt: "2026-07-01T00:00:00Z" })] });
+
+    syncRemotePullRequests("github.com/hasna/codewith", "hasna/codewith", { client, state: "open" });
+
+    // Only the open-set fetch, not the merged/closed page.
+    expect(client.fetchCalls).toBe(1);
+    expect(countPullRequests({ state: "merged" })).toBe(0);
   });
 
   it("stores the merge-gate fields the GraphQL connection returns", () => {
@@ -234,11 +271,19 @@ describe("syncAllGithubPRs fan-out", () => {
     }
     upsertRepo({ path: "/w/other", name: "other", org: "hasna", remote_url: "github.com/hasna/repos" });
 
-    const result = syncAllGithubPRs({ org: "hasna", limit: 0 });
+    // A stub client keeps this hermetic — without one the call would spawn real
+    // `gh api graphql` subprocesses and pass only because the failures land in
+    // result.errors, which nothing asserts on.
+    const client = stubClient({ open: [] });
+    const result = syncAllGithubPRs({ org: "hasna", limit: 0, client });
 
+    expect(result.errors).toEqual([]);
+    expect(result.skipped).toEqual([]);
     expect(result.repos_seen).toBe(4);
     expect(result.remotes_seen).toBe(2);
     expect(result.repos_checked).toBe(2);
+    // Two distinct remotes behind four checkouts, so two open-set fetches.
+    expect(client.fetchCalls).toBe(2);
   });
 });
 

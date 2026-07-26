@@ -425,6 +425,8 @@ export interface ListPullRequestOptions extends ListOptions {
    * one of its pull requests N times.
    */
   duplicates?: boolean;
+  /** Sort key: newest created (default) or most recently updated. */
+  orderBy?: "created" | "updated";
 }
 
 /**
@@ -433,16 +435,23 @@ export interface ListPullRequestOptions extends ListOptions {
  *
  *   1. the row whose owning repo record's remote actually matches the PR URL —
  *      a PR attached to an unrelated repo record is a mis-attributed sync;
- *   2. a terminal state over `open` — `merged`/`closed` come with a timestamp
- *      from GitHub and never revert, whereas `open` is exactly the value that
- *      goes stale when a copy stops being synced;
- *   3. the most recently updated row, then the newest row id.
+ *   2. the most recently updated row, because `updated_at` comes from GitHub
+ *      and is the only field that tracks which copy saw reality last. This has
+ *      to outrank state: a pull request can be REOPENED, so preferring a
+ *      terminal state first would keep reporting a reopened PR as closed. The
+ *      merge/close/create timestamps stand in when `updated_at` is missing, so
+ *      a terminal row without one is not ranked as though it had no history;
+ *   3. a terminal state over `open`, to break ties when copies share a
+ *      timestamp — `open` is the value that goes stale when a copy stops being
+ *      synced, whereas `merged`/`closed` carry a timestamp from GitHub;
+ *   4. the newest row id, so the ordering is always total and deterministic.
  */
 const PR_RANK_ORDER = `
   CASE WHEN url IS NOT NULL AND owner_remote IS NOT NULL
-         AND url LIKE 'https://' || owner_remote || '/pull/%' THEN 0 ELSE 1 END,
+         AND url LIKE 'https://' || replace(replace(owner_remote, '\\', '\\\\'), '_', '\\_') || '/pull/%'
+         ESCAPE '\\' THEN 0 ELSE 1 END,
+  COALESCE(updated_at, merged_at, closed_at, created_at, '') DESC,
   CASE WHEN state = 'open' THEN 1 ELSE 0 END,
-  COALESCE(updated_at, '') DESC,
   id DESC`;
 
 /**
@@ -474,12 +483,14 @@ function buildPullRequestQuery(opts: ListPullRequestOptions): { cte: string; par
 
   const cte = duplicates
     ? `WITH candidate AS (
-         SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org
+         SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org,
+                r.name AS owner_name, r.path AS owner_path
          FROM pull_requests p LEFT JOIN repos r ON r.id = p.repo_id
          ${whereClause}
        ), ranked AS (SELECT candidate.*, 1 AS rn FROM candidate)`
     : `WITH candidate AS (
-         SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org
+         SELECT p.*, r.remote_url AS owner_remote, r.org AS owner_org,
+                r.name AS owner_name, r.path AS owner_path
          FROM pull_requests p LEFT JOIN repos r ON r.id = p.repo_id
          ${whereClause}
        ), ranked AS (
@@ -491,29 +502,65 @@ function buildPullRequestQuery(opts: ListPullRequestOptions): { cte: string; par
   return { cte, params, stateFilter, stateParams };
 }
 
+/**
+ * Project a ranked row onto the public record shape.
+ *
+ * `org`/`repo` are read from the stored gh_owner/gh_repo columns and nothing
+ * else. Falling back to the owning repo record here would print an org that
+ * `--org` cannot match, so the tool would advertise a filter value that returns
+ * nothing. The columns are kept authoritative at write time instead — see
+ * bulkInsertPullRequests.
+ */
 function toPullRequestRecord(row: any): PullRequestRecord {
-  const origin = resolvePullRequestOrigin(row.url, row.owner_remote, row.owner_org);
-  const { owner_remote, owner_org, rn, ...pr } = row;
+  const { owner_remote, owner_org, owner_name, owner_path, rn, gh_owner, gh_repo, ...pr } = row;
   return {
     ...(pr as PullRequest),
     is_draft: Boolean(row.is_draft),
-    org: row.gh_owner ?? origin.org,
-    repo: row.gh_repo ?? origin.repo,
+    org: gh_owner ?? null,
+    repo: gh_repo ?? null,
   };
 }
 
 export function listPullRequests(opts: ListPullRequestOptions = {}): PullRequestRecord[] {
-  const db = getDb();
-  const { limit = 50, offset = 0 } = opts;
-  const { cte, params, stateFilter, stateParams } = buildPullRequestQuery(opts);
+  return listRankedPullRequests(opts).map(toPullRequestRecord);
+}
 
-  const rows = db
+/**
+ * De-duplicated pull requests with their owning repo record attached.
+ *
+ * Exists so every PR surface — the CLI listing and the `pr-queue` producer that
+ * automation consumes — shares one de-duplication implementation. A second,
+ * hand-rolled JOIN is how the producer ended up returning the same pull request
+ * once per local checkout.
+ */
+export function listPullRequestsWithRepo(opts: ListPullRequestOptions = {}): Array<PullRequestRecord & {
+  repo_name: string;
+  repo_org: string | null;
+  repo_path: string;
+  repo_remote_url: string | null;
+}> {
+  return listRankedPullRequests(opts).map((row) => ({
+    ...toPullRequestRecord(row),
+    repo_name: row.owner_name,
+    repo_org: row.owner_org,
+    repo_path: row.owner_path,
+    repo_remote_url: row.owner_remote,
+  }));
+}
+
+function listRankedPullRequests(opts: ListPullRequestOptions): any[] {
+  const db = getDb();
+  const { limit = 50, offset = 0, orderBy } = opts;
+  const { cte, params, stateFilter, stateParams } = buildPullRequestQuery(opts);
+  const order = orderBy === "updated"
+    ? "COALESCE(updated_at, created_at) DESC, id DESC"
+    : "created_at DESC, id DESC";
+
+  return db
     .query(`${cte}
       SELECT * FROM (SELECT * FROM ranked WHERE rn = 1) ${stateFilter}
-      ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`)
+      ORDER BY ${order} LIMIT ? OFFSET ?`)
     .all(...params, ...stateParams, limit, offset) as any[];
-
-  return rows.map(toPullRequestRecord);
 }
 
 /**
@@ -543,7 +590,7 @@ export function bulkInsertPullRequests(prs: PullRequestInput[]): number {
   const db = getDb();
   // Upsert rather than INSERT OR REPLACE: REPLACE deletes and re-inserts the
   // row, which changes its rowid and appends a duplicate entry to the
-  // contentless FTS index on every sync.
+  // external-content FTS index on every sync.
   const stmt = db.query(`INSERT INTO pull_requests
     (repo_id, number, title, state, author, created_at, updated_at, merged_at, closed_at, url,
      base_branch, head_branch, additions, deletions, changed_files,
@@ -560,10 +607,26 @@ export function bulkInsertPullRequests(prs: PullRequestInput[]): number {
       merge_state_status = excluded.merge_state_status, ci_state = excluded.ci_state,
       is_draft = excluded.is_draft, review_decision = excluded.review_decision,
       gh_owner = excluded.gh_owner, gh_repo = excluded.gh_repo`);
+  // Resolving a row with an unusable URL needs its owning repo's remote, so
+  // look that up once per repo rather than once per pull request.
+  const repoLookup = db.query("SELECT remote_url, org FROM repos WHERE id = ?");
+  const repoCache = new Map<number, { remote_url: string | null; org: string | null }>();
+  const repoFor = (id: number) => {
+    let row = repoCache.get(id);
+    if (!row) {
+      row = (repoLookup.get(id) as { remote_url: string | null; org: string | null } | null)
+        ?? { remote_url: null, org: null };
+      repoCache.set(id, row);
+    }
+    return row;
+  };
+
   let count = 0;
   const tx = db.transaction(() => {
     for (const pr of prs) {
-      const origin = resolvePullRequestOrigin(pr.url, null, null);
+      // Stored so that --org filters and the printed org are the same value.
+      const owner = repoFor(pr.repo_id);
+      const origin = resolvePullRequestOrigin(pr.url, owner.remote_url, owner.org);
       stmt.run(
         pr.repo_id, pr.number, pr.title, pr.state, pr.author, pr.created_at, pr.updated_at,
         pr.merged_at, pr.closed_at, pr.url, pr.base_branch, pr.head_branch,
@@ -610,13 +673,21 @@ export function applyPullRequestTerminalStates(repo_id: number, states: PullRequ
         closed_at = COALESCE(?, closed_at),
         updated_at = COALESCE(?, updated_at)
     WHERE repo_id = ? AND number = ? AND state = 'open'`);
-  // Count the rows that were actually open beforehand rather than trusting the
-  // driver's change count, which also includes rows written by FTS triggers.
-  const isOpen = db.query("SELECT 1 FROM pull_requests WHERE repo_id = ? AND number = ? AND state = 'open'");
+  if (states.length === 0) return 0;
+
+  // Which rows are still open is read once, not once per number: the count has
+  // to reflect rows this call actually transitioned, and the driver's own
+  // change count is inflated by the writes the FTS trigger performs.
+  const placeholders = states.map(() => "?").join(",");
+  const stillOpen = new Set((db
+    .query(`SELECT number FROM pull_requests WHERE repo_id = ? AND state = 'open' AND number IN (${placeholders})`)
+    .all(repo_id, ...states.map((entry) => entry.number)) as Array<{ number: number }>)
+    .map((row) => row.number));
+
   let changed = 0;
   const tx = db.transaction(() => {
     for (const entry of states) {
-      if (!isOpen.get(repo_id, entry.number)) continue;
+      if (!stillOpen.has(entry.number)) continue;
       stmt.run(
         entry.state, entry.merged_at ?? null, entry.closed_at ?? null,
         entry.updated_at ?? null, repo_id, entry.number,

@@ -78,6 +78,110 @@ describe("ops producers", () => {
     expect(result.task_suggestions[0]!.metadata["github_author"]).toBe("andrei-hasna");
   });
 
+  test("emits one queue item per pull request, not one per local checkout", () => {
+    // The pr-queue producer is what automation consumes. It used to JOIN
+    // pull_requests to repos with no de-duplication, so a repository checked
+    // out N times produced N copies of every PR and `limit` was spent entirely
+    // on duplicates — on the live index a 50-item queue held 2 distinct PRs.
+    const paths = [
+      "/workspace/open-codewith",
+      "/home/u/.hasna/repos/worktrees/codewith/a",
+      "/home/u/.hasna/repos/worktrees/codewith/b",
+    ];
+    for (const path of paths) {
+      const repo = upsertRepo({
+        path,
+        name: basename(path),
+        org: "hasna",
+        remote_url: "git@github.com:hasna/codewith.git",
+      });
+      bulkInsertPullRequests([{
+        repo_id: repo.id,
+        number: 424,
+        title: "Enforce reserved namespace boundary",
+        state: "open",
+        author: "andrei-hasna",
+        created_at: "2026-07-26T00:00:00Z",
+        updated_at: "2026-07-26T01:00:00Z",
+        merged_at: null,
+        closed_at: null,
+        url: "https://github.com/hasna/codewith/pull/424",
+        base_branch: "main",
+        head_branch: "fix/ns",
+        additions: 1,
+        deletions: 0,
+        changed_files: 1,
+      }]);
+    }
+
+    const result = buildPrQueue({ org: "hasna" });
+
+    expect(result.summary.items).toBe(1);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]!.repo.full_name).toBe("hasna/codewith");
+    expect(result.task_suggestions).toHaveLength(1);
+  });
+
+  test("scopes the queue by the org that owns the PR, not the repo record's org", () => {
+    // A PR recorded against an unrelated checkout must still be queued under
+    // the org that actually owns it.
+    const repo = upsertRepo({
+      path: "/workspace/platform-aicopilot",
+      name: "platform-aicopilot",
+      org: "hasnatools",
+      remote_url: "git@github.com:hasnatools/platform-aicopilot.git",
+    });
+    bulkInsertPullRequests([{
+      repo_id: repo.id,
+      number: 9,
+      title: "Mis-attributed pull request",
+      state: "open",
+      author: "andrei-hasna",
+      created_at: "2026-07-01T00:00:00Z",
+      updated_at: "2026-07-01T00:00:00Z",
+      merged_at: null,
+      closed_at: null,
+      url: "https://github.com/hasna/aicopilot/pull/9",
+      base_branch: "main",
+      head_branch: "fix/x",
+      additions: 1,
+      deletions: 0,
+      changed_files: 1,
+    }]);
+
+    expect(buildPrQueue({ org: "hasna" }).summary.items).toBe(1);
+    expect(buildPrQueue({ org: "hasnatools" }).summary.items).toBe(0);
+  });
+
+  test("an unresolvable --repo filter matches nothing rather than everything", () => {
+    const repo = upsertRepo({
+      path: "/workspace/open-loops-scope",
+      name: "open-loops-scope",
+      org: "hasna",
+      remote_url: "git@github.com:hasna/loops.git",
+    });
+    bulkInsertPullRequests([{
+      repo_id: repo.id,
+      number: 1,
+      title: "Something",
+      state: "open",
+      author: "andrei-hasna",
+      created_at: "2026-07-01T00:00:00Z",
+      updated_at: "2026-07-01T00:00:00Z",
+      merged_at: null,
+      closed_at: null,
+      url: "https://github.com/hasna/loops/pull/1",
+      base_branch: "main",
+      head_branch: "x",
+      additions: 1,
+      deletions: 0,
+      changed_files: 1,
+    }]);
+
+    expect(buildPrQueue({ repo: "no-such-repo-anywhere" }).summary.items).toBe(0);
+    expect(buildPrQueue({ repo: "open-loops-scope" }).summary.items).toBe(1);
+  });
+
   test("seed body State/Author lines are gate-parseable (cross-package contract with open-loops)", () => {
     // CONTRACT TEST — guards against "seed-body cross-package format drift"
     // (review-repos-pr11 BLOCK finding; tracked as task 21261ad4): a presence

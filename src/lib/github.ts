@@ -93,8 +93,12 @@ function pullRequestFields(withMergeState: boolean): string {
 function graphql(query: string, variables: Record<string, string>, withMergeState: boolean): any {
   const args = ["api", "graphql"];
   if (withMergeState) args.push("-H", MERGE_INFO_PREVIEW);
+  // `-f/--raw-field` throughout, never `-F/--field`: -F applies magic type
+  // conversion, so an all-numeric repository name (GitHub permits e.g. "2048")
+  // would be sent as an Int against a String! variable, and a value starting
+  // with "@" would be read as a filename.
   args.push("-f", `query=${query}`);
-  for (const [key, value] of Object.entries(variables)) args.push("-F", `${key}=${value}`);
+  for (const [key, value] of Object.entries(variables)) args.push("-f", `${key}=${value}`);
 
   const output = gh(args);
   if (!output) throw new Error("GitHub GraphQL returned empty output");
@@ -108,9 +112,19 @@ function graphql(query: string, variables: Record<string, string>, withMergeStat
     const detail = String(parsed.errors[0]?.message ?? "").replace(/\s+/g, " ");
     if (isUnsupportedFieldError(detail)) throw new UnsupportedGraphqlFieldError();
     if (isMissingRepoError(detail)) throw new Error("GitHub repository is unavailable");
-    throw new Error("GitHub GraphQL request failed");
+    // GitHub answers a partially-resolvable query with data AND errors. One
+    // unresolvable alias among fifty must not discard the forty-nine that did
+    // resolve, so only a response with nothing usable is an outright failure.
+    if (!hasUsableData(parsed.data)) throw new Error("GitHub GraphQL request failed");
   }
   return parsed?.data;
+}
+
+function hasUsableData(data: unknown): boolean {
+  if (!data || typeof data !== "object") return false;
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return false;
+  return Object.values(repository as Record<string, unknown>).some((value) => value != null);
 }
 
 /**
@@ -129,7 +143,17 @@ function graphqlWithOptionalMergeState<T>(build: (withMergeState: boolean) => { 
     }
   }
   const { query, variables } = build(false);
-  return graphql(query, variables, false) as T;
+  try {
+    return graphql(query, variables, false) as T;
+  } catch (error) {
+    // The reduced query no longer mentions mergeStateStatus, so a field
+    // rejection here is about some OTHER field. Reporting it as the same
+    // generic error would hide which field GitHub actually refused.
+    if (error instanceof UnsupportedGraphqlFieldError) {
+      throw new Error("GitHub GraphQL rejected a field this client requires");
+    }
+    throw error;
+  }
 }
 
 /**
@@ -176,6 +200,14 @@ export function fetchPullRequests(
   return collected;
 }
 
+/**
+ * Ceiling on the open set fetched for reconciliation. Exceeding it does not
+ * cause wrongful closure — every number missing from the set is individually
+ * re-queried and skipped when GitHub still answers OPEN — it only costs extra
+ * requests.
+ */
+const OPEN_SET_CAP = 1000;
+
 const RECONCILE_BATCH = 50;
 
 /**
@@ -193,16 +225,30 @@ export function fetchPullRequestStates(
   const result = new Map<number, { state: string; mergedAt: string | null; closedAt: string | null; updatedAt: string | null }>();
   if (!owner || !name || numbers.length === 0) return result;
 
-  for (let i = 0; i < numbers.length; i += RECONCILE_BATCH) {
-    const batch = numbers.slice(i, i + RECONCILE_BATCH);
+  // Only well-formed positive integers become aliases. The values come from an
+  // INTEGER column today, but a malformed one would otherwise be interpolated
+  // straight into the query and fail the whole batch.
+  const safeNumbers = numbers.filter((n) => Number.isSafeInteger(n) && n > 0);
+
+  for (let i = 0; i < safeNumbers.length; i += RECONCILE_BATCH) {
+    const batch = safeNumbers.slice(i, i + RECONCILE_BATCH);
     const aliases = batch
       .map((n) => `pr${n}: pullRequest(number: ${n}) { number state mergedAt closedAt updatedAt }`)
       .join("\n");
-    const data = graphql(
-      `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${aliases} } }`,
-      { owner, name },
-      false,
-    );
+    let data: any;
+    try {
+      data = graphql(
+        `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${aliases} } }`,
+        { owner, name },
+        false,
+      );
+    } catch {
+      // A batch that fails outright leaves its numbers unresolved, and
+      // unresolved numbers are left in place rather than guessed. Continuing
+      // keeps one bad batch from abandoning reconciliation for the rest of the
+      // repository — and for every other checkout of it.
+      continue;
+    }
     const repository = data?.repository ?? {};
     for (const n of batch) {
       const node = repository[`pr${n}`];
@@ -304,14 +350,17 @@ export function syncRemotePullRequests(
   ghRepo: string,
   opts: { limit?: number; state?: string; reconcile?: boolean; repoName?: string; client?: GithubPullRequestClient } = {},
 ): SyncPullRequestsResult {
-  const { limit = 100, reconcile = true, client = liveClient } = opts;
-  const state = { mergeStateSupported: true };
+  const { limit = 100, state: stateFilter = "all", reconcile = true, client = liveClient } = opts;
+  const caps = { mergeStateSupported: true };
 
   // The complete open set is what reconciliation is judged against, so it is
   // never truncated by --limit. Open sets are small; closed history is not.
-  const open = client.fetchPullRequests(ghRepo, { states: ["OPEN"], limit: 1000, state });
-  const recent = limit > 0
-    ? client.fetchPullRequests(ghRepo, { states: ["MERGED", "CLOSED"], limit, state })
+  const open = client.fetchPullRequests(ghRepo, { states: ["OPEN"], limit: OPEN_SET_CAP, state: caps });
+  // `state: "open"` means the caller only wants open pull requests, so the
+  // closed-history page is skipped rather than silently fetched anyway.
+  const wantsClosedHistory = stateFilter !== "open" && limit > 0;
+  const recent = wantsClosedHistory
+    ? client.fetchPullRequests(ghRepo, { states: ["MERGED", "CLOSED"], limit, state: caps })
     : [];
 
   const byNumber = new Map<number, GraphqlPr>();
@@ -325,30 +374,44 @@ export function syncRemotePullRequests(
 
   for (const checkout of checkouts) {
     synced += bulkInsertPullRequests(fetched.map((pr) => toPullRequestInput(checkout.id, pr)));
+  }
 
-    if (!reconcile) continue;
-    // Anything this checkout still calls open but GitHub did not list as open
-    // has left the open set since it was last seen.
-    const stale = listOpenPullRequestNumbers(checkout.id).filter((n) => !openNumbers.has(n));
-    if (stale.length === 0) continue;
-
-    const live = client.fetchPullRequestStates(ghRepo, stale);
-    const updates: PullRequestTerminalState[] = [];
-    for (const number of stale) {
-      const entry = live.get(number);
-      // A number GitHub will not resolve (deleted, transferred, never existed)
-      // is left untouched rather than guessed into a terminal state.
-      if (!entry) continue;
-      if (entry.state === "OPEN") continue;
-      updates.push({
-        number,
-        state: entry.state === "MERGED" || entry.mergedAt ? "merged" : "closed",
-        merged_at: entry.mergedAt,
-        closed_at: entry.closedAt,
-        updated_at: entry.updatedAt,
-      });
+  if (reconcile && checkouts.length > 0) {
+    // Every checkout of a remote holds copies of the same pull requests, so
+    // their stale sets overlap almost entirely. Collect the union and resolve
+    // it in ONE pass: querying per checkout would re-ask GitHub the same
+    // question once per local directory, and this machine has remotes checked
+    // out over a hundred times.
+    const staleByCheckout = new Map<number, number[]>();
+    const allStale = new Set<number>();
+    for (const checkout of checkouts) {
+      const stale = listOpenPullRequestNumbers(checkout.id).filter((n) => !openNumbers.has(n));
+      if (stale.length === 0) continue;
+      staleByCheckout.set(checkout.id, stale);
+      for (const number of stale) allStale.add(number);
     }
-    reconciled += applyPullRequestTerminalStates(checkout.id, updates);
+
+    if (allStale.size > 0) {
+      const live = client.fetchPullRequestStates(ghRepo, [...allStale].sort((a, b) => a - b));
+      for (const [checkoutId, stale] of staleByCheckout) {
+        const updates: PullRequestTerminalState[] = [];
+        for (const number of stale) {
+          const entry = live.get(number);
+          // A number GitHub will not resolve (deleted, transferred, never
+          // existed) is left untouched rather than guessed into a terminal state.
+          if (!entry) continue;
+          if (entry.state === "OPEN") continue;
+          updates.push({
+            number,
+            state: entry.state === "MERGED" || entry.mergedAt ? "merged" : "closed",
+            merged_at: entry.mergedAt,
+            closed_at: entry.closedAt,
+            updated_at: entry.updatedAt,
+          });
+        }
+        reconciled += applyPullRequestTerminalStates(checkoutId, updates);
+      }
+    }
   }
 
   return {
@@ -357,7 +420,7 @@ export function syncRemotePullRequests(
     repo_name: opts.repoName ?? ghRepo,
     remote: remoteUrl,
     checkouts: checkouts.length,
-    merge_state_available: state.mergeStateSupported,
+    merge_state_available: caps.mergeStateSupported,
   };
 }
 
@@ -377,9 +440,9 @@ export function isMissingRepoError(message: string): boolean {
 }
 
 export function syncAllGithubPRs(
-  opts: { org?: string; limit?: number; state?: string; maxRepos?: number; reconcile?: boolean; onProgress?: (msg: string) => void } = {}
+  opts: { org?: string; limit?: number; state?: string; maxRepos?: number; reconcile?: boolean; client?: GithubPullRequestClient; onProgress?: (msg: string) => void } = {}
 ): { total_synced: number; total_reconciled: number; repos_seen: number; repos_checked: number; repos_synced: number; remotes_seen: number; truncated: boolean; errors: string[]; skipped: string[] } {
-  const { org, limit = 50, maxRepos, reconcile = true, onProgress } = opts;
+  const { org, limit = 50, state, maxRepos, reconcile = true, client, onProgress } = opts;
 
   const repos = listAllRepos(org ? { org } : {})
     .filter((repo) => repo.remote_url?.startsWith("github.com/"));
@@ -409,7 +472,7 @@ export function syncAllGithubPRs(
     const [remoteUrl, ghRepo] = entries[i]!;
     onProgress?.(`[${i + 1}/${entries.length}] Syncing PRs for ${ghRepo}...`);
     try {
-      const result = syncRemotePullRequests(remoteUrl, ghRepo, { limit, reconcile });
+      const result = syncRemotePullRequests(remoteUrl, ghRepo, { limit, state, reconcile, client });
       total_synced += result.synced;
       total_reconciled += result.reconciled;
       repos_synced++;

@@ -110,6 +110,35 @@ describe("cross-checkout de-duplication", () => {
     expect(rows[0]!.repo_id).toBe(right.id);
   });
 
+  it("reports a reopened pull request as open, not as its earlier closed state", () => {
+    // GitHub pull requests can be reopened, so a terminal state is NOT
+    // permanent and must never outrank freshness. A copy that saw the closure
+    // must not win over a copy that saw the reopen.
+    const stale = upsertRepo({ path: "/w/stale", name: "stale", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const fresh = upsertRepo({ path: "/w/fresh", name: "fresh", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    bulkInsertPullRequests([
+      pr({ repo_id: stale.id, number: 50, state: "closed", closed_at: "2026-07-01T00:00:00Z", updated_at: "2026-07-01T00:00:00Z" }),
+      pr({ repo_id: fresh.id, number: 50, state: "open", updated_at: "2026-07-09T00:00:00Z" }),
+    ]);
+
+    const rows = listPullRequests({});
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.state).toBe("open");
+    expect(listPullRequests({ state: "open" })).toHaveLength(1);
+    expect(listPullRequests({ state: "closed" })).toHaveLength(0);
+  });
+
+  it("prefers a terminal state only when copies share a timestamp", () => {
+    const stale = upsertRepo({ path: "/w/stale", name: "stale", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    const fresh = upsertRepo({ path: "/w/fresh", name: "fresh", org: "hasna", remote_url: "github.com/hasna/codewith" });
+    bulkInsertPullRequests([
+      pr({ repo_id: stale.id, number: 51, state: "open", updated_at: "2026-07-05T00:00:00Z" }),
+      pr({ repo_id: fresh.id, number: 51, state: "merged", merged_at: "2026-07-05T00:00:00Z", updated_at: "2026-07-05T00:00:00Z" }),
+    ]);
+
+    expect(listPullRequests({})[0]!.state).toBe("merged");
+  });
+
   it("never merges distinct pull requests that share no URL", () => {
     const repo = upsertRepo({ path: "/w/one", name: "one", org: "hasna", remote_url: "github.com/hasna/codewith" });
     bulkInsertPullRequests([

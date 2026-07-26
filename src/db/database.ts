@@ -838,17 +838,18 @@ function upgradePullRequestGateColumns(db: Database): number {
     CREATE INDEX IF NOT EXISTS idx_prs_owner ON pull_requests(gh_owner, gh_repo);
   `);
 
-  // pull_requests rows are updated in place by every sync, but the FTS mirror
-  // only had insert and delete triggers, so an edited title never refreshed.
+  // Repair the FTS mirror before touching row data.
+  //
+  // Writes used INSERT OR REPLACE, which resolves a conflict by deleting the
+  // existing row and inserting a new one — and with PRAGMA recursive_triggers
+  // OFF (the default; nothing here enables it) that delete never fired prs_ad.
+  // Every re-sync therefore appended another entry and orphaned the previous
+  // one. On the live index this left roughly seven stale entries per live row.
+  // The join in searchPullRequests hides them, so this is bloat rather than
+  // wrong results, but it grows without bound. A rebuild re-derives the whole
+  // index from the external content table.
   if (tableExists(db, "fts_prs")) {
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS prs_au AFTER UPDATE ON pull_requests BEGIN
-        INSERT INTO fts_prs(fts_prs, rowid, title, author)
-        VALUES ('delete', old.id, old.title, old.author);
-        INSERT INTO fts_prs(rowid, title, author)
-        VALUES (new.id, new.title, new.author);
-      END;
-    `);
+    db.exec("INSERT INTO fts_prs(fts_prs) VALUES('rebuild')");
   }
 
   // A scan that could not read `git remote get-url origin` used to overwrite a
@@ -875,7 +876,22 @@ function upgradePullRequestGateColumns(db: Database): number {
     `);
   }
 
-  return backfillPullRequestOrigins(db);
+  const updated = backfillPullRequestOrigins(db);
+
+  // Created only after the backfill so that rewriting every row's gh_owner does
+  // not push two FTS writes per row through the trigger.
+  if (tableExists(db, "fts_prs")) {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS prs_au AFTER UPDATE ON pull_requests BEGIN
+        INSERT INTO fts_prs(fts_prs, rowid, title, author)
+        VALUES ('delete', old.id, old.title, old.author);
+        INSERT INTO fts_prs(rowid, title, author)
+        VALUES (new.id, new.title, new.author);
+      END;
+    `);
+  }
+
+  return updated;
 }
 
 /**

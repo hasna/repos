@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { getDb } from "../db/database.js";
+import { getRepo, listPullRequestsWithRepo } from "../db/repos.js";
 import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
 import { getReleasePipelineParity, type OpsCommandRunner } from "./repo-ops.js";
 import type { PullRequest } from "../types/index.js";
@@ -989,28 +990,33 @@ export function buildProtectedRelease(options: ProtectedReleaseOptions): Protect
   };
 }
 
+/**
+ * Rows for the pr-queue producer.
+ *
+ * Delegates to the shared de-duplicated listing rather than re-joining
+ * pull_requests to repos. The hand-rolled join returned one row per local
+ * checkout, so on this machine a 50-item queue was 23 copies of two pull
+ * requests and `limit` was consumed entirely by duplicates.
+ *
+ * `org` is likewise the GitHub owner resolved from the pull request itself, not
+ * the owning repo record's org — the two disagree whenever a PR was recorded
+ * against an unrelated checkout.
+ */
 function listPrRows(opts: { org?: string; repo?: string; state: string; limit: number }): PrRow[] {
-  const db = getDb();
-  const params: Array<string | number> = [];
-  const where = ["pr.state = ?"];
-  params.push(opts.state);
-  if (opts.org) {
-    where.push("r.org = ?");
-    params.push(opts.org);
-  }
+  let repo_id: number | undefined;
   if (opts.repo) {
-    where.push("(r.name = ? OR r.path = ?)");
-    params.push(opts.repo, opts.repo);
+    const repo = getRepo(opts.repo);
+    // An unresolvable --repo must match nothing, not silently match everything.
+    if (!repo) return [];
+    repo_id = repo.id;
   }
-  params.push(opts.limit);
-  return db.query<PrRow, Array<string | number>>(`
-    SELECT pr.*, r.name AS repo_name, r.org AS repo_org, r.path AS repo_path, r.remote_url AS repo_remote_url
-    FROM pull_requests pr
-    JOIN repos r ON r.id = pr.repo_id
-    WHERE ${where.join(" AND ")}
-    ORDER BY COALESCE(pr.updated_at, pr.created_at) DESC
-    LIMIT ?
-  `).all(...params);
+  return listPullRequestsWithRepo({
+    org: opts.org,
+    repo_id,
+    state: opts.state,
+    limit: opts.limit,
+    orderBy: "updated",
+  }) as unknown as PrRow[];
 }
 
 function prRowToQueueItem(row: PrRow): RepoPrQueueItem {
