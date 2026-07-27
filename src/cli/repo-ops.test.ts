@@ -130,7 +130,7 @@ describe("repo ops CLI commands", () => {
     expect(result.exitCode, stderr).toBe(0);
     expect(JSON.parse(stdout)).toMatchObject({
       kind: "no_cloud_inventory",
-      schema_version: "1.2",
+      schema_version: "1.3",
       summary: {
         repos: 0,
         routeable: 0,

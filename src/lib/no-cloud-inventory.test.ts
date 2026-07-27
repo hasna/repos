@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getNoCloudInventory } from "./no-cloud-inventory";
+import { classifyNpmViewFailure, deriveNpmPackageChecks, getNoCloudInventory } from "./no-cloud-inventory";
 
 function withTempWorkspace(fn: (root: string) => void) {
   const root = join(tmpdir(), `repos-no-cloud-${Date.now()}-${Math.random().toString(16).slice(2)}`);
@@ -497,5 +497,85 @@ describe("no-cloud inventory", () => {
       expect(finding?.remote).toBe("git.example.com/hasna/repo");
       expect(finding?.remote).not.toContain("super-secret");
     });
+  });
+});
+
+describe("no-cloud registry inventory is derived, not hardcoded", () => {
+  const scope = "@" + "hasna";
+
+  it("derives the package set from the scanned repos' own package.json names", () => {
+    withTempWorkspace((root) => {
+      const alpha = join(root, "open-alpha");
+      gitRepo(alpha);
+      writeFileSync(join(alpha, "package.json"), JSON.stringify({ name: `${scope}/alpha`, version: "1.0.0" }));
+
+      const beta = join(root, "open-beta");
+      gitRepo(beta);
+      writeFileSync(join(beta, "package.json"), JSON.stringify({ name: `${scope}/beta`, version: "0.2.0" }));
+
+      const derived = deriveNpmPackageChecks([alpha, beta]);
+
+      expect(derived).toEqual([`${scope}/alpha`, `${scope}/beta`]);
+    });
+  });
+
+  it("ignores repos with no package.json, unparseable package.json, no name, or a foreign scope", () => {
+    withTempWorkspace((root) => {
+      const noPkg = join(root, "no-package");
+      gitRepo(noPkg);
+
+      const broken = join(root, "broken-package");
+      gitRepo(broken);
+      writeFileSync(join(broken, "package.json"), "{ this is not json");
+
+      const unnamed = join(root, "unnamed");
+      gitRepo(unnamed);
+      writeFileSync(join(unnamed, "package.json"), JSON.stringify({ version: "1.0.0" }));
+
+      const foreign = join(root, "foreign");
+      gitRepo(foreign);
+      writeFileSync(join(foreign, "package.json"), JSON.stringify({ name: "@someoneelse/thing" }));
+
+      expect(deriveNpmPackageChecks([noPkg, broken, unnamed, foreign])).toEqual([]);
+    });
+  });
+
+  it("de-duplicates a package name declared by more than one checkout", () => {
+    withTempWorkspace((root) => {
+      const canonical = join(root, "open-dup");
+      gitRepo(canonical);
+      writeFileSync(join(canonical, "package.json"), JSON.stringify({ name: `${scope}/dup` }));
+
+      const mirror = join(root, "mirror-dup");
+      gitRepo(mirror);
+      writeFileSync(join(mirror, "package.json"), JSON.stringify({ name: `${scope}/dup` }));
+
+      expect(deriveNpmPackageChecks([canonical, mirror])).toEqual([`${scope}/dup`]);
+    });
+  });
+
+  // The regression this whole block exists for: a frozen literal list outlives the
+  // packages in it. @hasna/swarm was unpublished on 2026-07-27 while still named in
+  // DEFAULT_PACKAGE_CHECKS, so the inventory reported a package that no longer existed.
+  // A workspace that declares no packages must now produce an EMPTY registry inventory
+  // rather than falling back to a stale hardcoded set.
+  it("reports an empty registry inventory instead of falling back to a hardcoded list", () => {
+    withTempWorkspace((root) => {
+      const repo = join(root, "open-nothing-published");
+      gitRepo(repo);
+
+      const report = getNoCloudInventory({ root, limit: 10, includeNpm: true });
+
+      expect(report.npm).toEqual([]);
+      expect(report.summary.registry_packages).toBe(0);
+    });
+  });
+
+  it("distinguishes an unpublished package from a check that could not run", () => {
+    expect(classifyNpmViewFailure("npm error code E404\nnpm error 404 Not Found")).toBe("unpublished");
+    expect(classifyNpmViewFailure("npm error 404 Not Found - GET https://registry.npmjs.org/x")).toBe("unpublished");
+    expect(classifyNpmViewFailure("npm error code E401\nnpm error 401 Unauthorized")).toBe("npm-view-failed");
+    expect(classifyNpmViewFailure("npm error network timeout")).toBe("npm-view-failed");
+    expect(classifyNpmViewFailure("")).toBe("npm-view-failed");
   });
 });

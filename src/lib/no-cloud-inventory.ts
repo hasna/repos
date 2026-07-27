@@ -47,12 +47,12 @@ export interface NoCloudNpmFinding {
   package: string;
   version: string | null;
   cloud_dep: string | null;
-  status: "published" | "published-cloud-dep" | "cloud-package" | "npm-view-failed";
+  status: "published" | "published-cloud-dep" | "cloud-package" | "unpublished" | "npm-view-failed";
 }
 
 export interface NoCloudInventoryReport {
   kind: "no_cloud_inventory";
-  schema_version: "1.2";
+  schema_version: "1.3";
   root: string;
   patterns: string[];
   summary: {
@@ -65,6 +65,7 @@ export interface NoCloudInventoryReport {
     dirty: number;
     registry_packages: number;
     registry_cloud_deps: number;
+    registry_unpublished: number;
   };
   repos: NoCloudRepoFinding[];
   npm: NoCloudNpmFinding[];
@@ -76,7 +77,8 @@ const DEFAULT_LIMIT = 200;
 const DEFAULT_MAX_DEPTH = 8;
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_LOCKFILE_BYTES = 64 * 1024 * 1024;
-const SCHEMA_VERSION = "1.2" as const;
+const SCHEMA_VERSION = "1.3" as const;
+const PACKAGE_SCOPE = "@hasna";
 
 const CLOUD_PACKAGE = "@hasna" + "/cloud";
 const CLOUD_PATTERNS = [
@@ -89,46 +91,45 @@ const CLOUD_PATTERNS = [
   ["HASNA", "RDS", "PASSWORD"].join("_"),
 ];
 
-const DEFAULT_PACKAGE_CHECKS = [
-  CLOUD_PACKAGE,
-  "@hasna/connectors",
-  "@hasna/secrets",
-  "@hasna/repos",
-  "@hasna/shortlinks",
-  "@hasna/todos",
-  "@hasna/terminal",
-  "@hasna/sessions",
-  "@hasna/brains",
-  "@hasna/contacts",
-  "@hasna/wallets",
-  "@hasna/configs",
-  "@hasna/context",
-  "@hasna/telephony",
-  "@hasna/tickets",
-  "@hasna/signatures",
-  "@hasna/hooks",
-  "@hasna/trademarks",
-  "@hasna/sandboxes",
-  "@hasna/styles",
-  "@hasna/mcps",
-  "@hasna/testers",
-  "@hasna/prompts",
-  "@hasna/servers",
-  "@hasna/deployment",
-  "@hasna/implementations",
-  "@hasna/analytics",
-  "@hasna/predictor",
-  "@hasna/transcriber",
-  "@hasna/crm",
-  "@hasna/scaffolds",
-  "@hasna/assistants-mcp",
-  "@hasna/assistants",
-  "@hasna/evals",
-  "@hasna/markdown",
-  "@hasna/researcher",
-  "@hasna/coders",
-  "@hasna/calendar",
-];
+/**
+ * The registry inventory is DERIVED from the package.json name of each repo actually
+ * scanned. It used to be a frozen literal list, which silently outlived its contents:
+ * @hasna/swarm was unpublished on 2026-07-27 while still named in that list, so the
+ * report kept asserting a package that no longer existed. Deriving it means a renamed,
+ * retired or unpublished package drops out on its own.
+ */
+export function deriveNpmPackageChecks(repoRoots: string[]): string[] {
+  const names = new Set<string>([CLOUD_PACKAGE]);
+  for (const repoRoot of repoRoots) {
+    const name = localPackageName(repoRoot);
+    if (name && name.startsWith(`${PACKAGE_SCOPE}/`)) names.add(name);
+  }
+  names.delete(CLOUD_PACKAGE);
+  return [...names].sort();
+}
+
+function localPackageName(repoRoot: string): string | null {
+  try {
+    const manifest = join(repoRoot, "package.json");
+    if (!existsSync(manifest)) return null;
+    if (statSync(manifest).size > MAX_FILE_BYTES) return null;
+    const parsed = JSON.parse(readFileSync(manifest, "utf-8")) as { name?: unknown };
+    const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+    return name || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An absent package and an unusable npm client both make `npm view` exit non-zero.
+ * Collapsing them into one status is what let a retired package read as a transient
+ * failure, so a 404 is reported as `unpublished` and everything else stays a failure.
+ */
+export function classifyNpmViewFailure(detail: string): "unpublished" | "npm-view-failed" {
+  if (/\bE404\b/.test(detail) || /\b404 Not Found\b/i.test(detail)) return "unpublished";
+  return "npm-view-failed";
+}
 
 const SKIP_DIRS = new Set([
   ".git",
@@ -507,7 +508,7 @@ function npmFinding(pkg: string): NoCloudNpmFinding {
   try {
     const raw = execFileSync("npm", ["view", pkg, "version", "dependencies", "optionalDependencies", "peerDependencies", "deprecated", "--json"], {
       encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: ["ignore", "pipe", "pipe"],
       timeout: 20_000,
       maxBuffer: 1024 * 1024,
     }).trim();
@@ -534,8 +535,12 @@ function npmFinding(pkg: string): NoCloudNpmFinding {
       cloud_dep: dep,
       status: dep ? "published-cloud-dep" : "published",
     };
-  } catch {
-    return { package: pkg, version: null, cloud_dep: null, status: "npm-view-failed" };
+  } catch (error) {
+    const failure = error as { stderr?: unknown; stdout?: unknown; message?: unknown };
+    const detail = [failure.stderr, failure.stdout, failure.message]
+      .map((part) => (typeof part === "string" ? part : Buffer.isBuffer(part) ? part.toString("utf-8") : ""))
+      .join("\n");
+    return { package: pkg, version: null, cloud_dep: null, status: classifyNpmViewFailure(detail) };
   }
 }
 
@@ -554,7 +559,7 @@ export function getNoCloudInventory(options: NoCloudInventoryOptions = {}): NoCl
       return a.path.localeCompare(b.path);
     });
   const npmPackages = options.includeNpm
-    ? (options.npmPackages?.length ? options.npmPackages : DEFAULT_PACKAGE_CHECKS)
+    ? (options.npmPackages?.length ? options.npmPackages : deriveNpmPackageChecks(roots))
     : [];
   const npm = npmPackages.map(npmFinding);
   const truncated = repoFindings.length > limit || npm.length > limit;
@@ -576,6 +581,7 @@ export function getNoCloudInventory(options: NoCloudInventoryOptions = {}): NoCl
       dirty: repoFindings.filter((repo) => repo.dirty > 0).length,
       registry_packages: npm.length,
       registry_cloud_deps: npm.filter((entry) => entry.status === "published-cloud-dep").length,
+      registry_unpublished: npm.filter((entry) => entry.status === "unpublished").length,
     },
     repos,
     npm: npmLimited,
