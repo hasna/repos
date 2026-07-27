@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { clearConfigCache, getConfig, getDefaultWorkspaceRoots, getFilterAlias } from "./config";
+import {
+  clearConfigCache,
+  getConfig,
+  getDefaultWorkspaceRoots,
+  getFilterAlias,
+  getReposHomeDir,
+  getWorkspaceRoots,
+  getWorktreesRoot,
+} from "./config";
 
 let testDir = "";
 let configPath = "";
@@ -125,6 +133,73 @@ describe("config", () => {
     it("should fall back to lowercase workspace when no directory exists", () => {
       const roots = getDefaultWorkspaceRoots("/tmp/test-home", () => false);
       expect(roots).toEqual([resolve("/tmp/test-home/workspace")]);
+    });
+  });
+
+  describe("getWorktreesRoot", () => {
+    it("derives the worktrees root from the repos home rather than restating it", () => {
+      // If this were spelled out independently it could drift from the directory
+      // the rest of the package reads and writes.
+      expect(getWorktreesRoot("/tmp/test-home")).toBe(
+        join(getReposHomeDir("/tmp/test-home"), "worktrees"),
+      );
+    });
+  });
+
+  describe("getWorkspaceRoots", () => {
+    const home = "/tmp/test-home";
+    const worktreesRoot = getWorktreesRoot(home);
+
+    it("covers the worktrees root when the caller names no roots", () => {
+      // The defect: a bare `repos scan` never looked inside
+      // $HOME/.hasna/repos/worktrees, so an agent that created a worktree there
+      // and then scanned was told "found 6" and believed it was indexed.
+      writeFileSync(configPath, JSON.stringify({ workspaceRoots: ["/srv/code"] }));
+      clearConfigCache();
+      const roots = getWorkspaceRoots(undefined, { homeDir: home, pathExists: () => true });
+      expect(roots).toContain(worktreesRoot);
+      // Appended, so the declared roots keep their order and precedence.
+      expect(roots[roots.length - 1]).toBe(worktreesRoot);
+    });
+
+    it("still covers the worktrees root when workspaceRoots is configured explicitly", () => {
+      // Folding this into the workspaceRoots *defaults* would let any machine
+      // with a config file silently lose worktree coverage again.
+      writeFileSync(configPath, JSON.stringify({ workspaceRoots: ["/srv/code"] }));
+      clearConfigCache();
+      const roots = getWorkspaceRoots(undefined, { homeDir: home, pathExists: () => true });
+      expect(roots).toEqual([resolve("/srv/code"), worktreesRoot]);
+    });
+
+    it("omits the worktrees root when it does not exist on this machine", () => {
+      const roots = getWorkspaceRoots(undefined, {
+        homeDir: home,
+        pathExists: (path) => path !== worktreesRoot,
+      });
+      expect(roots).not.toContain(worktreesRoot);
+    });
+
+    it("honours includeWorktreesRoot: false as a deliberate opt-out", () => {
+      writeFileSync(configPath, JSON.stringify({ includeWorktreesRoot: false }));
+      clearConfigCache();
+      const roots = getWorkspaceRoots(undefined, { homeDir: home, pathExists: () => true });
+      expect(roots).not.toContain(worktreesRoot);
+    });
+
+    it("treats an explicit --root as the exact request, adding nothing", () => {
+      // A caller naming roots is narrowing the scan, not broadening it.
+      const roots = getWorkspaceRoots(["/srv/one", "/srv/two"], {
+        homeDir: home,
+        pathExists: () => true,
+      });
+      expect(roots).toEqual([resolve("/srv/one"), resolve("/srv/two")]);
+    });
+
+    it("does not repeat a root that is already configured", () => {
+      writeFileSync(configPath, JSON.stringify({ workspaceRoots: [worktreesRoot] }));
+      clearConfigCache();
+      const roots = getWorkspaceRoots(undefined, { homeDir: home, pathExists: () => true });
+      expect(roots).toEqual([worktreesRoot]);
     });
   });
 });
