@@ -104,7 +104,6 @@ const DEFAULT_PACKAGE_CHECKS = [
   "@hasna/configs",
   "@hasna/context",
   "@hasna/telephony",
-  "@hasna/swarm",
   "@hasna/tickets",
   "@hasna/signatures",
   "@hasna/hooks",
