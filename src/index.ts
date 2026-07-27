@@ -77,6 +77,7 @@ export { getReposStatus } from "./lib/status.js";
 export type { ReposStatusContract } from "./lib/status.js";
 export {
   getDocsDrift,
+  getManifestDependents,
   getPackageDrift,
   getPackageHealth,
   getReleaseHealth,

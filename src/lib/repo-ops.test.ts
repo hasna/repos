@@ -24,6 +24,9 @@ function writePackage(options: {
   readme?: string;
   bin?: boolean;
   scriptPort?: number;
+  license?: string;
+  publishConfig?: Record<string, unknown>;
+  repository?: unknown;
 } = {}) {
   const packageName = options.name ?? "@hasna/repos";
   const scripts: Record<string, string> = {
@@ -44,7 +47,9 @@ function writePackage(options: {
   writeFileSync(join(tempDir, "package.json"), JSON.stringify({
     name: packageName,
     version: "1.2.3",
-    license: "Apache-2.0",
+    license: options.license ?? "Apache-2.0",
+    publishConfig: options.publishConfig,
+    repository: options.repository,
     scripts,
     bin: options.bin ? { repos: "bin/cli.js" } : undefined,
     dependencies: {
@@ -75,6 +80,39 @@ function writePackage(options: {
   if (options.readme !== undefined) {
     writeFileSync(join(tempDir, "README.md"), options.readme);
   }
+}
+
+/** HEAD commit of the temp repo, for use as a reachable published gitHead. */
+function headSha(): string {
+  return execFileSync("git", ["rev-parse", "HEAD"], { cwd: tempDir, encoding: "utf-8" }).trim();
+}
+
+/**
+ * Command-aware `npm view` stub.
+ *
+ * The previous stub answered every `npm view` — `version` and anything else —
+ * with the same "9.9.9". That is a stub that measures nothing: the drift test
+ * passed without the audit ever establishing that the published artifact came
+ * from this repo, which is exactly how hasna/cli's unrelated npmjs package read
+ * as tag-pipeline drift.
+ */
+function npmViewRunner(opts: { version: string; gitHead?: string | null; repository?: string | null }): OpsCommandRunner {
+  return (command, args) => {
+    if (command === "npm" && args.includes("view") && args.includes("gitHead")) {
+      return opts.gitHead
+        ? { ok: true, stdout: opts.gitHead, stderr: "", exitCode: 0 }
+        : { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    }
+    if (command === "npm" && args.includes("view") && args.includes("repository.url")) {
+      return opts.repository
+        ? { ok: true, stdout: opts.repository, stderr: "", exitCode: 0 }
+        : { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    }
+    if (command === "npm" && args.includes("view") && args.includes("version")) {
+      return { ok: true, stdout: opts.version, stderr: "", exitCode: 0 };
+    }
+    return { ok: false, stdout: "", stderr: `unexpected command: ${command} ${args.join(" ")}`, exitCode: 1 };
+  };
 }
 
 function initGitRepo() {
@@ -285,7 +323,7 @@ describe("repo ops primitives", () => {
     execFileSync("git", ["tag", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
     execFileSync("git", ["push", "origin", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
     execFileSync("git", ["tag", "-d", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
-    const runner: OpsCommandRunner = () => ({ ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 });
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: headSha() });
 
     try {
       const result = getReleasePipelineParity({ cwd: tempDir, runner });
@@ -302,15 +340,150 @@ describe("repo ops primitives", () => {
     writePackage();
     writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
     initGitRepo();
-    const runner: OpsCommandRunner = () => ({ ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 });
+    // gitHead is this repo's own HEAD, so the artifact is provably ours and
+    // "publish bypassed the tag pipeline" is a claim the evidence supports.
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: headSha() });
 
     const result = getReleasePipelineParity({ cwd: tempDir, runner });
 
     expect(result.registry.checked).toBe(true);
     expect(result.registry.npm_latest).toBe("9.9.9");
+    expect(result.registry.git_head_reachability).toBe("reachable");
     expect(result.registry.npm_latest_without_git_tag).toBe(true);
     expect(result.issues.map((issue) => issue.code)).toContain("npm_latest_without_git_tag");
     expect(result.status).toBe("warn");
+  });
+
+  it("does not claim tag-pipeline drift when the published artifact is a different package", () => {
+    // hasna/cli's npmjs artifact carries gitHead
+    // 207800eaf5bc582999b227a2ef7393b5e0991a4e, which is not a commit in
+    // hasna/cli. Under the old check that produced a high-priority
+    // npm_latest_without_git_tag warning — the tag is genuinely absent, because
+    // the artifact was never built here.
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: "207800eaf5bc582999b227a2ef7393b5e0991a4e" });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.git_head_reachability).toBe("absent");
+    expect(result.registry.npm_latest_without_git_tag).toBe(false);
+    const codes = result.issues.map((issue) => issue.code);
+    expect(codes).toContain("registry_unrelated_name");
+    expect(codes).not.toContain("npm_latest_without_git_tag");
+  });
+
+  it("reports an unverified tag gap when the artifact carries no gitHead", () => {
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: null });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.git_head).toBeNull();
+    expect(result.registry.git_head_reachability).toBe("unknown");
+    // Absent provenance is its own state: the tag gap is reported, but not as a
+    // tag-pipeline bypass, and not as a name collision either.
+    expect(result.registry.npm_latest_without_git_tag).toBe(false);
+    const codes = result.issues.map((issue) => issue.code);
+    expect(codes).toContain("npm_latest_without_git_tag_unverified");
+    expect(codes).not.toContain("npm_latest_without_git_tag");
+    expect(codes).not.toContain("registry_unrelated_name");
+  });
+
+  it("keeps the tag-pipeline warning when the artifact has no gitHead but declares this repo", () => {
+    // Requiring a reachable gitHead retired this check for most of the fleet:
+    // measured 2026-07-27 (UTC) against live npmjs, 15 of 36 readable
+    // DEFAULT_PACKAGE_CHECKS packages publish `latest` with no gitHead, and
+    // `npm view @hasna/repos@0.1.36 gitHead` is empty while
+    // `npm view @hasna/repos@0.1.36 repository.url` is
+    // git+https://github.com/hasna/repos.git. The tag gap is a real finding for
+    // those packages and must stay a warning.
+    writePackage({ repository: { type: "git", url: "git+https://github.com/hasna/repos.git" } });
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: null, repository: "git+https://github.com/hasna/repos.git" });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.git_head).toBeNull();
+    expect(result.registry.published_repository).toBe("github.com/hasna/repos");
+    expect(result.registry.repository_attribution).toBe("match");
+    expect(result.registry.npm_latest_without_git_tag).toBe(true);
+    const codes = result.issues.map((issue) => issue.code);
+    expect(codes).toContain("npm_latest_without_git_tag");
+    expect(codes).not.toContain("npm_latest_without_git_tag_unverified");
+    expect(result.status).toBe("warn");
+  });
+
+  it("does not claim tag-pipeline drift when neither gitHead nor repository attributes the artifact", () => {
+    // The npmjs @hasna/cli@0.1.0 shape on the repository axis: no repository at
+    // all. The tightening this PR added stays in force.
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: null, repository: null });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.repository_attribution).toBe("absent");
+    expect(result.registry.npm_latest_without_git_tag).toBe(false);
+    expect(result.issues.map((issue) => issue.code)).toContain("npm_latest_without_git_tag_unverified");
+  });
+
+  it("resolves the drift registry from publishConfig and skips npmjs when it is not the target", () => {
+    const seen: string[] = [];
+    writePackage({ publishConfig: { registry: "https://npm.pkg.github.com", access: "restricted", tag: "internal" } });
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner: OpsCommandRunner = (command, args) => {
+      seen.push(`${command} ${args.join(" ")}`);
+      return { ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 };
+    };
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.registry_url).toBe("https://npm.pkg.github.com");
+    expect(result.registry.registry_source).toBe("publishConfig.registry");
+    expect(result.registry.scope).toBe("non-npmjs-registry");
+    expect(result.registry.checked).toBe(false);
+    // No registry command ran at all: an npmjs lookup under this name would
+    // describe a different package.
+    expect(seen).toEqual([]);
+    const outOfScope = result.issues.find((issue) => issue.code === "registry_out_of_npmjs_scope");
+    expect(outOfScope?.message).toContain("npm.pkg.github.com");
+  });
+
+  it("positive control: the same capture records npm view when npmjs IS the target", () => {
+    const seen: string[] = [];
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner: OpsCommandRunner = (command, args) => {
+      seen.push(`${command} ${args.join(" ")}`);
+      return { ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 };
+    };
+
+    getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(seen.some((entry) => entry.startsWith("npm view @hasna/repos version"))).toBe(true);
+  });
+
+  it("classifies access=restricted on npmjs out of drift scope", () => {
+    writePackage({ publishConfig: { access: "restricted" } });
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: headSha() });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.registry_url).toBe("https://registry.npmjs.org");
+    expect(result.registry.registry_source).toBe("default-npmjs");
+    expect(result.registry.scope).toBe("npmjs-restricted");
+    expect(result.registry.checked).toBe(false);
+    expect(result.issues.map((issue) => issue.code)).toContain("registry_out_of_npmjs_scope");
   });
 
   it("passes the registry check when the npm latest version is tagged", () => {
@@ -318,7 +491,7 @@ describe("repo ops primitives", () => {
     writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
     initGitRepo();
     execFileSync("git", ["tag", "v9.9.9"], { cwd: tempDir, stdio: "pipe" });
-    const runner: OpsCommandRunner = () => ({ ok: true, stdout: "9.9.9", stderr: "", exitCode: 0 });
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: headSha() });
 
     const result = getReleasePipelineParity({ cwd: tempDir, runner });
 

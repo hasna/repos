@@ -62,6 +62,7 @@ import { upsertTaskSeeds, writeLoopReport } from "../lib/ops-loop-tasks.js";
 import { findFile, whoIs, diffStats, getDirtyRepos, getUnpushedRepos, getBehindRepos, getHealthReport, getRepoPath, getReport, getChurn, getLanguages, exportRepos, importFromOrg, fuzzyFindRepo } from "../lib/utils.js";
 import {
   getDocsDrift,
+  getManifestDependents,
   getPackageDrift,
   getPackageHealth,
   getReleaseHealth,
@@ -2109,6 +2110,26 @@ addOpsOptions(packageOps
     const report = withTodos(
       getPackageDrift({ cwd, limit: intFlag(opts.limit, "--limit", 1) }),
       todosOpts(opts, cwd)
+    );
+    printOpsJson(report, opts.pretty);
+  });
+
+addOpsOptions(packageOps
+  .command("dependents")
+  .description("Confirm which repos declare an exact dependency on a package (not a substring match)")
+  .requiredOption("--name <package>", "Package name to confirm dependents for")
+  .requiredOption("--paths <paths>", "Comma-separated candidate repo paths")
+  .option("--max-depth <n>", "How deep to look for workspace manifests", "4"))
+  .action((opts: any) => {
+    const roots = String(opts.paths).split(",").map((entry: string) => entry.trim()).filter(Boolean);
+    const report = withTodos(
+      getManifestDependents({
+        packageName: String(opts.name),
+        roots,
+        limit: intFlag(opts.limit, "--limit", 1),
+        maxDepth: intFlag(opts.maxDepth, "--max-depth", 0),
+      }),
+      todosOpts(opts, process.cwd())
     );
     printOpsJson(report, opts.pretty);
   });
