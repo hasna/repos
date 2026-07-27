@@ -21,6 +21,7 @@ import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/githu
 import { buildGraph, queryNode, queryRelated, findPath, getDeps, getGraphStats } from "../lib/graph.js";
 import {
   getDocsDrift,
+  getManifestDependents,
   getPackageDrift,
   getPackageHealth,
   getReleaseHealth,
@@ -527,6 +528,19 @@ server.tool("release_pipeline_parity", "Check the standard ci.yml + tag-publish 
 }, async (args) => jsonText(withTodos(getReleasePipelineParity({
   cwd: args.cwd,
   includeRegistry: args.include_registry,
+  limit: args.limit,
+}), todosArgs(args))));
+
+server.tool("manifest_dependents", "Confirm which repos declare an exact dependency on a package (never a substring/code-search match)", {
+  package_name: z.string().describe("Package name to confirm dependents for"),
+  paths: z.array(z.string()).describe("Candidate repo paths to confirm"),
+  max_depth: z.number().optional().describe("How deep to look for workspace manifests; default 4"),
+  limit: z.number().optional().describe("Max returned items"),
+  ...todosShape,
+}, async (args) => jsonText(withTodos(getManifestDependents({
+  packageName: args.package_name,
+  roots: args.paths,
+  maxDepth: args.max_depth,
   limit: args.limit,
 }), todosArgs(args))));
 

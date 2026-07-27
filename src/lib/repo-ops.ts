@@ -1,6 +1,18 @@
 import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
+import {
+  collectRepoManifests,
+  confirmManifestDependents,
+  type ManifestDependentFinding,
+} from "./manifest-dependents.js";
+import {
+  gitHeadProbeArgs,
+  probeGitHeadReachability,
+  resolveRegistryTarget,
+  type GitHeadReachability,
+  type RegistryScope,
+} from "./registry-target.js";
 
 type IssueSeverity = "info" | "warning" | "error";
 type OpsStatus = "ok" | "warn" | "fail";
@@ -1197,9 +1209,22 @@ export function getReleasePipelineParity(options: {
   registry: {
     checked: boolean;
     package: string | null;
+    /** The registry actually consulted, resolved from publishConfig.registry. */
+    registry_url: string;
+    registry_source: "publishConfig.registry" | "default-npmjs";
+    scope: RegistryScope;
     npm_latest: string | null;
     git_tag_for_latest: string | null;
+    /**
+     * True only when the published artifact is provably from this repo and has
+     * no matching tag. Provenance is required because a name collision produces
+     * the same tagless-latest symptom — hasna/cli's npmjs artifact has no
+     * `v0.1.0` tag in hasna/cli because it was never built from that repo.
+     */
     npm_latest_without_git_tag: boolean;
+    /** `gitHead` of the published latest, when the publisher recorded one. */
+    git_head: string | null;
+    git_head_reachability: GitHeadReachability;
   };
 } {
   const root = rootOf(options.cwd);
@@ -1236,12 +1261,22 @@ export function getReleasePipelineParity(options: {
     }
   }
 
+  // The registry to compare against comes from the manifest. Comparing every
+  // package against npmjs is what let hasna/cli — publishConfig.registry
+  // npm.pkg.github.com, access restricted — be measured against an unrelated
+  // npmjs package of the same name.
+  const target = resolveRegistryTarget(pkg);
   const registry: ReturnType<typeof getReleasePipelineParity>["registry"] = {
     checked: false,
     package: redactMaybe(pkg?.name),
+    registry_url: target.registry_url,
+    registry_source: target.registry_source,
+    scope: target.scope,
     npm_latest: null,
     git_tag_for_latest: null,
     npm_latest_without_git_tag: false,
+    git_head: null,
+    git_head_reachability: "unknown",
   };
 
   if (options.includeRegistry !== false) {
@@ -1249,6 +1284,15 @@ export function getReleasePipelineParity(options: {
       issues.push({ code: "registry_check_skipped", severity: "info", message: "No package name; skipping npm registry drift check", ref: "package.json" });
     } else if (pkg.private) {
       issues.push({ code: "registry_check_skipped", severity: "info", message: "Package is private; skipping npm registry drift check", ref: "package.json" });
+    } else if (!target.in_npmjs_divergence_scope) {
+      // Separately classified rather than skipped silently: the scope and the
+      // reason are on the report so these packages remain auditable.
+      issues.push({
+        code: "registry_out_of_npmjs_scope",
+        severity: "info",
+        message: `Out of npmjs drift scope (${target.scope}): ${target.out_of_scope_reasons.join("; ")}`,
+        ref: "package.json",
+      });
     } else {
       const npm = runner("npm", ["view", pkg.name, "version"], { cwd: root, timeout: 15_000 });
       if (!npm.ok || !npm.stdout.trim()) {
@@ -1261,37 +1305,79 @@ export function getReleasePipelineParity(options: {
         registry.checked = true;
         const latest = npm.stdout.trim().split("\n")[0]!.replace(/^"|"$/g, "");
         registry.npm_latest = redactText(latest);
+
+        // Provenance of the published artifact. Without it, "npm latest has no
+        // matching git tag" cannot distinguish a publish that bypassed the tag
+        // pipeline from a package of the same name that was never built here.
+        const gitHeadView = runner("npm", ["view", `${pkg.name}@${latest}`, "gitHead"], { cwd: root, timeout: 15_000 });
+        const publishedGitHead = gitHeadView.ok
+          ? gitHeadView.stdout.trim().split("\n")[0]?.replace(/^"|"$/g, "").trim() || null
+          : null;
+        registry.git_head = publishedGitHead ? redactText(publishedGitHead) : null;
+
         const inside = git(root, ["rev-parse", "--is-inside-work-tree"], 3000);
         if (!inside.ok || inside.stdout !== "true") {
           issues.push({ code: "tag_check_skipped", severity: "info", message: "Path is not a git repository; skipping npm-latest tag check" });
         } else {
-          const tags = git(root, ["tag", "--list", `v${latest}`, latest], 5000);
-          let tag = tags.stdout.split("\n").map((line) => line.trim()).filter(Boolean)[0] ?? null;
-          if (!tag) {
-            // Local tags can be missing entirely (shallow/partial clones, CI
-            // checkouts with fetch-tags disabled). The registry path is already
-            // network-opt-in, so consult the remote before flagging drift.
-            const remote = git(root, ["ls-remote", "--tags", "origin", `v${latest}`, latest], 10_000);
-            if (remote.ok) {
-              tag =
-                remote.stdout
-                  .split("\n")
-                  .map((line) => line.trim())
-                  .filter(Boolean)
-                  .map((line) => line.split(/\s+/).pop() ?? "")
-                  .map((ref) => ref.replace(/^refs\/tags\//, "").replace(/\^\{\}$/, ""))
-                  .filter(Boolean)[0] ?? null;
-            }
-          }
-          registry.git_tag_for_latest = tag ? redactText(tag) : null;
-          if (!tag) {
-            registry.npm_latest_without_git_tag = true;
+          const shallow = git(root, ["rev-parse", "--is-shallow-repository"], 3000);
+          registry.git_head_reachability = probeGitHeadReachability({
+            gitHead: publishedGitHead,
+            isGitRepo: true,
+            isShallow: shallow.ok && shallow.stdout === "true",
+            runProbe: (sha) => {
+              const probe = git(root, gitHeadProbeArgs(sha), 5000);
+              return { status: probe.exitCode, stderr: probe.stderr };
+            },
+          });
+
+          if (registry.git_head_reachability === "absent") {
+            // Not drift. The registry name resolves to someone else's package,
+            // so no tag is expected here and none should be demanded.
             issues.push({
-              code: "npm_latest_without_git_tag",
+              code: "registry_unrelated_name",
               severity: "warning",
-              message: `npm latest ${redactText(latest)} has no matching git tag locally or on origin (publish bypassed the tag pipeline?)`,
-              ref: redactText(latest),
+              message: `${redactText(pkg.name)}@${redactText(latest)} on ${registry.registry_url} was published from ${registry.git_head}, which is not a commit in this repo — the registry name resolves to a different package, not a stale version`,
+              ref: redactText(pkg.name),
             });
+          } else {
+            const tags = git(root, ["tag", "--list", `v${latest}`, latest], 5000);
+            let tag = tags.stdout.split("\n").map((line) => line.trim()).filter(Boolean)[0] ?? null;
+            if (!tag) {
+              // Local tags can be missing entirely (shallow/partial clones, CI
+              // checkouts with fetch-tags disabled). The registry path is already
+              // network-opt-in, so consult the remote before flagging drift.
+              const remote = git(root, ["ls-remote", "--tags", "origin", `v${latest}`, latest], 10_000);
+              if (remote.ok) {
+                tag =
+                  remote.stdout
+                    .split("\n")
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .map((line) => line.split(/\s+/).pop() ?? "")
+                    .map((ref) => ref.replace(/^refs\/tags\//, "").replace(/\^\{\}$/, ""))
+                    .filter(Boolean)[0] ?? null;
+              }
+            }
+            registry.git_tag_for_latest = tag ? redactText(tag) : null;
+            if (!tag && registry.git_head_reachability === "reachable") {
+              registry.npm_latest_without_git_tag = true;
+              issues.push({
+                code: "npm_latest_without_git_tag",
+                severity: "warning",
+                message: `npm latest ${redactText(latest)} has no matching git tag locally or on origin (publish bypassed the tag pipeline?)`,
+                ref: redactText(latest),
+              });
+            } else if (!tag) {
+              // The tag really is missing, but the artifact cannot be attributed
+              // to this repo, so "bypassed the tag pipeline" is an unproven
+              // claim and must not be raised as one.
+              issues.push({
+                code: "npm_latest_without_git_tag_unverified",
+                severity: "info",
+                message: `npm latest ${redactText(latest)} has no matching git tag, and the published artifact carries no verifiable gitHead, so it cannot be attributed to this repo`,
+                ref: redactText(latest),
+              });
+            }
           }
         }
       }
@@ -1320,6 +1406,76 @@ export function getReleasePipelineParity(options: {
     issues: redactIssues(issues, limit),
     artifacts,
     truncated: issues.length > limit,
+  };
+}
+
+/**
+ * Confirm which candidate repos actually declare a dependency on a package.
+ *
+ * The correct replacement for `gh search code "<package>"`, which is substring
+ * matching: during the 2026-07 cleanup wave it reported hasna/clip
+ * (`@hasna/clip`) and hasnaxyz/iapp-clips (`@hasna/clips`) as dependents of
+ * `@hasna/cli`, and hasna/browserplan as a dependent of `entity_get` on the
+ * strength of Chromium identity-API source text. A candidate is confirmed only
+ * by an exact dependency-map key in a manifest; near misses are reported so a
+ * rejected candidate stays visible rather than silently vanishing.
+ */
+export function getManifestDependents(options: {
+  packageName: string;
+  roots: string[];
+  limit?: number;
+  maxDepth?: number;
+}): OpsReport & {
+  kind: "manifest_dependents";
+  package_name: string;
+  confirmed: ManifestDependentFinding[];
+  rejected: ManifestDependentFinding[];
+} {
+  const limit = capLimit(options.limit);
+  const root = rootOf();
+  const packageName = options.packageName.trim();
+  const issues: OpsIssue[] = [];
+
+  const candidates = options.roots.map((candidateRoot) => {
+    const absolute = resolve(candidateRoot);
+    return {
+      candidate: redactPath(absolute),
+      manifests: existsSync(absolute) ? collectRepoManifests(absolute, { maxDepth: options.maxDepth }) : [],
+    };
+  });
+
+  const result = confirmManifestDependents({ packageName, candidates });
+
+  if (packageName.length === 0) {
+    issues.push({ code: "dependent_query_empty", severity: "error", message: "No package name to confirm dependents for" });
+  }
+  for (const finding of result.rejected) {
+    if (finding.rejection !== "substring-only-match") continue;
+    issues.push({
+      code: "dependent_substring_only",
+      severity: "info",
+      message: `${finding.candidate} declares ${finding.near_miss_names.join(", ")} but no dependency on ${redactText(packageName)}; a substring search would have reported it as a dependent`,
+      ref: finding.candidate,
+    });
+  }
+
+  return {
+    kind: "manifest_dependents",
+    schema_version: SCHEMA_VERSION,
+    status: statusFor(issues),
+    root: redactPath(root),
+    package_name: redactText(packageName),
+    summary: {
+      candidates: result.summary.candidates,
+      confirmed: result.summary.confirmed,
+      rejected: result.summary.rejected,
+      substring_only: result.summary.substring_only,
+    },
+    confirmed: result.confirmed.slice(0, limit),
+    rejected: result.rejected.slice(0, limit),
+    issues: redactIssues(issues, limit),
+    artifacts: [],
+    truncated: result.confirmed.length > limit || result.rejected.length > limit,
   };
 }
 
