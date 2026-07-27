@@ -7,11 +7,14 @@ import {
   type ManifestDependentFinding,
 } from "./manifest-dependents.js";
 import {
+  attributeRepository,
   gitHeadProbeArgs,
+  normalizeRepositoryIdentity,
   probeGitHeadReachability,
   resolveRegistryTarget,
   type GitHeadReachability,
   type RegistryScope,
+  type RepositoryAttribution,
 } from "./registry-target.js";
 
 type IssueSeverity = "info" | "warning" | "error";
@@ -70,6 +73,7 @@ interface PackageJson {
   peerDependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
   publishConfig?: Record<string, unknown>;
+  repository?: unknown;
 }
 
 export interface CommandResult {
@@ -1225,6 +1229,14 @@ export function getReleasePipelineParity(options: {
     /** `gitHead` of the published latest, when the publisher recorded one. */
     git_head: string | null;
     git_head_reachability: GitHeadReachability;
+    /** The published artifact's own `repository`, normalized to host/owner/name. */
+    published_repository: string | null;
+    /**
+     * Whether that repository is this repo. The weaker of the two provenance
+     * axes, and the only one available for the ~40% of fleet artifacts published
+     * without a `gitHead`.
+     */
+    repository_attribution: RepositoryAttribution;
   };
 } {
   const root = rootOf(options.cwd);
@@ -1277,6 +1289,8 @@ export function getReleasePipelineParity(options: {
     npm_latest_without_git_tag: false,
     git_head: null,
     git_head_reachability: "unknown",
+    published_repository: null,
+    repository_attribution: "absent",
   };
 
   if (options.includeRegistry !== false) {
@@ -1314,6 +1328,20 @@ export function getReleasePipelineParity(options: {
           ? gitHeadView.stdout.trim().split("\n")[0]?.replace(/^"|"$/g, "").trim() || null
           : null;
         registry.git_head = publishedGitHead ? redactText(publishedGitHead) : null;
+
+        // Second, weaker provenance axis, for the majority of artifacts that
+        // carry no gitHead at all. Without it, every such package loses the
+        // tag-pipeline-bypass signal entirely.
+        const repositoryView = runner("npm", ["view", `${pkg.name}@${latest}`, "repository.url"], { cwd: root, timeout: 15_000 });
+        const publishedRepository = repositoryView.ok
+          ? repositoryView.stdout.trim().split("\n")[0]?.replace(/^"|"$/g, "").trim() || null
+          : null;
+        const originUrl = git(root, ["config", "--get", "remote.origin.url"], 3000);
+        registry.published_repository = normalizeRepositoryIdentity(publishedRepository);
+        registry.repository_attribution = attributeRepository(publishedRepository, [
+          (pkg as { repository?: unknown }).repository,
+          originUrl.ok ? originUrl.stdout.trim() : null,
+        ]);
 
         const inside = git(root, ["rev-parse", "--is-inside-work-tree"], 3000);
         if (!inside.ok || inside.stdout !== "true") {
@@ -1359,7 +1387,13 @@ export function getReleasePipelineParity(options: {
               }
             }
             registry.git_tag_for_latest = tag ? redactText(tag) : null;
-            if (!tag && registry.git_head_reachability === "reachable") {
+            // Attributable either by a reachable gitHead (proof) or, for the
+            // majority of artifacts that carry no gitHead, by the artifact
+            // declaring exactly this repository (corroboration). Requiring the
+            // gitHead alone silently retired this check for most of the fleet.
+            const attributable = registry.git_head_reachability === "reachable"
+              || (publishedGitHead === null && registry.repository_attribution === "match");
+            if (!tag && attributable) {
               registry.npm_latest_without_git_tag = true;
               issues.push({
                 code: "npm_latest_without_git_tag",
@@ -1374,7 +1408,7 @@ export function getReleasePipelineParity(options: {
               issues.push({
                 code: "npm_latest_without_git_tag_unverified",
                 severity: "info",
-                message: `npm latest ${redactText(latest)} has no matching git tag, and the published artifact carries no verifiable gitHead, so it cannot be attributed to this repo`,
+                message: `npm latest ${redactText(latest)} has no matching git tag, and the published artifact cannot be attributed to this repo (no verifiable gitHead, repository attribution ${registry.repository_attribution})`,
                 ref: redactText(latest),
               });
             }

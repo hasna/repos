@@ -26,6 +26,7 @@ function writePackage(options: {
   scriptPort?: number;
   license?: string;
   publishConfig?: Record<string, unknown>;
+  repository?: unknown;
 } = {}) {
   const packageName = options.name ?? "@hasna/repos";
   const scripts: Record<string, string> = {
@@ -48,6 +49,7 @@ function writePackage(options: {
     version: "1.2.3",
     license: options.license ?? "Apache-2.0",
     publishConfig: options.publishConfig,
+    repository: options.repository,
     scripts,
     bin: options.bin ? { repos: "bin/cli.js" } : undefined,
     dependencies: {
@@ -94,11 +96,16 @@ function headSha(): string {
  * from this repo, which is exactly how hasna/cli's unrelated npmjs package read
  * as tag-pipeline drift.
  */
-function npmViewRunner(opts: { version: string; gitHead?: string | null }): OpsCommandRunner {
+function npmViewRunner(opts: { version: string; gitHead?: string | null; repository?: string | null }): OpsCommandRunner {
   return (command, args) => {
     if (command === "npm" && args.includes("view") && args.includes("gitHead")) {
       return opts.gitHead
         ? { ok: true, stdout: opts.gitHead, stderr: "", exitCode: 0 }
+        : { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    }
+    if (command === "npm" && args.includes("view") && args.includes("repository.url")) {
+      return opts.repository
+        ? { ok: true, stdout: opts.repository, stderr: "", exitCode: 0 }
         : { ok: true, stdout: "", stderr: "", exitCode: 0 };
     }
     if (command === "npm" && args.includes("view") && args.includes("version")) {
@@ -384,6 +391,46 @@ describe("repo ops primitives", () => {
     expect(codes).toContain("npm_latest_without_git_tag_unverified");
     expect(codes).not.toContain("npm_latest_without_git_tag");
     expect(codes).not.toContain("registry_unrelated_name");
+  });
+
+  it("keeps the tag-pipeline warning when the artifact has no gitHead but declares this repo", () => {
+    // Requiring a reachable gitHead retired this check for most of the fleet:
+    // measured 2026-07-27 (UTC) against live npmjs, 15 of 36 readable
+    // DEFAULT_PACKAGE_CHECKS packages publish `latest` with no gitHead, and
+    // `npm view @hasna/repos@0.1.36 gitHead` is empty while
+    // `npm view @hasna/repos@0.1.36 repository.url` is
+    // git+https://github.com/hasna/repos.git. The tag gap is a real finding for
+    // those packages and must stay a warning.
+    writePackage({ repository: { type: "git", url: "git+https://github.com/hasna/repos.git" } });
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: null, repository: "git+https://github.com/hasna/repos.git" });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.git_head).toBeNull();
+    expect(result.registry.published_repository).toBe("github.com/hasna/repos");
+    expect(result.registry.repository_attribution).toBe("match");
+    expect(result.registry.npm_latest_without_git_tag).toBe(true);
+    const codes = result.issues.map((issue) => issue.code);
+    expect(codes).toContain("npm_latest_without_git_tag");
+    expect(codes).not.toContain("npm_latest_without_git_tag_unverified");
+    expect(result.status).toBe("warn");
+  });
+
+  it("does not claim tag-pipeline drift when neither gitHead nor repository attributes the artifact", () => {
+    // The npmjs @hasna/cli@0.1.0 shape on the repository axis: no repository at
+    // all. The tightening this PR added stays in force.
+    writePackage();
+    writeWorkflows({ publish: "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n" });
+    initGitRepo();
+    const runner = npmViewRunner({ version: "9.9.9", gitHead: null, repository: null });
+
+    const result = getReleasePipelineParity({ cwd: tempDir, runner });
+
+    expect(result.registry.repository_attribution).toBe("absent");
+    expect(result.registry.npm_latest_without_git_tag).toBe(false);
+    expect(result.issues.map((issue) => issue.code)).toContain("npm_latest_without_git_tag_unverified");
   });
 
   it("resolves the drift registry from publishConfig and skips npmjs when it is not the target", () => {

@@ -112,6 +112,31 @@ export type GitHeadReachability = "reachable" | "absent" | "unknown";
  */
 export type PackageNameAuthority = "manifest" | "publish-script";
 
+/**
+ * Whether the registry artifact's own `repository` field names the repo being
+ * audited.
+ *
+ * A *weaker* signal than `gitHead` on purpose, and labelled as such wherever it
+ * is used: `gitHead` is a claim we can check against our own object database,
+ * whereas `repository` is only the publisher's assertion. It is still the
+ * decisive signal for the common case, because `gitHead` is simply absent from
+ * most published artifacts — measured 2026-07-27 (UTC) against live npmjs, 15 of
+ * 36 readable fleet packages (`DEFAULT_PACKAGE_CHECKS`) publish their `latest`
+ * with no `gitHead`, including `@hasna/repos`, `@hasna/todos` and
+ * `@hasna/conversations`, all of which do declare `repository`. The npmjs
+ * `@hasna/cli@0.1.0` artifact that caused the incident declares neither a
+ * `repository` nor a `homepage`, so it is `absent` on this axis too.
+ */
+export type RepositoryAttribution =
+  /** The artifact names exactly the repo under audit. */
+  | "match"
+  /** The artifact names a different repo. */
+  | "mismatch"
+  /** The artifact declares no repository at all. */
+  | "absent"
+  /** We have no identity for the repo under audit to compare against. */
+  | "unknown";
+
 export interface RegistryArtifactState {
   /** The registry answered at all (not offline, not auth-walled). */
   readable: boolean;
@@ -121,6 +146,12 @@ export interface RegistryArtifactState {
   /** `gitHead` from the registry manifest; null when the publisher omitted it. */
   git_head: string | null;
   git_head_reachability: GitHeadReachability;
+  /**
+   * The artifact's declared `repository`, normalized to `host/owner/name`; null
+   * when it declares none.
+   */
+  repository: string | null;
+  repository_attribution: RepositoryAttribution;
 }
 
 export type RegistryDivergenceClassification =
@@ -130,6 +161,13 @@ export type RegistryDivergenceClassification =
   | "DIVERGED"
   /** Registry artifact's commit is not in this repo — a name collision. */
   | "UNRELATED-NAME"
+  /**
+   * No `gitHead`, but the artifact declares exactly this repository, so lineage
+   * is corroborated by the publisher's assertion rather than proven by a commit.
+   * Weaker than `DIVERGED`, and deliberately a separate value so nothing keying
+   * on `DIVERGED` silently gains this case.
+   */
+  | "PROVENANCE-REPOSITORY-ONLY"
   /** No usable `gitHead`, or reachability could not be established. */
   | "PROVENANCE-UNVERIFIED"
   /** This package does not publish to npmjs anonymously; not measured here. */
@@ -204,6 +242,77 @@ export function registryHostOf(url: string | null): string | null {
  */
 export function isNpmjsRegistryHost(host: string | null): boolean {
   return host === NPMJS_REGISTRY_HOST;
+}
+
+/**
+ * Normalize a repository reference to `host/owner/name`, lowercased.
+ *
+ * npm accepts a `repository` as an object with a `url`, a plain URL, an SCP-style
+ * git address, a `github:owner/name` shorthand, or a bare `owner/name`, and the
+ * same repo appears in each of those forms across the fleet
+ * (`git+https://github.com/hasna/repos.git` on npmjs `@hasna/repos` vs
+ * `https://github.com/hasna/todos.git` on `@hasna/todos`). They must all reduce
+ * to one comparable identity, or a legitimate match reads as a mismatch.
+ *
+ * Returns null for anything unparseable — never a partial match, and never a
+ * substring test, which is the defect this whole module exists to fix.
+ */
+export function normalizeRepositoryIdentity(value: unknown): string | null {
+  const fromObject =
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)["url"]
+      : value;
+  let raw = trimmedString(fromObject);
+  if (!raw) return null;
+
+  // `git+https://…`, `git+ssh://…` — strip the VCS prefix npm adds.
+  raw = raw.replace(/^git\+/i, "");
+  // `github:owner/name`, `gitlab:owner/name`, `bitbucket:owner/name`.
+  const shorthandHosts: Record<string, string> = {
+    github: "github.com",
+    gitlab: "gitlab.com",
+    bitbucket: "bitbucket.org",
+  };
+  const shorthand = /^([a-z]+):([^/\s]+\/[^/\s]+)$/i.exec(raw);
+  if (shorthand && shorthandHosts[shorthand[1]!.toLowerCase()]) {
+    raw = `https://${shorthandHosts[shorthand[1]!.toLowerCase()]}/${shorthand[2]}`;
+  } else if (/^[^/\s:@]+\/[^/\s:@]+$/.test(raw)) {
+    // Bare `owner/name` shorthand: npm resolves it to GitHub.
+    raw = `https://github.com/${raw}`;
+  } else if (/^[^\s/]+@[^\s:]+:[^\s]+$/.test(raw)) {
+    // SCP-style `git@github.com:owner/name.git`.
+    raw = `https://${raw.replace(/^[^\s@]+@/, "").replace(":", "/")}`;
+  } else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    raw = `https://${raw}`;
+  }
+
+  try {
+    const url = new URL(raw);
+    const path = url.pathname.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+    if (!path) return null;
+    return `${url.host.toLowerCase()}/${path.toLowerCase()}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does the registry artifact claim to come from the repo under audit?
+ *
+ * Exact identity equality only. `unknown` when we have nothing to compare
+ * against, so an absent local identity cannot be read as a mismatch.
+ */
+export function attributeRepository(
+  artifactRepository: unknown,
+  repoIdentities: Array<unknown>,
+): RepositoryAttribution {
+  const known = repoIdentities
+    .map((identity) => normalizeRepositoryIdentity(identity))
+    .filter((identity): identity is string => identity !== null);
+  const artifact = normalizeRepositoryIdentity(artifactRepository);
+  if (!artifact) return "absent";
+  if (known.length === 0) return "unknown";
+  return known.includes(artifact) ? "match" : "mismatch";
 }
 
 /** `license: "UNLICENSED"` is npm's marker for "do not publish this". */
@@ -404,23 +513,48 @@ export function classifyRegistryDivergence(input: {
       reasons,
     };
   }
+  // Provenance grade, settled before any version comparison. `DIVERGED` requires
+  // a gitHead that is a commit here; `PROVENANCE-REPOSITORY-ONLY` is the weaker
+  // grade for the (majority) case of an artifact published without a gitHead that
+  // nonetheless names this repository. Everything else refuses.
+  let divergentClassification: "DIVERGED" | "PROVENANCE-REPOSITORY-ONLY";
   if (artifact.git_head === null) {
-    reasons.push(
-      `registry artifact ${target.package_name ?? "?"}@${artifact.version ?? "?"} carries no gitHead, so it cannot be tied to this repo's history`,
-    );
-    return refuse("PROVENANCE-UNVERIFIED");
-  }
-  if (artifact.git_head_reachability === "absent") {
+    // Absent gitHead is the norm, not a red flag: `npm publish`/`bun publish`
+    // outside a git checkout, and several publish workflows, simply omit it. It
+    // must not be treated as evidence of a name collision — that would block the
+    // release audit for most of the fleet. The publisher's own `repository`
+    // field is the available corroboration.
+    if (artifact.repository_attribution === "match") {
+      reasons.push(
+        `registry artifact ${target.package_name ?? "?"}@${artifact.version ?? "?"} carries no gitHead, but declares repository ${artifact.repository} — lineage is corroborated by the publisher's assertion, not proven by a commit`,
+      );
+      divergentClassification = "PROVENANCE-REPOSITORY-ONLY";
+    } else {
+      reasons.push(
+        `registry artifact ${target.package_name ?? "?"}@${artifact.version ?? "?"} carries no gitHead, so it cannot be tied to this repo's history`,
+        artifact.repository_attribution === "mismatch"
+          ? `and it declares repository ${artifact.repository}, which is not this repo`
+          : artifact.repository_attribution === "absent"
+            ? "and it declares no repository either"
+            : "and this repo has no declared identity to compare its repository against",
+      );
+      return refuse("PROVENANCE-UNVERIFIED");
+    }
+  } else if (artifact.git_head_reachability === "absent") {
+    // Unconditional, and never rescued by `repository_attribution`: a publisher
+    // can assert any repository, but a gitHead that is provably not in our object
+    // database is positive evidence of a different package.
     reasons.push(
       `registry artifact ${target.package_name ?? "?"}@${artifact.version ?? "?"} was published from ${artifact.git_head}, which is not a commit in this repo — a different package sharing this name, not a stale version`,
     );
     return refuse("UNRELATED-NAME");
-  }
-  if (artifact.git_head_reachability === "unknown") {
+  } else if (artifact.git_head_reachability === "unknown") {
     reasons.push(
       `could not establish whether ${artifact.git_head} is a commit in this repo, so shared lineage is unproven`,
     );
     return refuse("PROVENANCE-UNVERIFIED");
+  } else {
+    divergentClassification = "DIVERGED";
   }
 
   if (repoVersion && artifact.version && repoVersion === artifact.version) {
@@ -439,11 +573,15 @@ export function classifyRegistryDivergence(input: {
   }
 
   reasons.push(
-    `repo ${repoVersion} differs from ${target.registry_host} ${artifact.version ?? "?"}, and ${artifact.git_head} is a commit in this repo`,
+    divergentClassification === "DIVERGED"
+      ? `repo ${repoVersion} differs from ${target.registry_host} ${artifact.version ?? "?"}, and ${artifact.git_head} is a commit in this repo`
+      : `repo ${repoVersion} differs from ${target.registry_host} ${artifact.version ?? "?"}, on lineage corroborated only by the artifact's repository field`,
   );
   return {
-    classification: "DIVERGED",
-    divergent: true,
+    classification: divergentClassification,
+    // `divergent` stays reserved for proven lineage, so consumers keying on it
+    // keep the stronger meaning they had.
+    divergent: divergentClassification === "DIVERGED",
     publish_allowed: target.publish_allowed,
     publish_refusals: target.publish_refusals.map((refusal) => describePublishRefusal(refusal, target)),
     reasons,

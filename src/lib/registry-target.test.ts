@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  attributeRepository,
   classifyRegistryDivergence,
   detectPackageNameAuthority,
   gitHeadProbeArgs,
   isNpmjsRegistryHost,
   isUnlicensed,
   normalizeRegistryUrl,
+  normalizeRepositoryIdentity,
   probeGitHeadReachability,
   registryHostOf,
   resolveRegistryTarget,
@@ -44,6 +46,10 @@ const HASNA_CLI_NPMJS_ARTIFACT: RegistryArtifactState = {
   version: "0.1.0",
   git_head: "207800eaf5bc582999b227a2ef7393b5e0991a4e",
   git_head_reachability: "absent",
+  // The real npmjs @hasna/cli@0.1.0 document declares neither `repository` nor
+  // `homepage` (verified 2026-07-27 UTC), so it is unattributable on both axes.
+  repository: null,
+  repository_attribution: "absent",
 };
 
 describe("registry url resolution", () => {
@@ -267,7 +273,7 @@ describe("divergence classification", () => {
       repoVersion: "0.2.0",
       // Registry manifests published by older npm, or by tooling that strips
       // git metadata, carry no gitHead at all.
-      artifact: { readable: true, published: true, version: "0.1.0", git_head: null, git_head_reachability: "unknown" },
+      artifact: { readable: true, published: true, version: "0.1.0", git_head: null, git_head_reachability: "unknown", repository: null, repository_attribution: "absent" },
     });
 
     expect(result.classification).toBe("PROVENANCE-UNVERIFIED");
@@ -278,11 +284,109 @@ describe("divergence classification", () => {
     expect(result.reasons.join(" ")).toContain("carries no gitHead");
   });
 
+  /**
+   * Regression guard for the *other* direction of the same defect.
+   *
+   * Requiring a reachable `gitHead` before an audit may propose a release blocks
+   * the audit for most of the fleet, because most published artifacts have no
+   * `gitHead` at all. Measured 2026-07-27 (UTC) against live npmjs across
+   * `DEFAULT_PACKAGE_CHECKS`: 15 of 36 readable packages publish `latest` with
+   * no `gitHead`, `@hasna/repos@0.1.36` among them — and all of those do declare
+   * `repository`. So absent `gitHead` plus a matching `repository` is the common,
+   * legitimate case and must not be treated as a possible name collision.
+   */
+  test("absent gitHead with a matching repository is corroborated, not refused", () => {
+    const result = classifyRegistryDivergence({
+      target: resolveRegistryTarget({ name: "@hasna/repos", version: "0.1.37", license: "Apache-2.0" }),
+      repoVersion: "0.1.37",
+      artifact: {
+        readable: true,
+        published: true,
+        version: "0.1.36",
+        git_head: null,
+        git_head_reachability: "unknown",
+        repository: "github.com/hasna/repos",
+        repository_attribution: "match",
+      },
+    });
+
+    expect(result.classification).toBe("PROVENANCE-REPOSITORY-ONLY");
+    // A weaker grade than DIVERGED, and deliberately not DIVERGED, so nothing
+    // keying on proven lineage silently absorbs this case.
+    expect(result.classification).not.toBe("DIVERGED");
+    expect(result.divergent).toBe(false);
+    // But the release may be proposed: manifest policy is the only thing that
+    // may refuse it, and this manifest is licensed and public.
+    expect(result.publish_allowed).toBe(true);
+    expect(result.publish_refusals).toEqual([]);
+    expect(result.reasons.join(" ")).toContain("declares repository github.com/hasna/repos");
+  });
+
+  test("absent gitHead with a mismatched repository is still refused", () => {
+    const result = classifyRegistryDivergence({
+      target: resolveRegistryTarget({ name: "@hasna/repos", version: "0.1.37", license: "Apache-2.0" }),
+      repoVersion: "0.1.37",
+      artifact: {
+        readable: true,
+        published: true,
+        version: "0.1.36",
+        git_head: null,
+        git_head_reachability: "unknown",
+        repository: "github.com/someone-else/repos",
+        repository_attribution: "mismatch",
+      },
+    });
+
+    expect(result.classification).toBe("PROVENANCE-UNVERIFIED");
+    expect(result.publish_allowed).toBe(false);
+    expect(result.reasons.join(" ")).toContain("github.com/someone-else/repos");
+  });
+
+  test("a matching repository never rescues a gitHead that is provably not here", () => {
+    // The publisher asserts the repository; we can check the gitHead. When the
+    // checkable signal says "different package", the assertion loses.
+    const result = classifyRegistryDivergence({
+      target: resolveRegistryTarget({ name: "@hasna/cli", version: "0.2.0", license: "Apache-2.0" }),
+      repoVersion: "0.2.0",
+      artifact: {
+        readable: true,
+        published: true,
+        version: "0.1.0",
+        git_head: "207800eaf5bc582999b227a2ef7393b5e0991a4e",
+        git_head_reachability: "absent",
+        repository: "github.com/hasna/cli",
+        repository_attribution: "match",
+      },
+    });
+
+    expect(result.classification).toBe("UNRELATED-NAME");
+    expect(result.publish_allowed).toBe(false);
+  });
+
+  test("repository-only provenance still reports IN-SYNC when versions match", () => {
+    const result = classifyRegistryDivergence({
+      target: resolveRegistryTarget({ name: "@hasna/repos", version: "0.1.36", license: "Apache-2.0" }),
+      repoVersion: "0.1.36",
+      artifact: {
+        readable: true,
+        published: true,
+        version: "0.1.36",
+        git_head: null,
+        git_head_reachability: "unknown",
+        repository: "github.com/hasna/repos",
+        repository_attribution: "match",
+      },
+    });
+
+    expect(result.classification).toBe("IN-SYNC");
+    expect(result.publish_allowed).toBe(false);
+  });
+
   test("unknown reachability does not license a divergence claim", () => {
     const result = classifyRegistryDivergence({
       target: resolveRegistryTarget({ name: "@x/y", version: "0.2.0" }),
       repoVersion: "0.2.0",
-      artifact: { readable: true, published: true, version: "0.1.0", git_head: "abcdef1234567890", git_head_reachability: "unknown" },
+      artifact: { readable: true, published: true, version: "0.1.0", git_head: "abcdef1234567890", git_head_reachability: "unknown", repository: null, repository_attribution: "absent" },
     });
 
     expect(result.classification).toBe("PROVENANCE-UNVERIFIED");
@@ -293,7 +397,7 @@ describe("divergence classification", () => {
     const result = classifyRegistryDivergence({
       target: resolveRegistryTarget({ name: "@hasna/repos", version: "0.2.0", license: "Apache-2.0" }),
       repoVersion: "0.2.0",
-      artifact: { readable: true, published: true, version: "0.1.0", git_head: "abcdef1234567890", git_head_reachability: "reachable" },
+      artifact: { readable: true, published: true, version: "0.1.0", git_head: "abcdef1234567890", git_head_reachability: "reachable", repository: null, repository_attribution: "absent" },
     });
 
     expect(result.classification).toBe("DIVERGED");
@@ -305,7 +409,7 @@ describe("divergence classification", () => {
     const result = classifyRegistryDivergence({
       target: resolveRegistryTarget({ name: "@hasna/repos", version: "0.1.36", license: "Apache-2.0" }),
       repoVersion: "0.1.36",
-      artifact: { readable: true, published: true, version: "0.1.36", git_head: "abcdef1234567890", git_head_reachability: "reachable" },
+      artifact: { readable: true, published: true, version: "0.1.36", git_head: "abcdef1234567890", git_head_reachability: "reachable", repository: null, repository_attribution: "absent" },
     });
 
     expect(result.classification).toBe("IN-SYNC");
@@ -317,7 +421,7 @@ describe("divergence classification", () => {
     const result = classifyRegistryDivergence({
       target: resolveRegistryTarget({ name: "@hasna/repos", version: "0.2.0" }),
       repoVersion: "0.2.0",
-      artifact: { readable: false, published: false, version: null, git_head: null, git_head_reachability: "unknown" },
+      artifact: { readable: false, published: false, version: null, git_head: null, git_head_reachability: "unknown", repository: null, repository_attribution: "absent" },
     });
 
     expect(result.classification).toBe("REGISTRY-UNREADABLE");
@@ -328,7 +432,7 @@ describe("divergence classification", () => {
     const result = classifyRegistryDivergence({
       target: resolveRegistryTarget({ name: "@hasna/brand-new", version: "0.1.0", license: "Apache-2.0" }),
       repoVersion: "0.1.0",
-      artifact: { readable: true, published: false, version: null, git_head: null, git_head_reachability: "unknown" },
+      artifact: { readable: true, published: false, version: null, git_head: null, git_head_reachability: "unknown", repository: null, repository_attribution: "absent" },
     });
 
     expect(result.classification).toBe("NOT-PUBLISHED");
@@ -343,13 +447,57 @@ describe("divergence classification", () => {
     const result = classifyRegistryDivergence({
       target: resolveRegistryTarget({ name: "@hasna/aicopilot", version: "0.3.0", license: "Apache-2.0" }),
       repoVersion: "0.3.0",
-      artifact: { readable: true, published: false, version: null, git_head: null, git_head_reachability: "unknown" },
+      artifact: { readable: true, published: false, version: null, git_head: null, git_head_reachability: "unknown", repository: null, repository_attribution: "absent" },
       nameAuthority: "publish-script",
     });
 
     expect(result.classification).toBe("NOT-PUBLISHED-NAME-UNVERIFIED");
     expect(result.publish_allowed).toBe(false);
     expect(result.reasons.join(" ")).toContain("rewrites the package name");
+  });
+});
+
+describe("repository identity attribution", () => {
+  test("normalizes every repository form npm accepts to one identity", () => {
+    // All of these are the same repo, and all of these forms occur in the fleet:
+    // npmjs @hasna/repos declares "git+https://…/repos.git", @hasna/todos
+    // declares "https://…/todos.git" (verified 2026-07-27 UTC).
+    const expected = "github.com/hasna/repos";
+    for (const form of [
+      "git+https://github.com/hasna/repos.git",
+      "https://github.com/hasna/repos",
+      "https://github.com/hasna/repos.git",
+      "git+ssh://git@github.com/hasna/repos.git",
+      "git@github.com:hasna/repos.git",
+      "github:hasna/repos",
+      "hasna/repos",
+      "github.com/hasna/repos/",
+      { type: "git", url: "git+https://github.com/hasna/repos.git" },
+    ]) {
+      expect(normalizeRepositoryIdentity(form)).toBe(expected);
+    }
+  });
+
+  test("does not collapse different repos onto one identity", () => {
+    expect(normalizeRepositoryIdentity("https://github.com/hasna/repo")).toBe("github.com/hasna/repo");
+    expect(normalizeRepositoryIdentity("https://github.com/hasna/repos")).not.toBe("github.com/hasna/repo");
+    // A different host with the same path is a different repo.
+    expect(normalizeRepositoryIdentity("https://gitlab.com/hasna/repos")).toBe("gitlab.com/hasna/repos");
+    expect(normalizeRepositoryIdentity("")).toBeNull();
+    expect(normalizeRepositoryIdentity(null)).toBeNull();
+    expect(normalizeRepositoryIdentity({ type: "git" })).toBeNull();
+  });
+
+  test("attributes by exact identity, never by substring", () => {
+    expect(attributeRepository("git+https://github.com/hasna/repos.git", ["hasna/repos"])).toBe("match");
+    expect(attributeRepository("git+https://github.com/hasna/repos.git", ["hasna/repo"])).toBe("mismatch");
+    // The substring family again: "repos" contains "repo" and vice versa.
+    expect(attributeRepository("https://github.com/hasna/repo", ["hasna/repos"])).toBe("mismatch");
+    expect(attributeRepository(null, ["hasna/repos"])).toBe("absent");
+    expect(attributeRepository("hasna/repos", [])).toBe("unknown");
+    expect(attributeRepository("hasna/repos", [null, undefined])).toBe("unknown");
+    // Any one of several known identities is enough.
+    expect(attributeRepository("hasna/repos", ["hasna/other", "git@github.com:hasna/repos.git"])).toBe("match");
   });
 });
 

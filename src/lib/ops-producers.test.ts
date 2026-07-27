@@ -733,6 +733,89 @@ describe("ops producers", () => {
       expect(result.task_suggestions.filter((seed) => seed.title.startsWith("Prepare release"))).toEqual([]);
     });
 
+    /**
+     * Regression guard for the opposite failure: refusing to audit the fleet.
+     *
+     * Most published artifacts carry no `gitHead` at all — measured 2026-07-27
+     * (UTC) against live npmjs, 15 of the 36 readable `DEFAULT_PACKAGE_CHECKS`
+     * packages, including `@hasna/repos@0.1.36` itself. Treating that as a
+     * possible name collision blocked the release audit for all of them and filed
+     * a fresh "Resolve release blockers" seed per commit, because `latest` will
+     * never retroactively gain a `gitHead`.
+     *
+     * The artifact's own `repository` is the available corroboration, and npmjs
+     * `@hasna/repos@0.1.36` does declare `git+https://github.com/hasna/repos.git`
+     * while the incident artifact `@hasna/cli@0.1.0` declares nothing.
+     */
+    test("an artifact with no gitHead but a matching repository is still a candidate", () => {
+      const repoPath = writePackageJsonVersion("@hasna/repos", "0.1.37", {
+        license: "Apache-2.0",
+        repository: { type: "git", url: "git+https://github.com/hasna/repos.git" },
+      });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/repos",
+        fetch: false,
+        runner: hasnaCliRunner({
+          latestNpmVersion: "0.1.36",
+          latestReachableTag: "v0.1.36",
+          latestGithubRelease: "v0.1.36",
+          npmGitHead: null,
+          npmRepository: "git+https://github.com/hasna/repos.git",
+        }),
+      });
+
+      expect(result.state.registry.artifact.git_head).toBeNull();
+      expect(result.state.registry.artifact.repository).toBe("github.com/hasna/repos");
+      expect(result.state.registry.artifact.repository_attribution).toBe("match");
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-REPOSITORY-ONLY");
+      // Warn, not block: the audit proceeds, and says on what grade of evidence.
+      const gate = result.gates.find((entry) => entry.id === "registry-provenance-repository-only");
+      expect(gate?.status).toBe("warn");
+      expect(result.gates.filter((entry) => entry.status === "block")).toEqual([]);
+      expect(result.summary.status).toBe("candidate");
+      expect(result.publish_action.allowed).toBe(true);
+      expect(result.task_suggestions.map((seed) => seed.title)).toEqual(["Prepare release hasna/repos v0.1.37"]);
+    });
+
+    test("no gitHead and no repository stays blocked", () => {
+      // The tightening is not undone: with neither provenance axis, the audit
+      // still refuses. This is the npmjs @hasna/cli@0.1.0 shape.
+      const repoPath = writePackageJsonVersion("@hasna/repos", "0.1.37", { license: "Apache-2.0" });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/repos",
+        fetch: false,
+        runner: hasnaCliRunner({ npmGitHead: null, npmRepository: null }),
+      });
+
+      expect(result.state.registry.artifact.repository_attribution).toBe("absent");
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-UNVERIFIED");
+      expect(result.gates.map((gate) => gate.id)).toContain("registry-provenance-unverified");
+      expect(result.summary.status).toBe("blocked");
+      expect(result.task_suggestions.filter((seed) => seed.title.startsWith("Prepare release"))).toEqual([]);
+    });
+
+    test("no gitHead and a repository pointing at a different repo stays blocked", () => {
+      const repoPath = writePackageJsonVersion("@hasna/repos", "0.1.37", {
+        license: "Apache-2.0",
+        repository: { type: "git", url: "https://github.com/hasna/repos" },
+      });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/repos",
+        fetch: false,
+        runner: hasnaCliRunner({ npmGitHead: null, npmRepository: "https://github.com/someone-else/repos" }),
+      });
+
+      expect(result.state.registry.artifact.repository_attribution).toBe("mismatch");
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-UNVERIFIED");
+      expect(result.summary.status).toBe("blocked");
+    });
+
     test("a shallow clone cannot establish absence, so it is unverified rather than unrelated", () => {
       const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", { license: "Apache-2.0" });
 
@@ -990,6 +1073,12 @@ function releaseRunner(opts: {
   failOpenPrs?: boolean;
   /** gitHead of the published artifact. `null` publishes without provenance. */
   npmGitHead?: string | null;
+  /**
+   * `repository` on the published artifact. The weaker provenance axis, and the
+   * only one available for the ~40% of fleet artifacts published without a
+   * gitHead. `null` publishes with no repository at all, as npmjs @hasna/cli did.
+   */
+  npmRepository?: string | null;
   /** Whether that gitHead is a commit in this repo. Default true. */
   npmGitHeadReachable?: boolean;
   isShallow?: boolean;
@@ -1055,7 +1144,10 @@ function releaseRunner(opts: {
         stdout: JSON.stringify({
           "dist-tags": { latest: opts.latestNpmVersion },
           versions: {
-            [opts.latestNpmVersion]: publishedGitHead === null ? {} : { gitHead: publishedGitHead },
+            [opts.latestNpmVersion]: {
+              ...(publishedGitHead === null ? {} : { gitHead: publishedGitHead }),
+              ...(opts.npmRepository ? { repository: { type: "git", url: opts.npmRepository } } : {}),
+            },
           },
         }),
         stderr: "",

@@ -7,6 +7,8 @@ import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
 import { getReleasePipelineParity, type OpsCommandRunner } from "./repo-ops.js";
 import type { PullRequest } from "../types/index.js";
 import {
+  attributeRepository,
+  normalizeRepositoryIdentity,
   classifyRegistryDivergence,
   describePublishRefusal,
   detectPackageNameAuthority,
@@ -658,6 +660,13 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
   const registryArtifact: RegistryArtifactState = {
     ...registryRead.artifact,
     git_head_reachability: resolveGitHeadReachability(repoPath, registryRead.artifact.git_head, runner, timeoutMs),
+    // Both identities for this repo: what its own manifest declares, and the
+    // `owner/name` the audit was pointed at. `githubRepo` is itself inferred from
+    // `remote.origin.url` when not passed, so this covers the remote too.
+    repository_attribution: attributeRepository(registryRead.artifact.repository, [
+      (manifest as { repository?: unknown } | null)?.repository,
+      githubRepo === "unknown/unknown" ? null : githubRepo,
+    ]),
   };
   const registryDivergence: RegistryDivergence = classifyRegistryDivergence({
     target: registryTarget,
@@ -711,6 +720,19 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
     gates.push({
       id: "registry-provenance-unverified",
       status: "block",
+      message: registryDivergence.reasons.join("; "),
+    });
+  }
+  if (registryDivergence.classification === "PROVENANCE-REPOSITORY-ONLY") {
+    // Warn, not block. Most published artifacts carry no gitHead at all — 15 of
+    // 36 readable fleet packages on 2026-07-27 (UTC), `@hasna/repos` among them —
+    // so blocking here would stop the release audit for most of the fleet and
+    // file a fresh blocker task on every commit, which is the churn this producer
+    // is supposed to avoid. The artifact declaring exactly this repository is
+    // weaker evidence than a reachable gitHead, and it is recorded as such.
+    gates.push({
+      id: "registry-provenance-repository-only",
+      status: "warn",
       message: registryDivergence.reasons.join("; "),
     });
   }
@@ -1491,6 +1513,8 @@ const UNREADABLE_ARTIFACT: RegistryArtifactState = {
   version: null,
   git_head: null,
   git_head_reachability: "unknown",
+  repository: null,
+  repository_attribution: "absent",
 };
 
 /**
@@ -1543,7 +1567,8 @@ function readRegistryArtifact(
   try {
     const parsed = JSON.parse(result.stdout) as {
       "dist-tags"?: { latest?: unknown };
-      versions?: Record<string, { gitHead?: unknown } | undefined>;
+      repository?: unknown;
+      versions?: Record<string, { gitHead?: unknown; repository?: unknown } | undefined>;
     };
     const latest = parsed["dist-tags"]?.latest;
     if (typeof latest !== "string" || latest.length === 0) {
@@ -1553,6 +1578,10 @@ function readRegistryArtifact(
       };
     }
     const gitHead = parsed.versions?.[latest]?.gitHead;
+    // Version-level `repository` first, document-level as the fallback: npm
+    // records it per version, and a package that moved repos should be judged on
+    // what the published version claimed, not on the latest document metadata.
+    const repository = parsed.versions?.[latest]?.repository ?? parsed.repository ?? null;
     return {
       check: okCheck(latest),
       artifact: {
@@ -1561,6 +1590,8 @@ function readRegistryArtifact(
         version: latest,
         git_head: typeof gitHead === "string" && gitHead.trim().length > 0 ? gitHead.trim() : null,
         git_head_reachability: "unknown",
+        repository: normalizeRepositoryIdentity(repository),
+        repository_attribution: "absent",
       },
     };
   } catch {
