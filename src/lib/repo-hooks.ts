@@ -1,5 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { getHookQueuePath } from "./config.js";
 
 export const HOOK_MARKER_START = "# >>> hasna repos auto-index >>>";
@@ -20,23 +20,49 @@ export interface HookInstallSummary {
   results: HookInstallResult[];
 }
 
-export function resolveGitDir(repoPath: string): string | null {
+export type GitDirResolution =
+  | { status: "ok"; gitDir: string }
+  | { status: "missing_repo_root" }
+  | { status: "missing_git_dir" }
+  | { status: "dangling_git_dir"; target: string }
+  | { status: "unreadable_git_dir" };
+
+/**
+ * Resolve a checkout's real git directory.
+ *
+ * A `.git` FILE holds a `gitdir:` pointer (linked worktrees, submodules). That pointer is a
+ * claim, not a fact: when the repository it names has been removed the target no longer exists.
+ * Such a pointer must resolve to `dangling_git_dir`, never to a path — callers create
+ * directories under whatever this returns, and handing back a path into a missing repository is
+ * how empty directories get dressed up as broken repositories.
+ */
+export function resolveGitDirDetailed(repoPath: string): GitDirResolution {
   const dotGitPath = join(repoPath, ".git");
-  if (!existsSync(dotGitPath)) return null;
+  if (!existsSync(dotGitPath)) {
+    return existsSync(repoPath) ? { status: "missing_git_dir" } : { status: "missing_repo_root" };
+  }
 
   try {
     const stat = statSync(dotGitPath);
-    if (stat.isDirectory()) return dotGitPath;
+    if (stat.isDirectory()) return { status: "ok", gitDir: dotGitPath };
+
     const raw = readFileSync(dotGitPath, "utf-8");
     const match = raw.match(/^gitdir:\s*(.+)$/m);
-    if (match?.[1]) {
-      return resolve(repoPath, match[1].trim());
-    }
-  } catch {
-    return null;
-  }
+    if (!match?.[1]) return { status: "unreadable_git_dir" };
 
-  return null;
+    const target = resolve(repoPath, match[1].trim());
+    if (!existsSync(target) || !statSync(target).isDirectory()) {
+      return { status: "dangling_git_dir", target };
+    }
+    return { status: "ok", gitDir: target };
+  } catch {
+    return { status: "unreadable_git_dir" };
+  }
+}
+
+export function resolveGitDir(repoPath: string): string | null {
+  const resolution = resolveGitDirDetailed(repoPath);
+  return resolution.status === "ok" ? resolution.gitDir : null;
 }
 
 function buildHookSnippet(queuePath: string): string {
@@ -49,18 +75,27 @@ ${HOOK_MARKER_END}`;
 }
 
 export function installPostCommitHook(repoPath: string, queuePath = getHookQueuePath()): HookInstallResult {
-  const gitDir = resolveGitDir(repoPath);
-  if (!gitDir) {
+  const resolution = resolveGitDirDetailed(repoPath);
+  if (resolution.status !== "ok") {
+    // A repository that is not there is an error to report, not a tree to invent.
     return {
       repoPath,
       hookPath: null,
       status: "skipped",
-      reason: "missing_git_dir",
+      reason: resolution.status,
     };
   }
 
+  const gitDir = resolution.gitDir;
   const hooksDir = join(gitDir, "hooks");
-  mkdirSync(hooksDir, { recursive: true });
+  // Deliberately NOT recursive: gitDir is verified to exist, so `hooks` is the only level that
+  // may be missing. `recursive: true` is the flag that turns "write into a directory that is
+  // gone" into "fabricate every ancestor on the way there", and that is the whole bug.
+  try {
+    mkdirSync(hooksDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
 
   const hookPath = join(hooksDir, "post-commit");
   const existed = existsSync(hookPath);
@@ -97,6 +132,20 @@ export function installPostCommitHooks(repoPaths: string[], queuePath = getHookQ
     skipped: results.filter((result) => result.status === "skipped").length,
     results,
   };
+}
+
+/**
+ * Describe checkouts whose `.git` points at a git directory that is gone. These used to be
+ * fabricated into existence silently; they are worth surfacing because an orphan worktree may
+ * still hold the only copy of unpushed work.
+ */
+export function describeDanglingCheckouts(summary: HookInstallSummary, limit = 5): string | null {
+  const dangling = summary.results.filter((result) => result.reason === "dangling_git_dir");
+  if (dangling.length === 0) return null;
+
+  const names = dangling.slice(0, limit).map((result) => basename(result.repoPath));
+  const suffix = dangling.length > limit ? `, +${dangling.length - limit} more` : "";
+  return `${dangling.length} checkout(s) point at a git directory that no longer exists (orphan worktrees; hooks not installed): ${names.join(", ")}${suffix}`;
 }
 
 export function drainHookQueue(queuePath = getHookQueuePath()): string[] {
