@@ -38,7 +38,9 @@ describe("CLI remote output boundary", () => {
 
     for (const args of [
       ["repos", "--json"],
-      ["repo", "remoteoutput", "--json"],
+      // The fixture path does not exist, so `repo` refuses it with a non-zero
+      // exit. Opt out of the failure — the subject here is redaction.
+      ["repo", "remoteoutput", "--json", "--allow-unusable-checkout"],
       ["search", "remoteoutput", "--json"],
       ["export", "--json"],
     ]) {
@@ -48,6 +50,31 @@ describe("CLI remote output boundary", () => {
       expect(output).toContain("git.example.test/team/tool");
       expect(output).not.toContain(unsafe);
       expect(output).not.toContain("phrase");
+      // stderr is a new output boundary: the unusable-checkout refusal quotes the
+      // row's remote back at the caller to name a clone command, so it is exactly
+      // the kind of message that leaks an embedded credential if it uses the raw
+      // stored value instead of the sanitized one.
+      const errors = result.stderr.toString();
+      expect(errors).not.toContain(unsafe);
+      expect(errors).not.toContain("phrase");
     }
+  });
+
+  it("does not leak an embedded credential through the unusable-checkout refusal", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "repos-cli-refusal-output-"));
+    const dbPath = join(tempDir, "repos.db");
+    const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git`;
+    const db = getDb(dbPath);
+    db.query("INSERT INTO repos (path, name, remote_url) VALUES (?, 'refusalrepo', ?)")
+      .run(join(tempDir, "absent-checkout"), unsafe);
+    closeDb();
+
+    const result = runCli(dbPath, ["repo", "refusalrepo", "--json"]);
+    expect(result.exitCode).toBe(1);
+    const errors = result.stderr.toString();
+    expect(errors).toContain("missing-path");
+    expect(errors).toContain("git.example.test/team/tool");
+    expect(errors).not.toContain(unsafe);
+    expect(errors).not.toContain("phrase");
   });
 });

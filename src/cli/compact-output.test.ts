@@ -99,7 +99,11 @@ describe("compact CLI output", () => {
     expect(verbose).toContain("/tmp/workspaces/very/deep/private/path/alpha-repo");
     expect(verbose).toContain("deliberately long repository description");
 
-    const details = runCli(dbPath, ["show", "alpha-repo"]);
+    // This fixture row deliberately points at a path that does not exist, which
+    // `show` now refuses with a non-zero exit. That refusal is the subject of its
+    // own tests; here we only care about the disclosure of the path, so opt out
+    // of the failure the way a metadata-only caller is meant to.
+    const details = runCli(dbPath, ["show", "alpha-repo", "--allow-unusable-checkout"]);
     expect(details).toContain("Path: /tmp/workspaces/very/deep/private/path/alpha-repo");
   });
 
