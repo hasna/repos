@@ -42,6 +42,13 @@
  * nothing on disk to lose, which is the only case where a registry deletion is
  * information-preserving.
  *
+ * "Does not exist" therefore has to mean *gone*, not *invisible*. `existsSync`
+ * cannot make that distinction — it collapses `EACCES`, a stale mount and an IO
+ * error into the same `false` as `ENOENT` — so a live checkout under an unreadable
+ * parent would have been classified as gone and pruned, destroying exactly the
+ * record this narrowing exists to protect. Paths are classified by errno, and
+ * anything undecidable is reported and never deleted.
+ *
  * Pruning gutted-but-present checkouts is a separate decision needing a separate
  * verb and a separate argument. It is not smuggled in behind a flag here.
  *
@@ -57,7 +64,7 @@
  * behaviour you want from a receipt, and is asserted rather than assumed.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import { getDb, getDbPath } from "./database.js";
@@ -119,6 +126,49 @@ export class RegistryPruneError extends Error {
   }
 }
 
+/**
+ * Is a registry row's path gone, present, or merely invisible to this process?
+ *
+ * `existsSync` answers "gone" to all three, because it collapses every stat error
+ * into `false`. A live checkout under a mode-000 parent, a stale network handle or
+ * an unreachable mount therefore read as deleted — and this verb's entire
+ * justification is that a missing path means there is nothing on disk to lose.
+ * That is false for a path we cannot see, and such a directory may hold the only
+ * surviving copy of a deleted repository, which is exactly the harm the verb was
+ * narrowed to avoid. `ENOENT`/`ENOTDIR` mean gone; anything else means undecided,
+ * and undecided must never be deleted.
+ */
+export function classifyRegistryPath(path: string): "present" | "missing" | "undetermined" {
+  try {
+    statSync(path);
+    return "present";
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "missing";
+    return "undetermined";
+  }
+}
+
+/**
+ * The file the given connection will actually write to.
+ *
+ * `getDbPath()` is a pure resolver over env, cwd and `$HOME`; it has no link to
+ * the open connection, so `getDb(fixture)` followed by `getDbPath()` still names
+ * the production database. Comparing `expectedDatabasePath` against a global
+ * resolver rather than against the handle being mutated is the "right rows, wrong
+ * database" failure this guard exists to catch, so the guard's subject is read off
+ * the connection.
+ */
+export function connectionDatabasePath(db: Database): string | null {
+  try {
+    const row = db.query("PRAGMA database_list").get() as { name?: string; file?: string } | null;
+    const file = typeof row?.file === "string" ? row.file : "";
+    return file.length > 0 ? file : ":memory:";
+  } catch {
+    return null;
+  }
+}
+
 export interface PrunableRow {
   id: number;
   name: string;
@@ -138,6 +188,13 @@ export interface RegistryPrunePlan {
   /** Rows whose stored path does not exist. */
   rows: PrunableRow[];
   row_count: number;
+  /**
+   * Rows whose path could not be classified — present but unreadable, stale mount,
+   * IO error. Never deleted, and surfaced so an incomplete plan is not mistaken
+   * for a complete one.
+   */
+  undetermined: Array<{ id: number; name: string; path: string; reason: string }>;
+  undetermined_count: number;
   /** Total child rows that would cascade away, by table. */
   cascade_totals: Record<string, number>;
   plan_hash: string;
@@ -232,11 +289,18 @@ function countChildRows(db: Database, keys: ForeignKeyRow[], repoId: number): Re
  * needing the filesystem to be in a particular state.
  */
 export function planRegistryPrune(
-  opts: { db?: Database; databasePath?: string; limit?: number; pathExists?: (path: string) => boolean } = {},
+  opts: {
+    db?: Database;
+    databasePath?: string;
+    limit?: number;
+    /** Legacy boolean seam. `true` means present, `false` means missing. */
+    pathExists?: (path: string) => boolean;
+    pathState?: (path: string) => "present" | "missing" | "undetermined";
+  } = {},
 ): RegistryPrunePlan {
   const db = opts.db ?? getDb();
-  const database = opts.databasePath ?? getDbPath();
-  const pathExists = opts.pathExists ?? existsSync;
+  const database = opts.databasePath ?? connectionDatabasePath(db) ?? getDbPath();
+  const pathState = resolvePathState(opts);
   const keys = assertKnownForeignKeys(db);
 
   const all = db
@@ -247,8 +311,15 @@ export function planRegistryPrune(
     }>;
 
   const rows: PrunableRow[] = [];
+  const undetermined: Array<{ id: number; name: string; path: string; reason: string }> = [];
   for (const row of all) {
-    if (!row.path || pathExists(row.path)) continue;
+    if (!row.path) continue;
+    const state = pathState(row.path);
+    if (state === "present") continue;
+    if (state === "undetermined") {
+      undetermined.push({ id: row.id, name: row.name, path: row.path, reason: "path-unreadable" });
+      continue;
+    }
     rows.push({ ...row, cascade_counts: countChildRows(db, keys, row.id) });
     if (opts.limit !== undefined && rows.length >= opts.limit) break;
   }
@@ -266,9 +337,28 @@ export function planRegistryPrune(
     database,
     rows,
     row_count: rows.length,
+    undetermined,
+    undetermined_count: undetermined.length,
     cascade_totals: cascadeTotals,
     plan_hash: planHash(database, rows),
   };
+}
+
+/**
+ * `pathExists` stays supported so existing callers and tests keep their meaning,
+ * but the default is the errno-aware classifier: a boolean seam cannot express
+ * "I could not tell", and that is the answer that must not become a delete.
+ */
+function resolvePathState(opts: {
+  pathExists?: (path: string) => boolean;
+  pathState?: (path: string) => "present" | "missing" | "undetermined";
+}): (path: string) => "present" | "missing" | "undetermined" {
+  if (opts.pathState) return opts.pathState;
+  if (opts.pathExists) {
+    const exists = opts.pathExists;
+    return (path) => (exists(path) ? "present" : "missing");
+  }
+  return classifyRegistryPath;
 }
 
 function samePath(left: string, right: string): boolean {
@@ -319,17 +409,22 @@ function assertConfirmations(request: RegistryPruneRequest, database: string): {
 
 export function pruneRegistryRows(
   request: RegistryPruneRequest = {},
-  opts: { db?: Database; databasePath?: string; pathExists?: (path: string) => boolean } = {},
+  opts: {
+    db?: Database;
+    databasePath?: string;
+    pathExists?: (path: string) => boolean;
+    pathState?: (path: string) => "present" | "missing" | "undetermined";
+  } = {},
 ): RegistryPruneResult {
   const db = opts.db ?? getDb();
-  const database = opts.databasePath ?? getDbPath();
-  const pathExists = opts.pathExists ?? existsSync;
+  const database = opts.databasePath ?? connectionDatabasePath(db) ?? getDbPath();
+  const pathState = resolvePathState(opts);
 
   if (request.limit !== undefined && (!Number.isSafeInteger(request.limit) || request.limit < 1)) {
     throw new RegistryPruneError("INVALID_REQUEST", "limit must be a positive integer");
   }
 
-  const plan = planRegistryPrune({ db, databasePath: database, limit: request.limit, pathExists });
+  const plan = planRegistryPrune({ db, databasePath: database, limit: request.limit, pathState });
   if (!request.apply) {
     return { schema: REGISTRY_PRUNE_SCHEMA, applied: false, replayed: false, plan, receipt: null };
   }
@@ -379,11 +474,11 @@ export function pruneRegistryRows(
   try {
     // Re-check inside the transaction. A path that reappeared between the dry run
     // and now means someone re-cloned, and that row is no longer stale.
-    const reappeared = plan.rows.filter((row) => pathExists(row.path));
+    const reappeared = plan.rows.filter((row) => pathState(row.path) !== "missing");
     if (reappeared.length > 0) {
       throw new RegistryPruneError(
         "PATH_REAPPEARED",
-        "some paths exist again since the dry run; those rows are no longer stale",
+        "some paths exist again, or can no longer be read, since the dry run; those rows are not safe to prune",
         { rows: reappeared.map((row) => ({ id: row.id, name: row.name, path: row.path })) },
       );
     }

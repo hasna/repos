@@ -790,8 +790,11 @@ registry
       }
       const { plan } = result;
       if (result.applied) {
+        // On a replay the current plan is empty because the rows are already gone;
+        // reporting its count printed "pruned 0" next to a receipt saying 2.
+        const count = result.replayed && result.receipt ? result.receipt.row_count : plan.row_count;
         const replayed = result.replayed ? "replayed " : "";
-        console.log(chalk.green(`✓ ${replayed}pruned ${plan.row_count} registry row(s)`));
+        console.log(chalk.green(`✓ ${replayed}pruned ${count} registry row(s)`));
         if (result.receipt) console.log(chalk.dim(`  Receipt: ${result.receipt.id}`));
         return;
       }
@@ -805,9 +808,25 @@ registry
         if (row.remote_url) console.log(chalk.dim(`        remote: ${row.remote_url}`));
       }
       if (plan.rows.length > 20) console.log(chalk.dim(`    ... ${plan.rows.length - 20} more; use --json for the full plan.`));
+      if (plan.undetermined_count > 0) {
+        console.log(chalk.yellow(`\n  ${plan.undetermined_count} row(s) could not be classified and will NOT be pruned:`));
+        for (const row of plan.undetermined.slice(0, 10)) {
+          console.log(chalk.dim(`    #${row.id} ${row.name} ${compactText(row.path, 80)} (${row.reason})`));
+        }
+        console.log(chalk.dim("    A path that cannot be read is not a path that is gone."));
+      }
       console.log(chalk.dim("\n  This wrote nothing. Nothing on disk is touched by this command, ever — only registry rows."));
       console.log(chalk.dim("  To apply, supply every confirmation:"));
-      console.log(chalk.dim(`    repos registry prune --apply \\\n      --expected-database ${plan.database} \\\n      --expected-plan-hash ${plan.plan_hash} \\\n      --actor <you> --idempotency-key <key>`));
+      console.log(chalk.dim(`    repos registry prune --apply \\\n      --expected-database <the database you intend to prune> \\\n      --expected-plan-hash ${plan.plan_hash} \\\n      --actor <you> --idempotency-key <key>`));
+      // --expected-database is deliberately NOT pre-filled. The incident this guard
+      // exists for was "the right rows in the wrong database": the operator believed
+      // they were redirected and were not. Printing the resolved path inside a
+      // paste-ready command makes the guard compare that path against itself and
+      // pass for anyone following these instructions, which confirms nothing. The
+      // plan hash must be echoed — binding the exact row set is its job — but the
+      // database has to come from the operator's own belief to be a check at all.
+      console.log(chalk.dim("  Type the database path yourself; this command will not fill it in for you,"));
+      console.log(chalk.dim("  because a path it supplied could only ever match itself."));
     } catch (error) {
       const code = error instanceof RegistryPruneError ? error.code : "UNEXPECTED_ERROR";
       const message = error instanceof Error ? error.message : "unknown registry prune error";

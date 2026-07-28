@@ -127,21 +127,27 @@ alone is not enough:
 ```bash
 repos registry prune                 # dry run: lists the rows, writes nothing
 repos registry prune --apply \
-  --expected-database  <path from the dry run> \
+  --expected-database  <the database you intend to prune> \
   --expected-plan-hash <hash from the dry run> \
   --actor <you> --idempotency-key <key>
 ```
 
 `--expected-database` exists because the failure to design against is not "deleted the
 wrong rows", it is **"deleted the right rows in the wrong database"** — a default that
-resolves somewhere the operator did not intend now aborts. `--expected-plan-hash` binds the
-exact row set, so anything that changed since the dry run aborts. `--idempotency-key` makes
-a retry replay its receipt rather than deleting a second, different set. Every applied prune
-writes a receipt to `registry_prune_audit` holding the removed rows verbatim.
+resolves somewhere the operator did not intend now aborts. The dry run deliberately does
+**not** pre-fill it: a path the tool supplied could only ever match itself, so it has to
+come from your own belief about which registry you are pruning. `--expected-plan-hash`
+*is* echoed by the dry run, because binding the exact row set is its whole job — anything
+that changed since the dry run aborts. `--idempotency-key` makes a retry replay its receipt
+rather than deleting a second, different set. Every applied prune writes a receipt to
+`registry_prune_audit` holding the removed rows verbatim.
 
-**Only missing paths.** Rows for gutted-but-present checkouts are deliberately left alone:
-some of those directories are the only surviving copy of a deleted repository, and while
-removing a row does not delete files, it destroys the record of *where that data is*.
+**Only missing paths, and only paths that are genuinely gone.** Rows for gutted-but-present
+checkouts are deliberately left alone: some of those directories are the only surviving copy
+of a deleted repository, and while removing a row does not delete files, it destroys the
+record of *where that data is*. For the same reason a path that exists but cannot be read —
+mode-000 parent, stale mount, IO error — is reported as **undetermined** and never pruned;
+`existsSync` answers "gone" to all of those, so paths are classified by errno instead.
 **This command never touches the filesystem** — it removes registry rows and nothing else.
 
 The dry run also reports what would cascade away, which is usually the number that matters:

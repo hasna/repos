@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "./database.js";
 import {
   RegistryPruneError,
+  classifyRegistryPath,
   planRegistryPrune,
   pruneRegistryRows,
   REGISTRY_PRUNE_SCHEMA,
@@ -53,6 +54,55 @@ function confirmations(dbPath: string, planHash: string, key = "prune-key-1") {
 }
 
 describe("planRegistryPrune", () => {
+  test("does not plan a row whose path exists but cannot be read", () => {
+    // THE FAILURE THIS PINS. `existsSync` returns false for EACCES, so a live
+    // checkout under a mode-000 parent, a stale network handle or an unreachable
+    // mount reads as "gone". This module's justification for existing is that a
+    // missing path means there is nothing on disk to lose — which is false for a
+    // path we merely cannot see, and such a directory may hold the only surviving
+    // copy of a deleted repository. statSync distinguishes EACCES from ENOENT, so
+    // this is decidable rather than a judgement call.
+    const { db, dbPath, paths } = seed({ absent: ["open-unreadable", "open-gone"] });
+    const plan = planRegistryPrune({
+      db,
+      databasePath: dbPath,
+      pathState: (path) => (path === paths["open-unreadable"] ? "undetermined" : "missing"),
+    });
+    expect(plan.rows.map((row) => row.name)).toEqual(["open-gone"]);
+    expect(plan.undetermined.map((row) => row.name)).toEqual(["open-unreadable"]);
+    expect(plan.undetermined_count).toBe(1);
+  });
+
+  test("classifies an unreadable directory as undetermined, not missing", () => {
+    // Exercises the real predicate rather than an injected one: the directory
+    // exists, and only its parent's mode hides it.
+    tempDir = mkdtempSync(join(tmpdir(), "repos-prune-eacces-"));
+    const locked = join(tempDir, "locked");
+    const inside = join(locked, "livedata");
+    mkdirSync(inside, { recursive: true });
+    writeFileSync(join(inside, "IMPORTANT.txt"), "only surviving copy\n");
+    chmodSync(locked, 0o000);
+    try {
+      expect(classifyRegistryPath(inside)).toBe("undetermined");
+      expect(classifyRegistryPath(join(tempDir, "never-existed"))).toBe("missing");
+      expect(classifyRegistryPath(tempDir)).toBe("present");
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+  });
+
+  test("derives the compared database from the open connection, not a global resolver", () => {
+    // getDbPath() is a pure env/cwd/$HOME resolver with no link to the open
+    // connection: getDb(fixture) then getDbPath() still returns the production
+    // path. A caller passing { db } without databasePath therefore had
+    // expectedDatabasePath validated against a database that was not the one being
+    // written to — precisely the "right rows, wrong database" failure this guard
+    // exists to catch.
+    const { db, dbPath } = seed({ absent: ["open-gone"] });
+    const plan = planRegistryPrune({ db });
+    expect(plan.database).toBe(dbPath);
+  });
+
   test("selects only rows whose path does not exist", () => {
     const { db, dbPath } = seed({ present: ["open-live"], absent: ["open-gone", "open-also-gone"] });
     const plan = planRegistryPrune({ db, databasePath: dbPath });
