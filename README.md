@@ -34,6 +34,7 @@ repos-serve  # http://localhost:19450
 | `repos scan` | Discover and index all git repos |
 | `repos repos` | List repositories |
 | `repos repo <name>` / `repos show <name>` / `repos inspect <name>` | Get repo details |
+| `repos registry prune` | Retire registry rows whose path no longer exists (dry run unless explicitly confirmed) |
 | `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
@@ -76,6 +77,87 @@ CLI output is compact by default so it stays readable in agent terminals:
 - Use `--limit` plus `--cursor` or `--offset` on paginated list commands for more rows.
 - Use `repos show <name>` or `repos inspect <name>` for full repo detail.
 - Use `--json` for machine-readable records. JSON output keeps full fields where possible.
+
+### no-cloud registry inventory
+
+`repos no-cloud inventory --include-npm` checks published `@hasna` packages for a
+surviving dependency on the retired `@hasna/cloud`. The list of packages to check is the
+**union of two sources**, because neither is authoritative alone:
+
+- **local manifests** under the scan root — correct for what this machine has checked out,
+  but blind to any package whose repo is not cloned here, and keyed on the manifest `name`,
+  so a package published under a synthesised name (some are) is invisible to it;
+- **the scope roster** (`npm access list packages @hasna`) — what the scope actually
+  contains, *including deprecated packages*. Needs no credential: the E401 you get from
+  that command is caused by offering a token that lacks org read, so it is retried with the
+  user config suppressed, and `GET /-/org/<scope>/package` answers 200 unauthenticated;
+- **`npm search @hasna`** — a search index, which is strictly less than an enumeration. It
+  omits deprecated packages, and has been measured omitting live non-deprecated ones. Kept
+  only as a second opinion in case the roster endpoint changes.
+
+Coverage is the union of all three, so it shrinks only when a package leaves every source.
+A single source failing **degrades with a warning** rather than failing the command —
+`npm search` is flaky and turning that into a hard error would break a working path — but
+if *every* registry source fails the command **exits non-zero** and says how narrow the
+result is, rather than reporting a smaller inventory at exit code 0. Per-source outcomes are
+in `summary.registry_enumeration_sources`.
+
+The registry search API caps a result set at 250 no matter what `--searchlimit` says, so a
+saturated search is reported as `truncated`, never as complete.
+
+`@hasna/cloud` is also pinned in unconditionally and cannot be dropped by any source, since
+its deprecation is the exact fact the report exists to surface.
+
+A hardcoded list was tried first and went stale twice (`@hasna/swarm` unpublished while
+still listed; `@hasna/deployment` a live 404), so there is no literal list to edit. Deriving
+from local manifests alone was tried next and was worse: it silently dropped every package
+without a local checkout, including `@hasna/wallets`, which declares the retired
+`@hasna/cloud` today.
+### Registry prune
+
+`repos registry prune` retires rows whose stored path no longer exists. There was
+previously no prune, forget, remove or delete verb at all, so stale rows had no supported
+way to be removed — including rows whose obsolete remote still *works* via a GitHub
+redirect, which makes any tool resolving them operate on a live repo believing it is the
+old one.
+
+**It refuses by default.** A prune verb on a registry is a deletion primitive, so `--apply`
+alone is not enough:
+
+```bash
+repos registry prune                 # dry run: lists the rows, writes nothing
+repos registry prune --apply \
+  --expected-database  <the database you intend to prune> \
+  --expected-plan-hash <hash from the dry run> \
+  --actor <you> --idempotency-key <key>
+```
+
+`--expected-database` exists because the failure to design against is not "deleted the
+wrong rows", it is **"deleted the right rows in the wrong database"** — a default that
+resolves somewhere the operator did not intend now aborts. The dry run deliberately does
+**not** pre-fill it: a path the tool supplied could only ever match itself, so it has to
+come from your own belief about which registry you are pruning. `--expected-plan-hash`
+*is* echoed by the dry run, because binding the exact row set is its whole job — anything
+that changed since the dry run aborts. `--idempotency-key` makes a retry replay its receipt
+rather than deleting a second, different set. Every applied prune writes a receipt to
+`registry_prune_audit` holding the removed rows verbatim.
+
+**Only missing paths, and only paths that are genuinely gone.** Rows for gutted-but-present
+checkouts are deliberately left alone: some of those directories are the only surviving copy
+of a deleted repository, and while removing a row does not delete files, it destroys the
+record of *where that data is*. For the same reason a path that exists but cannot be read —
+mode-000 parent, stale mount, IO error — is reported as **undetermined** and never pruned;
+`existsSync` answers "gone" to all of those, so paths are classified by errno instead.
+**This command never touches the filesystem** — it removes registry rows and nothing else.
+
+The dry run also reports what would cascade away, which is usually the number that matters:
+
+```
+291 row(s) point at a path that no longer exists.
+    cascades: 134404 commits row(s)
+    cascades: 134010 branches row(s)
+    cascades: 15760 pull_requests row(s)
+```
 
 ### Primary registry relocation
 

@@ -32,6 +32,10 @@ import {
   PrimaryRelocationError,
   relocatePrimaryRepo,
 } from "../db/primary-relocation.js";
+import {
+  RegistryPruneError,
+  pruneRegistryRows,
+} from "../db/registry-prune.js";
 import { getDbPath } from "../db/database.js";
 import {
   ensureWorkspaceBootstrap,
@@ -739,6 +743,97 @@ registry
       if (json) {
         const details = error instanceof BranchAdjudicationError ? error.details : undefined;
         printJson({ schema: "open-repos.branch-adjudication.v1", ok: false, error: { code, message, details } });
+      } else {
+        console.error(chalk.red(`${code}: ${message}`));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+/**
+ * Retire registry rows whose path no longer exists.
+ *
+ * Refuses by default. A prune verb on a registry is a deletion primitive, and this
+ * workspace has already lost 139 artifacts to a deletion path that resolved to a
+ * production default while the operator believed it was pointed elsewhere. So
+ * `--apply` alone is not enough: the caller must also name the database they think
+ * they are pruning (`--expected-database`), quote back the plan hash from the dry
+ * run, and identify themselves.
+ *
+ * Only missing paths. Rows for gutted-but-present checkouts are left alone —
+ * some of those directories hold the only surviving copy of a deleted repository,
+ * and removing the row destroys the record of where that data is.
+ */
+registry
+  .command("prune")
+  .description("Retire registry rows whose path no longer exists (dry run unless explicitly confirmed)")
+  .option("--apply", "Delete the rows, with all confirmations supplied")
+  .option("--expected-database <path>", "The registry database this prune was reviewed against; must match the resolved path")
+  .option("--expected-plan-hash <sha256>", "Exact plan hash emitted by the dry run")
+  .option("--actor <actor>", "Auditable operator or workflow identity")
+  .option("--idempotency-key <key>", "Stable unique key for this logical prune")
+  .option("-n, --limit <n>", "Prune at most N rows")
+  .option("--json", "Output the versioned JSON result")
+  .action((opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = pruneRegistryRows({
+        apply: Boolean(opts.apply),
+        expectedDatabasePath: opts.expectedDatabase,
+        expectedPlanHash: opts.expectedPlanHash,
+        actor: opts.actor,
+        idempotencyKey: opts.idempotencyKey,
+        limit: opts.limit === undefined ? undefined : intFlag(String(opts.limit), "--limit", 1),
+      });
+      if (json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const { plan } = result;
+      if (result.applied) {
+        // On a replay the current plan is empty because the rows are already gone;
+        // reporting its count printed "pruned 0" next to a receipt saying 2.
+        const count = result.replayed && result.receipt ? result.receipt.row_count : plan.row_count;
+        const replayed = result.replayed ? "replayed " : "";
+        console.log(chalk.green(`✓ ${replayed}pruned ${count} registry row(s)`));
+        if (result.receipt) console.log(chalk.dim(`  Receipt: ${result.receipt.id}`));
+        return;
+      }
+      console.log(chalk.bold(`Registry prune dry run — ${plan.database}`));
+      console.log(`  ${plan.row_count} row(s) point at a path that no longer exists.`);
+      for (const [table, count] of Object.entries(plan.cascade_totals).sort()) {
+        console.log(chalk.dim(`    cascades: ${count} ${table} row(s)`));
+      }
+      for (const row of plan.rows.slice(0, 20)) {
+        console.log(`    ${chalk.dim(`#${row.id}`)} ${row.name} ${chalk.dim(compactText(row.path, 100))}`);
+        if (row.remote_url) console.log(chalk.dim(`        remote: ${row.remote_url}`));
+      }
+      if (plan.rows.length > 20) console.log(chalk.dim(`    ... ${plan.rows.length - 20} more; use --json for the full plan.`));
+      if (plan.undetermined_count > 0) {
+        console.log(chalk.yellow(`\n  ${plan.undetermined_count} row(s) could not be classified and will NOT be pruned:`));
+        for (const row of plan.undetermined.slice(0, 10)) {
+          console.log(chalk.dim(`    #${row.id} ${row.name} ${compactText(row.path, 80)} (${row.reason})`));
+        }
+        console.log(chalk.dim("    A path that cannot be read is not a path that is gone."));
+      }
+      console.log(chalk.dim("\n  This wrote nothing. Nothing on disk is touched by this command, ever — only registry rows."));
+      console.log(chalk.dim("  To apply, supply every confirmation:"));
+      console.log(chalk.dim(`    repos registry prune --apply \\\n      --expected-database <the database you intend to prune> \\\n      --expected-plan-hash ${plan.plan_hash} \\\n      --actor <you> --idempotency-key <key>`));
+      // --expected-database is deliberately NOT pre-filled. The incident this guard
+      // exists for was "the right rows in the wrong database": the operator believed
+      // they were redirected and were not. Printing the resolved path inside a
+      // paste-ready command makes the guard compare that path against itself and
+      // pass for anyone following these instructions, which confirms nothing. The
+      // plan hash must be echoed — binding the exact row set is its job — but the
+      // database has to come from the operator's own belief to be a check at all.
+      console.log(chalk.dim("  Type the database path yourself; this command will not fill it in for you,"));
+      console.log(chalk.dim("  because a path it supplied could only ever match itself."));
+    } catch (error) {
+      const code = error instanceof RegistryPruneError ? error.code : "UNEXPECTED_ERROR";
+      const message = error instanceof Error ? error.message : "unknown registry prune error";
+      if (json) {
+        const details = error instanceof RegistryPruneError ? error.details : undefined;
+        console.log(JSON.stringify({ schema: "open-repos.registry-prune.v1", ok: false, error: { code, message, details } }, null, 2));
       } else {
         console.error(chalk.red(`${code}: ${message}`));
       }
@@ -2282,8 +2377,8 @@ noCloudOps
   .description("Scan git repos for legacy Hasna cloud references and optional npm latest metadata")
   .option("-n, --limit <n>", "Max returned repos/npm packages", "200")
   .option("--max-depth <n>", "Max directory depth when discovering git roots", "8")
-  .option("--include-npm", "Also query npm latest metadata for known @hasna packages")
-  .option("--npm-package <name>", "Package name for npm metadata checks; repeat or comma-separate for multiple", collectValues, [])
+  .option("--include-npm", "Also query npm metadata for @hasna packages: local manifests unioned with the published scope")
+  .option("--npm-package <name>", "Check exactly these packages instead of the derived union; repeat or comma-separate", collectValues, [])
   .option("--pretty", "Pretty-print JSON")
   .action((path: string | undefined, opts: any) => {
     const root = path ?? process.cwd();
@@ -2295,6 +2390,31 @@ noCloudOps
       npmPackages: opts.npmPackage,
     });
     printOpsJson(report, opts.pretty);
+    // A source that failed or hit the registry's result ceiling still contributed,
+    // so this warns rather than failing — but it must not be silent, because an
+    // inventory that looks complete and is not is the whole defect.
+    const degraded = (report.summary.registry_enumeration_sources ?? [])
+      .filter((source) => source.status !== "ok");
+    if (report.summary.registry_enumeration === "ok" && degraded.length > 0) {
+      console.error(chalk.yellow(
+        `registry enumeration degraded: ${degraded.map((s) => `${s.source}=${s.status}`).join(", ")}; coverage may be narrower than the scope.`,
+      ));
+      if (report.summary.registry_enumeration_detail) {
+        console.error(chalk.dim(`  ${report.summary.registry_enumeration_detail}`));
+      }
+    }
+    if (report.summary.registry_enumeration === "failed") {
+      // The caller asked for registry coverage and did not get it. Reporting a
+      // narrower inventory at exit code 0 is the failure mode this whole change
+      // exists to remove, so it fails and says by how much.
+      console.error(chalk.red(
+        `registry enumeration failed, so this inventory covers only ${report.summary.registry_from_local_manifests} locally-declared package(s) plus @hasna/cloud.`,
+      ));
+      if (report.summary.registry_enumeration_detail) {
+        console.error(chalk.dim(`  ${report.summary.registry_enumeration_detail}`));
+      }
+      process.exitCode = 1;
+    }
   });
 
 // ── Knowledge Graph ──
