@@ -45,6 +45,7 @@ import { getFilterAlias } from "../lib/config.js";
 import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
 import { getReposStatus } from "../lib/status.js";
 import { formatRepoNotFoundMessage } from "./messages.js";
+import { printJson, printJsonLine, printLine } from "./stdout.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
 import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
@@ -157,7 +158,7 @@ function csvFlag(value: string | undefined): string[] | undefined {
 }
 
 function printOpsJson(report: unknown, pretty?: boolean) {
-  console.log(JSON.stringify(report, null, pretty ? 2 : 0));
+  printLine(JSON.stringify(report, null, pretty ? 2 : 0));
 }
 
 function collectValues(value: string, previous: string[] = []) {
@@ -381,7 +382,7 @@ program
       skipped: result.hooks.skipped,
     };
     if (opts.json) {
-      console.log(JSON.stringify({ ...scan, hooks: hookSummary }, null, 2));
+      printJson({ ...scan, hooks: hookSummary });
     } else {
       console.log(chalk.green(`\n✓ Scan complete in ${(scan.duration_ms / 1000).toFixed(1)}s`));
       console.log(`  Repos found: ${scan.repos_found} (${scan.repos_new} new, ${scan.repos_updated} updated)`);
@@ -452,7 +453,7 @@ program
     const repos = listRepos({ org, query, limit, offset });
     const total = countRepos({ org, query });
     if (opts.json) {
-      console.log(JSON.stringify(repos, null, 2));
+      printJson(repos);
       warnIfTruncated({ shown: repos.length, total, limit, offset, noun: "repo(s)" });
     } else {
       if (repos.length === 0) { console.log(chalk.dim("No repos found. Run: repos scan")); return; }
@@ -524,7 +525,7 @@ function printRepoDetails(name: string | undefined, opts: any) {
     const repo = resolveTargetRepo(name, opts);
     const stats = getRepoStats(repo.id);
     if (opts.json) {
-      console.log(JSON.stringify({ ...repo, ...stats }, null, 2));
+      printJson({ ...repo, ...stats });
     } else {
       console.log(chalk.bold(repo.name));
       console.log(`  Path: ${repo.path}`);
@@ -626,7 +627,7 @@ registry
         databasePath: getDbPath(),
       });
       if (json) {
-        console.log(JSON.stringify(result, null, 2));
+        printJson(result);
       } else if (result.applied) {
         console.log(chalk.green(`✓ Absorbed repo ${result.target_repo_id} into preserved repo ${result.repo_id}`));
         console.log(`  ${result.before.path} → ${result.after.path}`);
@@ -643,7 +644,7 @@ registry
       const message = error instanceof Error ? error.message : "unknown relocation error";
       if (json) {
         const details = error instanceof PrimaryRelocationError ? error.details : undefined;
-        console.log(JSON.stringify({ schema: "open-repos.primary-relocation.v2", ok: false, error: { code, message, details } }, null, 2));
+        printJson({ schema: "open-repos.primary-relocation.v2", ok: false, error: { code, message, details } });
       } else {
         console.error(chalk.red(`${code}: ${message}`));
       }
@@ -726,7 +727,7 @@ registry
         databasePath: getDbPath(),
       });
       if (json) {
-        console.log(JSON.stringify(result, null, 2));
+        printJson(result);
       } else if (result.applied) {
         const replayed = result.replayed ? "replayed " : "";
         console.log(chalk.green(`✓ ${replayed}branch adjudication applied for ${result.plan.rows.length} row(s)`));
@@ -741,7 +742,7 @@ registry
       const message = error instanceof Error ? error.message : "unknown branch adjudication error";
       if (json) {
         const details = error instanceof BranchAdjudicationError ? error.details : undefined;
-        console.log(JSON.stringify({ schema: "open-repos.branch-adjudication.v1", ok: false, error: { code, message, details } }, null, 2));
+        printJson({ schema: "open-repos.branch-adjudication.v1", ok: false, error: { code, message, details } });
       } else {
         console.error(chalk.red(`${code}: ${message}`));
       }
@@ -785,7 +786,7 @@ registry
         limit: opts.limit === undefined ? undefined : intFlag(String(opts.limit), "--limit", 1),
       });
       if (json) {
-        console.log(JSON.stringify(result, null, 2));
+        printJson(result);
         return;
       }
       const { plan } = result;
@@ -832,7 +833,7 @@ registry
       const message = error instanceof Error ? error.message : "unknown registry prune error";
       if (json) {
         const details = error instanceof RegistryPruneError ? error.details : undefined;
-        console.log(JSON.stringify({ schema: "open-repos.registry-prune.v1", ok: false, error: { code, message, details } }, null, 2));
+        printJson({ schema: "open-repos.registry-prune.v1", ok: false, error: { code, message, details } });
       } else {
         console.error(chalk.red(`${code}: ${message}`));
       }
@@ -863,7 +864,7 @@ program
     const offset = resolveOffset(opts);
     const commits = listCommits({ repo_id, author: opts.author, since: opts.since, until: opts.until, limit, offset });
     if (opts.json) {
-      console.log(JSON.stringify(commits, null, 2));
+      printJson(commits);
     } else {
       for (const c of commits) {
         console.log(`${chalk.yellow(c.sha.slice(0, 8))} ${compactText(c.message, opts.verbose ? 180 : 100)}`);
@@ -908,7 +909,7 @@ program
     const offset = resolveOffset(opts);
     const branches = listBranches({ repo_id, is_remote, limit, offset });
     if (opts.json) {
-      console.log(JSON.stringify(branches, null, 2));
+      printJson(branches);
     } else {
       for (const b of branches) {
         const remote = b.is_remote ? chalk.dim(" (remote)") : "";
@@ -949,7 +950,7 @@ program
     const offset = resolveOffset(opts);
     const tags = listTags({ repo_id, limit, offset });
     if (opts.json) {
-      console.log(JSON.stringify(tags, null, 2));
+      printJson(tags);
     } else {
       for (const t of tags) {
         console.log(`  ${chalk.cyan(compactText(t.name, 72))} ${chalk.yellow(t.sha.slice(0, 8))} ${chalk.dim(day(t.date))}`);
@@ -1002,7 +1003,7 @@ program
           // For --review, get PRs where user is requested reviewer
           const reviewJson = execSync(`gh search prs --review-requested=${ghUser} --state=open --limit=${limit} --json repository,number,title,author,createdAt,url`, { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] }).trim();
           const reviews = JSON.parse(reviewJson || "[]");
-          if (opts.json) { console.log(JSON.stringify(reviews, null, 2)); return; }
+          if (opts.json) { printJson(reviews); return; }
           if (reviews.length === 0) { console.log(chalk.dim("No PRs awaiting your review")); return; }
           console.log(chalk.bold(`${reviews.length} PR(s) awaiting review:`));
           for (const pr of reviews) {
@@ -1025,7 +1026,7 @@ program
     const prs = listPullRequests({ ...filter, limit, offset });
     const total = countPullRequests(filter);
     if (opts.json) {
-      console.log(JSON.stringify(prs, null, 2));
+      printJson(prs);
       warnIfTruncated({ shown: prs.length, total, limit, offset, noun: "pull request(s)" });
     } else {
       for (const pr of prs) {
@@ -1061,7 +1062,7 @@ program
     const limit = resolveLimit(opts, COMPACT_LIMIT, 20);
     const results = searchAll(query, limit);
     if (opts.json) {
-      console.log(JSON.stringify(results, null, 2));
+      printJson(results);
     } else {
       if (results.length === 0) { console.log(chalk.dim("No results")); return; }
       for (const r of results) {
@@ -1087,7 +1088,7 @@ program
   .action((opts) => {
     const stats = getGlobalStats();
     if (opts.json) {
-      console.log(JSON.stringify(stats, null, 2));
+      printJson(stats);
     } else {
       console.log(chalk.bold("Global Stats"));
       console.log(`  Repos: ${stats.total_repos}`);
@@ -1118,7 +1119,7 @@ program
   .action((opts) => {
     const status = getReposStatus();
     if (opts.json) {
-      console.log(JSON.stringify(status, null, 2));
+      printJson(status);
       return;
     }
 
@@ -1143,7 +1144,7 @@ program
     const limit = resolveLimit(opts, COMPACT_LIMIT, 20);
     const activity = getRecentActivity(intFlag(opts.days, "--days", 1), limit);
     if (opts.json) {
-      console.log(JSON.stringify(activity, null, 2));
+      printJson(activity);
     } else {
       console.log(chalk.bold(`Activity in last ${opts.days} days:`));
       for (const r of activity) {
@@ -1170,7 +1171,7 @@ program
     const limit = resolveLimit(opts, COMPACT_LIMIT, 20);
     const contributors = getContributorStats({ repo_id, limit });
     if (opts.json) {
-      console.log(JSON.stringify(contributors, null, 2));
+      printJson(contributors);
     } else {
       console.log(chalk.bold("Top Contributors:"));
       for (const c of contributors) {
@@ -1193,7 +1194,7 @@ program
   .action((opts) => {
     const stale = getStaleRepos(intFlag(opts.days, "--days", 1));
     if (opts.json) {
-      console.log(JSON.stringify(stale, null, 2));
+      printJson(stale);
     } else {
       const limit = resolveLimit(opts, COMPACT_LIMIT, stale.length || COMPACT_LIMIT);
       const shown = stale.slice(0, limit);
@@ -1220,7 +1221,7 @@ program
     }
     const heatmap = getActivityHeatmap(repo_id);
     if (opts.json) {
-      console.log(JSON.stringify(heatmap, null, 2));
+      printJson(heatmap);
     } else {
       console.log(chalk.bold("Commit Activity Heatmap"));
       console.log(`Total: ${heatmap.total} commits`);
@@ -1244,7 +1245,7 @@ program
       try {
         const result = syncGithubPRs(opts.repo, { limit: intFlag(opts.limit, "--limit", 1), reconcile });
         if (opts.json) {
-          console.log(JSON.stringify(result));
+          printJsonLine(result);
         } else {
           console.log(chalk.green(`✓ Synced ${result.synced} PRs for ${result.repo_name} (${result.rows_written} rows across ${result.checkouts} checkout(s)), reconciled ${result.reconciled}`));
           if (!result.merge_state_available) {
@@ -1263,7 +1264,7 @@ program
         onProgress: opts.json ? undefined : (msg: string) => console.log(chalk.dim(msg)),
       });
       if (opts.json) {
-        console.log(JSON.stringify(result));
+        printJsonLine(result);
       } else {
         console.log(chalk.green(`\n✓ Synced ${result.total_synced} PRs across ${result.repos_synced} remotes (${result.total_rows_written} rows over ${result.repos_seen} local checkouts), reconciled ${result.total_reconciled} to a terminal state`));
         if (result.errors.length > 0) {
@@ -1327,7 +1328,7 @@ program
       });
 
       if (opts.json) {
-        console.log(JSON.stringify(envelope, null, 2));
+        printJson(envelope);
         return;
       }
 
@@ -1399,7 +1400,7 @@ addLoopProducerOptions(
       taskListDescription: "Open PR tasks created by deterministic OpenRepos producers and consumed by headless worker/verifier workflows.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope) || syncFailed(result.synced, opts.allowSyncErrors)) process.exitCode = 1;
       return;
     }
@@ -1440,7 +1441,7 @@ addLoopProducerOptions(
       taskListDescription: "CLI availability failures created by deterministic OpenRepos smoke checks.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (result.summary.failed > 0 || result.summary.missing > 0 || loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1471,7 +1472,7 @@ ops
       timeoutMs: intFlag(opts.timeoutMs, "--timeout-ms", 1),
     });
     if (opts.json) {
-      console.log(JSON.stringify(result, null, 2));
+      printJson(result);
       return;
     }
     const status = result.summary.scoped_npm_duplicates === 0 ? chalk.green("ok") : chalk.yellow("review");
@@ -1503,7 +1504,7 @@ addLoopProducerOptions(
       taskListDescription: "Release pipeline parity gaps (missing CI/tag-publish workflows, npm-latest-without-git-tag drift) created by deterministic OpenRepos producers.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1573,7 +1574,7 @@ addLoopProducerOptions(
       taskListDescription: "Release candidate and release-blocker tasks created by deterministic OpenRepos producers.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1636,7 +1637,7 @@ addLoopProducerOptions(
       taskListDescription: "Docs, changelog, skills, and agent rule drift tasks created by deterministic OpenRepos producers.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1682,7 +1683,7 @@ addLoopProducerOptions(
       taskListDescription: "Dependency refresh tasks created by deterministic OpenRepos producers.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1731,7 +1732,7 @@ addLoopProducerOptions(
       taskListDescription: "Stale, dirty, detached, and missing worktree tasks created by deterministic OpenRepos producers.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1777,7 +1778,7 @@ addLoopProducerOptions(
       taskListDescription: "Task lifecycle route health tasks created by deterministic OpenRepos producers.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1847,7 +1848,7 @@ addLoopProducerOptions(
       taskListDescription: "Protected release tasks created only after deterministic release gates are green.",
     });
     if (opts.json) {
-      console.log(JSON.stringify(envelope, null, 2));
+      printJson(envelope);
       if (loopProducerHadErrors(envelope)) process.exitCode = 1;
       return;
     }
@@ -1870,7 +1871,7 @@ program
     const meta = fetchRepoMetadata(name);
     if (!meta) { console.log(chalk.red("Cannot fetch metadata (no GitHub remote?)")); process.exit(1); }
     if (opts.json) {
-      console.log(JSON.stringify(meta, null, 2));
+      printJson(meta);
     } else {
       if (meta.description) console.log(`Description: ${meta.description}`);
       if (meta.language) console.log(`Language: ${meta.language}`);
@@ -1889,7 +1890,7 @@ program
   .action((file, opts) => {
     const limit = resolveLimit(opts, COMPACT_LIMIT, 50);
     const results = findFile(file, limit);
-    if (opts.json) { console.log(JSON.stringify(results, null, 2)); return; }
+    if (opts.json) { printJson(results); return; }
     if (results.length === 0) { console.log(chalk.dim("Not found in any repo")); return; }
     for (const r of results) {
       console.log(chalk.bold(r.repo_name));
@@ -1909,7 +1910,7 @@ program
   .option("--json", "Output as JSON")
   .action((query, opts) => {
     const results = whoIs(query);
-    if (opts.json) { console.log(JSON.stringify(results, null, 2)); return; }
+    if (opts.json) { printJson(results); return; }
     if (results.length === 0) { console.log(chalk.dim("No commits found for that author")); return; }
     const limit = resolveLimit(opts, COMPACT_LIMIT, results.length || COMPACT_LIMIT);
     const shown = results.slice(0, limit);
@@ -1934,7 +1935,7 @@ program
   .action((opts) => {
     const days = opts.week ? 7 : opts.today ? 1 : intFlag(opts.days, "--days", 1);
     const results = diffStats(days);
-    if (opts.json) { console.log(JSON.stringify(results, null, 2)); return; }
+    if (opts.json) { printJson(results); return; }
     if (results.length === 0) { console.log(chalk.dim(`No activity in last ${days} day(s)`)); return; }
     const limit = resolveLimit(opts, COMPACT_LIMIT, results.length || COMPACT_LIMIT);
     const shown = results.slice(0, limit);
@@ -1955,7 +1956,7 @@ program
   .option("--json", "Output as JSON")
   .action((opts) => {
     const dirty = getDirtyRepos();
-    if (opts.json) { console.log(JSON.stringify(dirty, null, 2)); return; }
+    if (opts.json) { printJson(dirty); return; }
     if (dirty.length === 0) { console.log(chalk.green("✓ All repos clean")); return; }
     const limit = resolveLimit(opts, COMPACT_LIMIT, dirty.length || COMPACT_LIMIT);
     const shown = dirty.slice(0, limit);
@@ -1980,7 +1981,7 @@ program
   .option("--json", "Output as JSON")
   .action((opts) => {
     const unpushed = getUnpushedRepos();
-    if (opts.json) { console.log(JSON.stringify(unpushed, null, 2)); return; }
+    if (opts.json) { printJson(unpushed); return; }
     if (unpushed.length === 0) { console.log(chalk.green("✓ All repos pushed")); return; }
     const limit = resolveLimit(opts, COMPACT_LIMIT, unpushed.length || COMPACT_LIMIT);
     const shown = unpushed.slice(0, limit);
@@ -2002,7 +2003,7 @@ program
   .option("--json", "Output as JSON")
   .action((opts) => {
     const behind = getBehindRepos(opts.fetch);
-    if (opts.json) { console.log(JSON.stringify(behind, null, 2)); return; }
+    if (opts.json) { printJson(behind); return; }
     if (behind.length === 0) { console.log(chalk.green("✓ All repos up to date")); return; }
     const limit = resolveLimit(opts, COMPACT_LIMIT, behind.length || COMPACT_LIMIT);
     const shown = behind.slice(0, limit);
@@ -2023,7 +2024,7 @@ program
   .option("--json", "Output as JSON")
   .action((opts) => {
     const report = getHealthReport();
-    if (opts.json) { console.log(JSON.stringify(report, null, 2)); return; }
+    if (opts.json) { printJson(report); return; }
 
     const issues = report.dirty.length + report.unpushed.length + report.behind.length + report.stale.length;
     if (issues === 0) { console.log(chalk.green("✓ All repos healthy")); return; }
@@ -2098,7 +2099,7 @@ program
   .option("--json", "Output as JSON")
   .action((opts) => {
     const report = getReport(intFlag(opts.days, "--days", 1));
-    if (opts.json) { console.log(JSON.stringify(report, null, 2)); return; }
+    if (opts.json) { printJson(report); return; }
     console.log(chalk.bold(`Report: ${report.period}`));
     console.log(`  Repos touched: ${report.repos_touched}`);
     console.log(`  Commits: ${report.total_commits}`);
@@ -2125,7 +2126,7 @@ program
   .action((opts) => {
     const limit = resolveLimit(opts, COMPACT_LIMIT, 20);
     const results = getChurn(intFlag(opts.days, "--days", 1), limit);
-    if (opts.json) { console.log(JSON.stringify(results, null, 2)); return; }
+    if (opts.json) { printJson(results); return; }
     if (results.length === 0) { console.log(chalk.dim("No file changes found")); return; }
     console.log(chalk.bold("Most changed files:"));
     for (const r of results) {
@@ -2143,7 +2144,7 @@ program
   .option("--json", "Output as JSON")
   .action((opts) => {
     const languages = getLanguages();
-    if (opts.json) { console.log(JSON.stringify(languages, null, 2)); return; }
+    if (opts.json) { printJson(languages); return; }
     const limit = resolveLimit(opts, COMPACT_LIMIT, languages.length || COMPACT_LIMIT);
     const shown = languages.slice(0, limit);
     console.log(chalk.bold("Languages:"));
@@ -2177,7 +2178,7 @@ program
     const result = importFromOrg(org, opts.dir, {
       onProgress: opts.json ? undefined : (msg: string) => console.log(chalk.dim(msg)),
     });
-    if (opts.json) { console.log(JSON.stringify(result)); return; }
+    if (opts.json) { printJsonLine(result); return; }
     console.log(chalk.green(`\n✓ Cloned ${result.cloned}, skipped ${result.skipped}`));
     if (result.errors.length > 0) console.log(chalk.yellow(`  ${result.errors.length} errors`));
   });
@@ -2428,7 +2429,7 @@ graph
       onProgress: opts.json ? undefined : (msg: string) => console.log(chalk.dim(msg)),
     });
     if (opts.json) {
-      console.log(JSON.stringify(result));
+      printJsonLine(result);
     } else {
       console.log(chalk.green(`\n✓ Graph built in ${(result.duration_ms / 1000).toFixed(1)}s — ${result.edges_created} edges`));
     }
@@ -2444,7 +2445,7 @@ graph
     const node = queryNode(type, id);
     if (!node) { console.log(chalk.red("Node not found")); process.exit(1); }
     if (opts.json) {
-      console.log(JSON.stringify(node, null, 2));
+      printJson(node);
     } else {
       const limit = resolveLimit(opts, COMPACT_LIMIT, node.edges.length || COMPACT_LIMIT);
       console.log(chalk.bold(`${node.type}: ${node.label}`));
@@ -2466,7 +2467,7 @@ graph
     const limit = resolveLimit(opts, 10, 10);
     const results = queryRelated(repo, limit);
     if (opts.json) {
-      console.log(JSON.stringify(results, null, 2));
+      printJson(results);
     } else {
       if (results.length === 0) { console.log(chalk.dim("No related repos found. Run: repos graph build")); return; }
       console.log(chalk.bold(`Repos related to ${repo}:`));
@@ -2486,7 +2487,7 @@ graph
     const path = findPath(fromType, fromId, toType, toId);
     if (!path) { console.log(chalk.red("No path found")); process.exit(1); }
     if (opts.json) {
-      console.log(JSON.stringify(path, null, 2));
+      printJson(path);
     } else {
       console.log(chalk.bold(`Path (${path.length} hops):`));
       for (let i = 0; i < path.nodes.length; i++) {
@@ -2508,7 +2509,7 @@ graph
   .action((repo, opts) => {
     const deps = getDeps(repo, intFlag(opts.depth, "--depth", 1));
     if (opts.json) {
-      console.log(JSON.stringify(deps, null, 2));
+      printJson(deps);
     } else {
       if (deps.length === 0) { console.log(chalk.dim("No dependencies found")); return; }
       const limit = resolveLimit(opts, 50, deps.length || 50);
@@ -2531,7 +2532,7 @@ graph
   .action((opts) => {
     const authors = getCrossOrgAuthors();
     if (opts.json) {
-      console.log(JSON.stringify(authors, null, 2));
+      printJson(authors);
     } else {
       const limit = resolveLimit(opts, COMPACT_LIMIT, authors.length || COMPACT_LIMIT);
       const shown = authors.slice(0, limit);
@@ -2550,7 +2551,7 @@ graph
   .action((opts) => {
     const stats = getGraphStats();
     if (opts.json) {
-      console.log(JSON.stringify(stats, null, 2));
+      printJson(stats);
     } else {
       console.log(chalk.bold(`Graph: ${stats.total_edges} edges`));
       console.log(chalk.dim("\nBy relation:"));
@@ -2624,7 +2625,7 @@ program
     if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
     copyFileSync(src, dest);
     if (opts.json) {
-      console.log(JSON.stringify({ ok: true, source: src, backup: dest }));
+      printJsonLine({ ok: true, source: src, backup: dest });
     } else {
       console.log(chalk.green(`✓ Backed up ${src} → ${dest}`));
     }
@@ -2641,7 +2642,7 @@ program
     const { existsSync, copyFileSync } = await import("node:fs");
     if (!existsSync(src)) {
       const msg = `Backup file not found: ${src}`;
-      if (opts.json) console.log(JSON.stringify({ ok: false, error: msg }));
+      if (opts.json) printJsonLine({ ok: false, error: msg });
       else console.error(chalk.red(msg));
       process.exit(1);
     }
@@ -2652,14 +2653,14 @@ program
         process.stdin.once("data", (d) => resolve(d.toString().trim()));
       });
       if (answer.toLowerCase() !== "y") {
-        if (opts.json) console.log(JSON.stringify({ ok: false, cancelled: true }));
+        if (opts.json) printJsonLine({ ok: false, cancelled: true });
         else console.log(chalk.yellow("Restore cancelled."));
         process.exit(0);
       }
     }
     copyFileSync(src, dest);
     if (opts.json) {
-      console.log(JSON.stringify({ ok: true, restored: dest, from: src }));
+      printJsonLine({ ok: true, restored: dest, from: src });
     } else {
       console.log(chalk.green(`✓ Restored ${dest} from ${src}`));
     }
