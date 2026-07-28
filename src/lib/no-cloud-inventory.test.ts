@@ -3,7 +3,12 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getNoCloudInventory } from "./no-cloud-inventory";
+import {
+  classifyNpmViewFailure,
+  deriveLocalPackageNames,
+  getNoCloudInventory,
+  resolveNpmPackageChecks,
+} from "./no-cloud-inventory";
 
 function withTempWorkspace(fn: (root: string) => void) {
   const root = join(tmpdir(), `repos-no-cloud-${Date.now()}-${Math.random().toString(16).slice(2)}`);
@@ -496,6 +501,193 @@ describe("no-cloud inventory", () => {
 
       expect(finding?.remote).toBe("git.example.com/hasna/repo");
       expect(finding?.remote).not.toContain("super-secret");
+    });
+  });
+});
+
+describe("registry inventory sources", () => {
+  const cloudPkg = "@hasna" + "/cloud";
+  const walletsPkg = "@hasna" + "/wallets";
+  const reposPkg = "@hasna" + "/repos";
+  const localOnlyPkg = "@hasna" + "/localonly";
+
+  function manifest(root: string, dir: string, name: string) {
+    const path = join(root, dir);
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, "package.json"), `${JSON.stringify({ name, version: "1.0.0" })}\n`);
+    return path;
+  }
+
+  it("unions local manifests with the registry rather than substituting for them", () => {
+    // THE REGRESSION THIS PINS: deriving the list from local manifests only sees
+    // packages that have one. iapp-wallets has no package.json, so
+    // @hasna/wallets@0.1.10 — which actively declares the retired @hasna/cloud —
+    // silently stopped being checked. Fifteen published packages dropped out that
+    // way. The registry side has to ADD to the derived set, never replace it.
+    withTempWorkspace((root) => {
+      manifest(root, "open-localonly", localOnlyPkg);
+      const inventory = resolveNpmPackageChecks([join(root, "open-localonly")], {
+        enumerate: () => ({ status: "ok", names: [walletsPkg, reposPkg], detail: null }),
+      });
+      expect(inventory.packages).toContain(localOnlyPkg);
+      expect(inventory.packages).toContain(walletsPkg);
+      expect(inventory.packages).toContain(reposPkg);
+      expect(inventory.from_local_manifests).toBe(1);
+      expect(inventory.from_registry).toBe(2);
+      expect(inventory.registry_enumeration).toBe("ok");
+    });
+  });
+
+  it("keeps @hasna/cloud even though the registry enumeration cannot see it", () => {
+    // Measured against live npmjs on 2026-07-28: `npm search @hasna` returns 160
+    // scoped packages and @hasna/cloud is NOT among them, because npm search omits
+    // deprecated packages and @hasna/cloud@0.1.41 is deprecated. That deprecation
+    // is the exact fact this report exists to surface, so no source may drop it.
+    const inventory = resolveNpmPackageChecks([], {
+      enumerate: () => ({ status: "ok", names: [reposPkg], detail: null }),
+    });
+    expect(inventory.packages).toContain(cloudPkg);
+  });
+
+  it("keeps @hasna/cloud when both sources are empty", () => {
+    const inventory = resolveNpmPackageChecks([], {
+      enumerate: () => ({ status: "ok", names: [], detail: null }),
+    });
+    expect(inventory.packages).toEqual([cloudPkg]);
+  });
+
+  it("reports a failed enumeration instead of quietly narrowing coverage", () => {
+    // Absorbing the failure would return the local manifests and look exactly like
+    // a successful enumeration of a workspace with nothing published — the same
+    // silent-narrowing failure the union exists to prevent.
+    withTempWorkspace((root) => {
+      manifest(root, "open-localonly", localOnlyPkg);
+      const inventory = resolveNpmPackageChecks([join(root, "open-localonly")], {
+        enumerate: () => ({ status: "failed", names: [], detail: "network unreachable" }),
+      });
+      expect(inventory.registry_enumeration).toBe("failed");
+      expect(inventory.from_registry).toBeNull();
+      expect(inventory.registry_enumeration_detail).toBe("network unreachable");
+      // Coverage is still the union of what it could see, not nothing.
+      expect(inventory.packages).toContain(localOnlyPkg);
+      expect(inventory.packages).toContain(cloudPkg);
+    });
+  });
+
+  it("de-duplicates a name declared by two checkouts and by the registry", () => {
+    withTempWorkspace((root) => {
+      const a = manifest(root, "open-repos", reposPkg);
+      const b = manifest(root, "repos-worktree", reposPkg);
+      const inventory = resolveNpmPackageChecks([a, b], {
+        enumerate: () => ({ status: "ok", names: [reposPkg], detail: null }),
+      });
+      expect(inventory.packages.filter((name) => name === reposPkg).length).toBe(1);
+    });
+  });
+
+  it("ignores manifests that are missing, unparseable, unnamed, or foreign-scoped", () => {
+    withTempWorkspace((root) => {
+      const noManifest = join(root, "no-manifest");
+      mkdirSync(noManifest, { recursive: true });
+      const broken = join(root, "broken");
+      mkdirSync(broken, { recursive: true });
+      writeFileSync(join(broken, "package.json"), "{ not json");
+      const unnamed = join(root, "unnamed");
+      mkdirSync(unnamed, { recursive: true });
+      writeFileSync(join(unnamed, "package.json"), JSON.stringify({ version: "1.0.0" }));
+      const foreign = manifest(root, "foreign", "@other/thing");
+
+      expect(deriveLocalPackageNames([noManifest, broken, unnamed, foreign])).toEqual([]);
+    });
+  });
+
+  it("does not treat a scope-prefixed name from another scope as in-scope", () => {
+    // `@hasnafoo/x` starts with the scope string but is a different scope. A
+    // startsWith check without the slash would accept it.
+    withTempWorkspace((root) => {
+      const impostor = manifest(root, "impostor", "@hasnafoo/x");
+      expect(deriveLocalPackageNames([impostor])).toEqual([]);
+    });
+  });
+
+  it("classifies a registry 404 as unpublished and anything else as a failure", () => {
+    // An absent package and a broken npm client both exit non-zero. Collapsing
+    // them is how a retired package reads as a transient blip.
+    expect(classifyNpmViewFailure("npm error code E404\nnpm error 404 Not Found")).toBe("unpublished");
+    expect(classifyNpmViewFailure("404 Not Found - GET https://registry.npmjs.org/@hasna%2fgone")).toBe("unpublished");
+    expect(classifyNpmViewFailure("npm error network ETIMEDOUT")).toBe("npm-view-failed");
+    expect(classifyNpmViewFailure("")).toBe("npm-view-failed");
+  });
+
+  it("uses an explicit --npm-package list verbatim without enumerating", () => {
+    withTempWorkspace((root) => {
+      let enumerated = false;
+      const report = getNoCloudInventory({
+        root,
+        includeNpm: true,
+        npmPackages: ["@hasna/nonexistent-fixture-package"],
+        enumerateScopedPackages: () => { enumerated = true; return { status: "ok", names: [], detail: null }; },
+      });
+      expect(enumerated).toBe(false);
+      expect(report.summary.registry_enumeration).toBe("skipped");
+      expect(report.npm.map((entry) => entry.package)).toEqual(["@hasna/nonexistent-fixture-package"]);
+    });
+  });
+
+  it("reports registry_enumeration skipped when --include-npm is absent", () => {
+    withTempWorkspace((root) => {
+      const report = getNoCloudInventory({ root, limit: 10 });
+      expect(report.summary.registry_enumeration).toBe("skipped");
+      expect(report.summary.registry_packages).toBe(0);
+      expect(report.summary.registry_from_registry).toBeNull();
+      expect(report.schema_version).toBe("1.3");
+    });
+  });
+});
+
+describe("enclosing-repository detection", () => {
+  it("does not treat a directory with an invalid .git as an enclosing repository", () => {
+    // `existsSync(dir + "/.git")` accepted anything holding a `.git` entry. A bare
+    // empty `/tmp/.git` on the host was therefore the "parent" of every fixture
+    // created under TMPDIR, which made 7 tests in this file fail on an untouched
+    // main and get mistaken for a broken baseline. In production it means a stray
+    // `.git` anywhere above a workspace marks every checkout below it
+    // non-routeable, with canonical_path decided from a repo that does not exist.
+    withTempWorkspace((root) => {
+      const outer = join(root, "outer");
+      mkdirSync(join(outer, ".git"), { recursive: true });
+      const inner = join(outer, "open-brains");
+      gitRepo(inner);
+      writeFileSync(join(inner, "README.md"), `${cloudPackage}\n`);
+      commitAll(inner, "add cloud evidence");
+      setTrackedGitHubRemote(inner, "https://github.com/hasna/brains.git");
+
+      const report = getNoCloudInventory({ root: inner, limit: 10 });
+      const finding = report.repos.find((entry) => entry.repo_key === "hasna/brains");
+      expect(finding?.route_blocked_reason).toBeNull();
+      expect(finding?.routeable).toBe(true);
+    });
+  });
+
+  it("still treats a real enclosing checkout as a nested-git-checkout block", () => {
+    // The control for the test above: the fix must not be achievable by simply
+    // never reporting a nested parent. A genuine parent repository still blocks,
+    // and it still blocks when the scan root IS the nested checkout — otherwise a
+    // nested repo could be laundered into a routeable one by pointing the scan
+    // at it.
+    withTempWorkspace((root) => {
+      const parent = join(root, "open-brains");
+      const child = join(parent, "brains");
+      gitRepo(parent);
+      gitRepo(child);
+      writeFileSync(join(child, "README.md"), `${cloudPackage}\n`);
+      commitAll(child, "add cloud evidence");
+      setTrackedGitHubRemote(child, "https://github.com/hasna/brains.git");
+
+      const report = getNoCloudInventory({ root: child, limit: 10 });
+      const finding = report.repos.find((entry) => entry.repo_key === "hasna/brains");
+      expect(finding?.route_blocked_reason).toBe("nested-git-checkout");
+      expect(finding?.routeable).toBe(false);
     });
   });
 });

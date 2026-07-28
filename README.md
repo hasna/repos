@@ -77,6 +77,26 @@ CLI output is compact by default so it stays readable in agent terminals:
 - Use `repos show <name>` or `repos inspect <name>` for full repo detail.
 - Use `--json` for machine-readable records. JSON output keeps full fields where possible.
 
+### no-cloud registry inventory
+
+`repos no-cloud inventory --include-npm` checks published `@hasna` packages for a
+surviving dependency on the retired `@hasna/cloud`. The list of packages to check is the
+**union of two sources**, because neither is authoritative alone:
+
+- **local manifests** under the scan root — correct for what this machine has checked out,
+  but blind to any package whose repo is not cloned here;
+- **the published scope** (`npm search @hasna`) — correct for what exists, but omits
+  deprecated packages.
+
+`@hasna/cloud` is pinned in unconditionally and cannot be dropped by either source: it is
+deprecated, so the registry enumeration does not list it, and its deprecation is the exact
+fact the report exists to surface.
+
+If the registry enumeration fails, the command **exits non-zero** and says how narrow the
+result is, rather than reporting a smaller inventory at exit code 0. A hardcoded list was
+tried first and went stale twice (`@hasna/swarm` unpublished while still listed;
+`@hasna/deployment` a live 404), so there is no literal list to edit.
+
 ### Primary registry relocation
 
 `repos registry relocate-primary` repairs a stale primary route when the canonical
