@@ -34,6 +34,7 @@ repos-serve  # http://localhost:19450
 | `repos scan` | Discover and index all git repos |
 | `repos repos` | List repositories |
 | `repos repo <name>` / `repos show <name>` / `repos inspect <name>` | Get repo details |
+| `repos registry prune` | Retire registry rows whose path no longer exists (dry run unless explicitly confirmed) |
 | `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
@@ -112,6 +113,45 @@ still listed; `@hasna/deployment` a live 404), so there is no literal list to ed
 from local manifests alone was tried next and was worse: it silently dropped every package
 without a local checkout, including `@hasna/wallets`, which declares the retired
 `@hasna/cloud` today.
+### Registry prune
+
+`repos registry prune` retires rows whose stored path no longer exists. There was
+previously no prune, forget, remove or delete verb at all, so stale rows had no supported
+way to be removed — including rows whose obsolete remote still *works* via a GitHub
+redirect, which makes any tool resolving them operate on a live repo believing it is the
+old one.
+
+**It refuses by default.** A prune verb on a registry is a deletion primitive, so `--apply`
+alone is not enough:
+
+```bash
+repos registry prune                 # dry run: lists the rows, writes nothing
+repos registry prune --apply \
+  --expected-database  <path from the dry run> \
+  --expected-plan-hash <hash from the dry run> \
+  --actor <you> --idempotency-key <key>
+```
+
+`--expected-database` exists because the failure to design against is not "deleted the
+wrong rows", it is **"deleted the right rows in the wrong database"** — a default that
+resolves somewhere the operator did not intend now aborts. `--expected-plan-hash` binds the
+exact row set, so anything that changed since the dry run aborts. `--idempotency-key` makes
+a retry replay its receipt rather than deleting a second, different set. Every applied prune
+writes a receipt to `registry_prune_audit` holding the removed rows verbatim.
+
+**Only missing paths.** Rows for gutted-but-present checkouts are deliberately left alone:
+some of those directories are the only surviving copy of a deleted repository, and while
+removing a row does not delete files, it destroys the record of *where that data is*.
+**This command never touches the filesystem** — it removes registry rows and nothing else.
+
+The dry run also reports what would cascade away, which is usually the number that matters:
+
+```
+291 row(s) point at a path that no longer exists.
+    cascades: 134404 commits row(s)
+    cascades: 134010 branches row(s)
+    cascades: 15760 pull_requests row(s)
+```
 
 ### Primary registry relocation
 
