@@ -36,12 +36,23 @@
  *     Reporting an unreadable path as gutted would invite someone to re-clone
  *     over a checkout that was merely inaccessible.
  *
+ *     Property 2 is why every existence check here goes through
+ *     {@link CheckoutFs.probe}, which answers `present` / `absent` /
+ *     `unreadable` rather than a boolean. `existsSync` cannot express the third
+ *     answer: it returns `false` for `EACCES` exactly as it does for `ENOENT`.
+ *     Built on `existsSync`, this module classified a **complete** checkout at
+ *     mode 000 as `no-git-dir`, whose remedy is "the directory survives but its
+ *     repository does not — re-clone it" — a data-loss instruction synthesised
+ *     from a permissions error, on a repository that was entirely intact.
+ *     Absence is now a positive finding (`ENOENT`/`ENOTDIR`); every other errno
+ *     means only that the probe was blocked.
+ *
  * What it deliberately does not do is judge repository *content*: object
  * corruption, a broken index, or an unfetched shallow history all read as
  * usable here. Those are real conditions, they are not this defect, and
  * detecting them needs the git subprocess this module exists to avoid.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 export type CheckoutState =
@@ -61,7 +72,13 @@ export type CheckoutState =
   | "worktree-severed-common-dir"
   /** A `.git` file that does not carry a parseable `gitdir:` pointer. */
   | "worktree-unparseable-pointer"
-  /** Something on the path could not be read. Not a claim that it is broken. */
+  /**
+   * Something on the path could not be read. Not a claim that it is broken.
+   *
+   * Reached whenever a probe is *blocked* rather than answered — a mode-000
+   * directory, an unmounted volume, a symlink loop. The checkout underneath may
+   * be perfectly intact, so no remedy here may destroy it.
+   */
   | "unreadable";
 
 export interface CheckoutHealth {
@@ -77,20 +94,83 @@ export interface CheckoutHealth {
   common_dir: string | null;
 }
 
+/**
+ * What a probe could establish about a path.
+ *
+ * `absent` is a *finding*: something looked and there was nothing there.
+ * `unreadable` is the absence of a finding. Collapsing the two — which is what a
+ * boolean does — is the whole defect this type exists to prevent.
+ */
+export type PathPresence = "present" | "absent" | "unreadable";
+
+export interface PathProbe {
+  presence: PathPresence;
+  /** The errno that blocked the probe, when one did. Named in the message so an operator can act. */
+  code: string | null;
+}
+
 /** Injectable filesystem, so every branch is reachable in a test. */
 export interface CheckoutFs {
-  exists(path: string): boolean;
+  /**
+   * Tri-state existence probe. Implementations report unreadability rather than
+   * throwing it, so that classification reads it as an answer instead of
+   * inferring it from a caught exception.
+   */
+  probe(path: string): PathProbe;
   isDirectory(path: string): boolean;
   readText(path: string): string;
   readDir(path: string): string[];
 }
 
+/**
+ * The errnos that mean "there is nothing here", as opposed to "I was not allowed
+ * to look".
+ *
+ * `ENOTDIR` belongs with `ENOENT`: a path component that is a regular file proves
+ * the target does not exist as spelled. Every other errno — `EACCES`, `EPERM`,
+ * `ELOOP`, `EIO` on a dying disk, `ESTALE` on a stale NFS handle — proves only
+ * that the probe was blocked, and must never become a claim about the repository.
+ * Unrecognised errnos fall on the `unreadable` side deliberately: the safe
+ * default is to admit ignorance.
+ */
+const ABSENT_ERRNOS: ReadonlySet<string> = new Set(["ENOENT", "ENOTDIR"]);
+
+function errnoOf(error: unknown): string | null {
+  const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+  return typeof code === "string" ? code : null;
+}
+
 export const nodeCheckoutFs: CheckoutFs = {
-  exists: (path) => existsSync(path),
+  probe: (path) => {
+    try {
+      // `statSync`, not `existsSync`: the same syscall, but the errno survives.
+      statSync(path);
+      return { presence: "present", code: null };
+    } catch (error) {
+      const code = errnoOf(error);
+      return code !== null && ABSENT_ERRNOS.has(code)
+        ? { presence: "absent", code }
+        : { presence: "unreadable", code };
+    }
+  },
   isDirectory: (path) => statSync(path).isDirectory(),
   readText: (path) => readFileSync(path, "utf8"),
   readDir: (path) => readdirSync(path),
 };
+
+/**
+ * Probe through a guard, so a `CheckoutFs` that throws (the interface asks it not
+ * to, but a caller's fake may) still degrades to `unreadable` instead of
+ * propagating. The verdict does not *depend* on the throw — the non-throwing path
+ * arrives at the same place by reading the returned presence.
+ */
+function probe(fs: CheckoutFs, path: string): PathProbe {
+  try {
+    return fs.probe(path);
+  } catch (error) {
+    return { presence: "unreadable", code: errnoOf(error) };
+  }
+}
 
 /**
  * The three entries that make a directory a git object database.
@@ -101,13 +181,34 @@ export const nodeCheckoutFs: CheckoutFs = {
  */
 const GIT_DIR_REQUIRED_ENTRIES = ["HEAD", "objects", "refs"] as const;
 
-function missingGitDirEntries(fs: CheckoutFs, gitDir: string): string[] {
-  return GIT_DIR_REQUIRED_ENTRIES.filter((entry) => !fs.exists(join(gitDir, entry)));
+interface GitDirScan {
+  /** Required entries a probe established are not there. */
+  missing: string[];
+  /** Required entries a probe could not look at. Takes precedence over `missing`. */
+  unreadable: string[];
+  /** The errno that blocked the first unreadable probe. */
+  code: string | null;
 }
 
-/** Does this directory look like a git object database (bare repo or `.git` dir)? */
-function isRepositoryDir(fs: CheckoutFs, dir: string): boolean {
-  return missingGitDirEntries(fs, dir).length === 0;
+/**
+ * Probe the three entries that make a directory a git object database.
+ *
+ * `unreadable` outranks `missing`, and that ordering is the safety property: if
+ * even one required entry could not be looked at, the directory has not been
+ * shown to be gutted, and nothing downstream may act as though it had been.
+ */
+function scanGitDirEntries(fs: CheckoutFs, gitDir: string): GitDirScan {
+  const scan: GitDirScan = { missing: [], unreadable: [], code: null };
+  for (const entry of GIT_DIR_REQUIRED_ENTRIES) {
+    const result = probe(fs, join(gitDir, entry));
+    if (result.presence === "absent") {
+      scan.missing.push(entry);
+    } else if (result.presence === "unreadable") {
+      scan.unreadable.push(entry);
+      scan.code ??= result.code;
+    }
+  }
+  return scan;
 }
 
 /**
@@ -119,13 +220,20 @@ function isRepositoryDir(fs: CheckoutFs, dir: string): boolean {
  * a ref that exists nowhere in `refs/` or `packed-refs`.
  */
 function hasAnyRef(fs: CheckoutFs, commonDir: string): boolean {
-  if (fs.exists(join(commonDir, "packed-refs"))) return true;
+  // Only a probe that positively establishes absence counts as absence here.
+  // Unreadable ref storage must not downgrade a populated repository to
+  // "no commits", because that tells a caller `git worktree add` will refuse when
+  // it would in fact succeed. (An unreadable common dir is normally already caught
+  // by `scanGitDirEntries`; the direction is stated here because this is where it
+  // is decided.)
+  if (probe(fs, join(commonDir, "packed-refs")).presence !== "absent") return true;
   const headsDir = join(commonDir, "refs", "heads");
-  if (!fs.exists(headsDir)) return false;
+  const heads = probe(fs, headsDir);
+  if (heads.presence === "absent") return false;
+  if (heads.presence === "unreadable") return true;
   try {
     return fs.readDir(headsDir).length > 0;
   } catch {
-    // Unreadable ref storage is not evidence of an empty repository.
     return true;
   }
 }
@@ -144,6 +252,49 @@ function health(
     git_dir: extra.gitDir ?? null,
     common_dir: extra.commonDir ?? null,
   };
+}
+
+/**
+ * The one verdict that must never be inferred from a failure to look.
+ *
+ * `blockedAt` is the exact path the probe stopped on, and `code` the errno that
+ * stopped it, because "check permissions and mounts" is only actionable if the
+ * operator is told where and why.
+ */
+function unreadable(
+  path: string,
+  blockedAt: string,
+  code: string | null,
+  extra: { gitDir?: string | null; commonDir?: string | null } = {},
+): CheckoutHealth {
+  const because = code === null ? "" : ` (${code})`;
+  return health(
+    path,
+    "unreadable",
+    `${blockedAt} could not be read${because}; this is not evidence that it is broken`,
+    extra,
+  );
+}
+
+/**
+ * The " (it holds only: ...)" tail on a hollow-`.git` message.
+ *
+ * Decoration, and deliberately isolated as such. This read used to *be* the
+ * classification for a mode-000 `.git`: that case reported `unreadable` only
+ * because `readdirSync` threw, which left a safety-critical verdict resting on a
+ * cosmetic code path — hand it a `readDir` that cannot fail and the verdict
+ * inverted to `hollow-git-dir`, which re-clones. The hollow verdict is now
+ * established by {@link scanGitDirEntries} alone, so a failure here costs the
+ * decoration and nothing else. A directory readable enough to stat its children
+ * but not to list them (mode `--x`) is the real case that still lands here.
+ */
+function describeHeldEntries(fs: CheckoutFs, gitDir: string): string {
+  try {
+    const entries = fs.readDir(gitDir);
+    return entries.length > 0 ? ` (it holds only: ${entries.join(", ")})` : "";
+  } catch {
+    return "";
+  }
 }
 
 /** Resolve the `gitdir:` pointer in a linked worktree's `.git` file. */
@@ -167,34 +318,30 @@ export function classifyCheckout(path: string, fs: CheckoutFs = nodeCheckoutFs):
   if (!path || path.trim().length === 0) {
     return health(path, "missing-path", "the registry row stores no path");
   }
-  let exists: boolean;
-  try {
-    exists = fs.exists(path);
-  } catch {
-    return health(path, "unreadable", `${path} could not be read; this is not evidence that it is broken`);
-  }
-  if (!exists) {
+  const pathProbe = probe(fs, path);
+  if (pathProbe.presence === "unreadable") return unreadable(path, path, pathProbe.code);
+  if (pathProbe.presence === "absent") {
     return health(path, "missing-path", `${path} does not exist`);
   }
 
   const dotGit = join(path, ".git");
-  let dotGitExists: boolean;
-  try {
-    dotGitExists = fs.exists(dotGit);
-  } catch {
-    return health(path, "unreadable", `${dotGit} could not be read; this is not evidence that it is broken`);
-  }
+  const dotGitProbe = probe(fs, dotGit);
+  // A checkout directory at mode 000 blocks this probe on a repository that is
+  // entirely intact: the directory itself stats fine (its parent is readable), but
+  // nothing inside it can be reached. `existsSync` reported that as "no .git
+  // here", which classified as `no-git-dir` and told the operator to re-clone.
+  if (dotGitProbe.presence === "unreadable") return unreadable(path, dotGit, dotGitProbe.code);
 
-  if (!dotGitExists) {
+  if (dotGitProbe.presence === "absent") {
     // A bare repository has the object database at the top level.
-    try {
-      if (isRepositoryDir(fs, path)) {
-        return hasAnyRef(fs, path)
-          ? health(path, "usable", `${path} is a bare repository`, { gitDir: path, commonDir: path })
-          : health(path, "no-commits", `${path} is a bare repository with no commits`, { gitDir: path, commonDir: path });
-      }
-    } catch {
-      return health(path, "unreadable", `${path} could not be inspected`);
+    const scan = scanGitDirEntries(fs, path);
+    if (scan.unreadable.length > 0) {
+      return unreadable(path, join(path, scan.unreadable[0]!), scan.code);
+    }
+    if (scan.missing.length === 0) {
+      return hasAnyRef(fs, path)
+        ? health(path, "usable", `${path} is a bare repository`, { gitDir: path, commonDir: path })
+        : health(path, "no-commits", `${path} is a bare repository with no commits`, { gitDir: path, commonDir: path });
     }
     return health(path, "no-git-dir", `${path} exists but contains no .git and is not a bare repository`);
   }
@@ -202,24 +349,20 @@ export function classifyCheckout(path: string, fs: CheckoutFs = nodeCheckoutFs):
   let dotGitIsDir: boolean;
   try {
     dotGitIsDir = fs.isDirectory(dotGit);
-  } catch {
-    return health(path, "unreadable", `${dotGit} could not be stat'ed`);
+  } catch (error) {
+    return unreadable(path, dotGit, errnoOf(error));
   }
 
   if (dotGitIsDir) {
-    let missing: string[];
-    let entries: string[];
-    try {
-      missing = missingGitDirEntries(fs, dotGit);
-      entries = missing.length === 0 ? [] : fs.readDir(dotGit);
-    } catch {
-      return health(path, "unreadable", `${dotGit} could not be inspected`);
+    const scan = scanGitDirEntries(fs, dotGit);
+    if (scan.unreadable.length > 0) {
+      return unreadable(path, join(dotGit, scan.unreadable[0]!), scan.code, { gitDir: dotGit, commonDir: dotGit });
     }
-    if (missing.length > 0) {
+    if (scan.missing.length > 0) {
       return health(
         path,
         "hollow-git-dir",
-        `${dotGit} is missing ${missing.join(", ")}${entries.length > 0 ? ` (it holds only: ${entries.join(", ")})` : ""}`,
+        `${dotGit} is missing ${scan.missing.join(", ")}${describeHeldEntries(fs, dotGit)}`,
         { gitDir: dotGit, commonDir: dotGit },
       );
     }
@@ -232,35 +375,51 @@ export function classifyCheckout(path: string, fs: CheckoutFs = nodeCheckoutFs):
   let gitDir: string | null;
   try {
     gitDir = readWorktreePointer(fs, dotGit);
-  } catch {
-    return health(path, "unreadable", `${dotGit} could not be read`);
+  } catch (error) {
+    return unreadable(path, dotGit, errnoOf(error));
   }
   if (!gitDir) {
     return health(path, "worktree-unparseable-pointer", `${dotGit} carries no usable 'gitdir:' pointer`);
   }
-  try {
-    if (!fs.exists(gitDir)) {
-      return health(path, "worktree-dangling-gitdir", `${dotGit} points at ${gitDir}, which does not exist`, { gitDir });
-    }
-    const commonDirFile = join(gitDir, "commondir");
-    const commonDir = fs.exists(commonDirFile)
-      ? resolve(gitDir, fs.readText(commonDirFile).trim())
-      : gitDir;
-    const missing = missingGitDirEntries(fs, commonDir);
-    if (missing.length > 0) {
-      return health(
-        path,
-        "worktree-severed-common-dir",
-        `${dotGit} resolves to ${commonDir}, which is missing ${missing.join(", ")}`,
-        { gitDir, commonDir },
-      );
-    }
-    return hasAnyRef(fs, commonDir)
-      ? health(path, "usable", `${path} is a linked worktree of ${commonDir}`, { gitDir, commonDir })
-      : health(path, "no-commits", `${path} is a linked worktree of ${commonDir}, which has no commits`, { gitDir, commonDir });
-  } catch {
-    return health(path, "unreadable", `${gitDir} could not be inspected`, { gitDir });
+
+  const gitDirProbe = probe(fs, gitDir);
+  // Same swallowed errno one level down. A gitdir behind an unreadable parent is
+  // not a severed worktree, and saying it is sends the caller off to hand-copy
+  // unpushed work out of a worktree whose parent repository is fine.
+  if (gitDirProbe.presence === "unreadable") return unreadable(path, gitDir, gitDirProbe.code, { gitDir });
+  if (gitDirProbe.presence === "absent") {
+    return health(path, "worktree-dangling-gitdir", `${dotGit} points at ${gitDir}, which does not exist`, { gitDir });
   }
+
+  const commonDirFile = join(gitDir, "commondir");
+  const commonDirProbe = probe(fs, commonDirFile);
+  if (commonDirProbe.presence === "unreadable") {
+    return unreadable(path, commonDirFile, commonDirProbe.code, { gitDir });
+  }
+  let commonDir = gitDir;
+  if (commonDirProbe.presence === "present") {
+    try {
+      commonDir = resolve(gitDir, fs.readText(commonDirFile).trim());
+    } catch (error) {
+      return unreadable(path, commonDirFile, errnoOf(error), { gitDir });
+    }
+  }
+
+  const scan = scanGitDirEntries(fs, commonDir);
+  if (scan.unreadable.length > 0) {
+    return unreadable(path, join(commonDir, scan.unreadable[0]!), scan.code, { gitDir, commonDir });
+  }
+  if (scan.missing.length > 0) {
+    return health(
+      path,
+      "worktree-severed-common-dir",
+      `${dotGit} resolves to ${commonDir}, which is missing ${scan.missing.join(", ")}`,
+      { gitDir, commonDir },
+    );
+  }
+  return hasAnyRef(fs, commonDir)
+    ? health(path, "usable", `${path} is a linked worktree of ${commonDir}`, { gitDir, commonDir })
+    : health(path, "no-commits", `${path} is a linked worktree of ${commonDir}, which has no commits`, { gitDir, commonDir });
 }
 
 /**

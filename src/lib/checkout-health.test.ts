@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -41,6 +41,22 @@ function makeRepo(name: string, opts: { commit?: boolean } = {}): string {
     expect(git(path, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"]).code).toBe(0);
   }
   return path;
+}
+
+/**
+ * Run `fn` with `path` at `mode`, restoring the original mode even if `fn` throws.
+ *
+ * A mode-000 directory left behind defeats this file's own `rmSync` teardown, so
+ * the restore has to survive a failing assertion.
+ */
+function withMode<T>(path: string, mode: number, fn: () => T): T {
+  const original = statSync(path).mode & 0o777;
+  chmodSync(path, mode);
+  try {
+    return fn();
+  } finally {
+    chmodSync(path, original);
+  }
 }
 
 /** Strip a `.git` down to what the real gutted checkouts on this machine retain. */
@@ -158,7 +174,7 @@ describe("classifyCheckout against real git fixtures", () => {
 describe("classifyCheckout never guesses", () => {
   function throwingFs(failOn: (path: string) => boolean, base: CheckoutFs = nodeCheckoutFs): CheckoutFs {
     return {
-      exists: (path) => { if (failOn(path)) throw Object.assign(new Error("EACCES"), { code: "EACCES" }); return base.exists(path); },
+      probe: (path) => { if (failOn(path)) throw Object.assign(new Error("EACCES"), { code: "EACCES" }); return base.probe(path); },
       isDirectory: (path) => { if (failOn(path)) throw Object.assign(new Error("EACCES"), { code: "EACCES" }); return base.isDirectory(path); },
       readText: (path) => { if (failOn(path)) throw Object.assign(new Error("EACCES"), { code: "EACCES" }); return base.readText(path); },
       readDir: (path) => { if (failOn(path)) throw Object.assign(new Error("EACCES"), { code: "EACCES" }); return base.readDir(path); },
@@ -190,7 +206,7 @@ describe("classifyCheckout never guesses", () => {
     const headsDir = join(path, ".git", "refs", "heads");
     let readDirCalls = 0;
     const fs: CheckoutFs = {
-      exists: (p) => nodeCheckoutFs.exists(p),
+      probe: (p) => nodeCheckoutFs.probe(p),
       isDirectory: (p) => nodeCheckoutFs.isDirectory(p),
       readText: (p) => nodeCheckoutFs.readText(p),
       readDir: (p) => {
@@ -204,6 +220,104 @@ describe("classifyCheckout never guesses", () => {
     const result = classifyCheckout(path, fs);
     expect(readDirCalls).toBe(1);
     expect(result.state).toBe("usable");
+  });
+});
+
+describe("classifyCheckout on a real unreadable checkout", () => {
+  test("a complete checkout at mode 000 is 'unreadable', and is never told to re-clone over itself", () => {
+    // The whole point of property 2. Before the errno fix this returned
+    // `no-git-dir` on a REAL, COMPLETE checkout, whose remedy is
+    // "The directory survives but its repository does not. Re-clone it with:
+    // git clone <remote> <path>" — a data-loss instruction generated from a
+    // permissions error, because `existsSync` answers EACCES and ENOENT alike
+    // with `false`.
+    const path = makeRepo("locked-checkout");
+    expect(classifyCheckout(path).state).toBe("usable");
+
+    withMode(path, 0o000, () => {
+      // Under a uid that ignores mode bits (root) this fixture proves nothing.
+      // Assert the denial is real so the test fails loudly rather than passing
+      // vacuously. CI runs as a normal user on ubuntu-latest.
+      expect(() => readdirSync(path)).toThrow();
+      // git does not claim it is not a repository either — it reports the
+      // permission problem ("fatal: cannot change to '<path>': Permission denied").
+      // Run it with `-C` from a readable cwd: spawning *into* a mode-000 directory
+      // fails in posix_spawn before git is reached.
+      expect(git(root, ["-C", path, "rev-parse", "--absolute-git-dir"]).code).not.toBe(0);
+
+      const result = classifyCheckout(path);
+      expect(result.state).toBe("unreadable");
+      expect(result.usable).toBe(false);
+      const remedy = describeCheckoutRemedy(result, { remoteUrl: "github.com/hasna/repos" });
+      expect(remedy).not.toContain("git clone");
+      expect(remedy).toContain("Do NOT re-clone");
+    });
+
+    // Restoring the mode restores the verdict: the checkout was intact all along.
+    expect(classifyCheckout(path).state).toBe("usable");
+  });
+
+  test("a .git at mode 000 is 'unreadable' because the probe says so, not because a decorative read threw", () => {
+    // The deeper version of the same defect. This case reported `unreadable`
+    // only as a side effect of `fs.readDir(dotGit)` throwing — a read that
+    // exists purely to decorate the message with what the hollow .git *does*
+    // hold. Hand it a `readDir` that cannot throw and the safety-critical
+    // verdict used to invert to `hollow-git-dir`, whose remedy re-clones.
+    const path = makeRepo("locked-dot-git");
+    const dotGit = join(path, ".git");
+
+    withMode(dotGit, 0o000, () => {
+      expect(() => readdirSync(dotGit)).toThrow();
+      expect(classifyCheckout(path).state).toBe("unreadable");
+
+      const decorationCannotFail: CheckoutFs = { ...nodeCheckoutFs, readDir: () => [] };
+      const result = classifyCheckout(path, decorationCannotFail);
+      expect(result.state).toBe("unreadable");
+      expect(describeCheckoutRemedy(result, { remoteUrl: "github.com/hasna/repos" })).not.toContain("git clone");
+    });
+  });
+
+  test("a gutted .git that can be traversed but not listed is still 'hollow-git-dir', minus the decoration", () => {
+    // The other side of separating the verdict from the decoration, and the one
+    // behaviour change this fix makes beyond the permission cases. At mode 111 the
+    // required entries can still be *stat'ed*, so their absence is positively
+    // established — this .git really is gutted, and git agrees ("fatal: not a git
+    // repository"). The old code reported `unreadable` here purely because the
+    // cosmetic `readDir` threw, which is a false "could not look" about a
+    // directory it could in fact look into.
+    const path = makeRepo("hollow-unlistable");
+    gutGitDir(path);
+    const dotGit = join(path, ".git");
+
+    withMode(dotGit, 0o111, () => {
+      expect(() => readdirSync(dotGit)).toThrow();
+      expect(git(root, ["-C", path, "rev-parse", "--absolute-git-dir"]).code).not.toBe(0);
+
+      const result = classifyCheckout(path);
+      expect(result.state).toBe("hollow-git-dir");
+      expect(result.detail).toContain("missing HEAD, objects, refs");
+      // The decoration is dropped, not substituted with a guess about the contents.
+      expect(result.detail).not.toContain("it holds only");
+    });
+  });
+
+  test("an unreadable worktree gitdir is 'unreadable', not 'worktree-dangling-gitdir'", () => {
+    // Same swallowed errno one level down: the parent repository is present and
+    // fine, so claiming its gitdir "does not exist" would send a caller to hand-copy
+    // unpushed work out of a worktree that is not severed at all.
+    const parent = makeRepo("locked-wt-parent");
+    const wt = join(root, "locked-wt");
+    expect(git(parent, ["worktree", "add", "-q", wt, "-b", "locked"]).code).toBe(0);
+    expect(classifyCheckout(wt).state).toBe("usable");
+
+    // Block the path to the gitdir, not the worktree itself: `.git` still reads,
+    // and its `gitdir:` target can no longer be probed.
+    withMode(join(parent, ".git"), 0o000, () => {
+      expect(() => readdirSync(join(parent, ".git"))).toThrow();
+      expect(classifyCheckout(wt).state).toBe("unreadable");
+    });
+
+    expect(classifyCheckout(wt).state).toBe("usable");
   });
 });
 

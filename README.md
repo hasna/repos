@@ -201,7 +201,9 @@ $ repos registry health --state hollow-git-dir --json
 `hollow-git-dir` means a `.git` directory stripped of `HEAD`, `objects` and `refs` —
 `git worktree add` against it is impossible. `unreadable` is deliberately distinct from
 all of these: a path that could not be inspected is not a path known to be broken, and
-must not be re-cloned over.
+must not be re-cloned over. Getting that distinction right needs the errno, not a
+boolean — only `ENOENT`/`ENOTDIR` count as absence, and a checkout you merely lack
+permission to read reports `unreadable` rather than being declared gutted.
 
 ### Primary registry relocation
 

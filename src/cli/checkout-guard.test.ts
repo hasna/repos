@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database.js";
@@ -86,6 +86,39 @@ describe("repo lookup refuses an unusable checkout", () => {
     expect(record.checkout_health.usable).toBe(false);
     expect(result.stderr).toContain("not a usable git checkout");
     expect(result.stderr).toContain("git clone https://github.com/hasna/gutted");
+  });
+
+  test("refuses a complete-but-unreadable checkout as 'unreadable' and never prints a re-clone command", () => {
+    // stderr is the surface where this defect was dangerous. On a REAL, COMPLETE
+    // checkout that merely could not be read, the refusal used to print
+    // "The directory survives but its repository does not. Re-clone it with:
+    // git clone <remote> <path>" — a data-loss instruction assembled from an
+    // EACCES, because `existsSync` reports a permission error as an absence.
+    tempDir = mkdtempSync(join(tmpdir(), "repos-guard-locked-"));
+    const path = makeCheckout("open-locked");
+    const dbPath = seed([{ name: "open-locked", path, remote: "github.com/hasna/locked" }]);
+
+    const original = statSync(path).mode & 0o777;
+    chmodSync(path, 0o000);
+    let result: ReturnType<typeof runCli>;
+    try {
+      // A uid that ignores mode bits (root) would make this fixture vacuous.
+      // Assert the denial is real; CI runs as a normal user on ubuntu-latest.
+      expect(() => readdirSync(path)).toThrow();
+      result = runCli(dbPath, ["repo", "open-locked", "--json"]);
+    } finally {
+      // Restore before asserting: a mode-000 directory also defeats the
+      // afterEach teardown.
+      chmodSync(path, original);
+    }
+
+    expect(result.code).toBe(1);
+    const record = JSON.parse(result.stdout) as { checkout_health: { state: string; usable: boolean } };
+    expect(record.checkout_health.state).toBe("unreadable");
+    expect(record.checkout_health.usable).toBe(false);
+    expect(result.stderr).toContain("not a usable git checkout");
+    expect(result.stderr).not.toContain("git clone");
+    expect(result.stderr).toContain("Do NOT re-clone");
   });
 
   test("exits zero for a real checkout and reports it usable", () => {
