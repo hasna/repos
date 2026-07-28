@@ -2294,6 +2294,19 @@ noCloudOps
       npmPackages: opts.npmPackage,
     });
     printOpsJson(report, opts.pretty);
+    // A source that failed or hit the registry's result ceiling still contributed,
+    // so this warns rather than failing — but it must not be silent, because an
+    // inventory that looks complete and is not is the whole defect.
+    const degraded = (report.summary.registry_enumeration_sources ?? [])
+      .filter((source) => source.status !== "ok");
+    if (report.summary.registry_enumeration === "ok" && degraded.length > 0) {
+      console.error(chalk.yellow(
+        `registry enumeration degraded: ${degraded.map((s) => `${s.source}=${s.status}`).join(", ")}; coverage may be narrower than the scope.`,
+      ));
+      if (report.summary.registry_enumeration_detail) {
+        console.error(chalk.dim(`  ${report.summary.registry_enumeration_detail}`));
+      }
+    }
     if (report.summary.registry_enumeration === "failed") {
       // The caller asked for registry coverage and did not get it. Reporting a
       // narrower inventory at exit code 0 is the failure mode this whole change

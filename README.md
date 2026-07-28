@@ -84,18 +84,34 @@ surviving dependency on the retired `@hasna/cloud`. The list of packages to chec
 **union of two sources**, because neither is authoritative alone:
 
 - **local manifests** under the scan root — correct for what this machine has checked out,
-  but blind to any package whose repo is not cloned here;
-- **the published scope** (`npm search @hasna`) — correct for what exists, but omits
-  deprecated packages.
+  but blind to any package whose repo is not cloned here, and keyed on the manifest `name`,
+  so a package published under a synthesised name (some are) is invisible to it;
+- **the scope roster** (`npm access list packages @hasna`) — what the scope actually
+  contains, *including deprecated packages*. Needs no credential: the E401 you get from
+  that command is caused by offering a token that lacks org read, so it is retried with the
+  user config suppressed, and `GET /-/org/<scope>/package` answers 200 unauthenticated;
+- **`npm search @hasna`** — a search index, which is strictly less than an enumeration. It
+  omits deprecated packages, and has been measured omitting live non-deprecated ones. Kept
+  only as a second opinion in case the roster endpoint changes.
 
-`@hasna/cloud` is pinned in unconditionally and cannot be dropped by either source: it is
-deprecated, so the registry enumeration does not list it, and its deprecation is the exact
-fact the report exists to surface.
+Coverage is the union of all three, so it shrinks only when a package leaves every source.
+A single source failing **degrades with a warning** rather than failing the command —
+`npm search` is flaky and turning that into a hard error would break a working path — but
+if *every* registry source fails the command **exits non-zero** and says how narrow the
+result is, rather than reporting a smaller inventory at exit code 0. Per-source outcomes are
+in `summary.registry_enumeration_sources`.
 
-If the registry enumeration fails, the command **exits non-zero** and says how narrow the
-result is, rather than reporting a smaller inventory at exit code 0. A hardcoded list was
-tried first and went stale twice (`@hasna/swarm` unpublished while still listed;
-`@hasna/deployment` a live 404), so there is no literal list to edit.
+The registry search API caps a result set at 250 no matter what `--searchlimit` says, so a
+saturated search is reported as `truncated`, never as complete.
+
+`@hasna/cloud` is also pinned in unconditionally and cannot be dropped by any source, since
+its deprecation is the exact fact the report exists to surface.
+
+A hardcoded list was tried first and went stale twice (`@hasna/swarm` unpublished while
+still listed; `@hasna/deployment` a live 404), so there is no literal list to edit. Deriving
+from local manifests alone was tried next and was worse: it silently dropped every package
+without a local checkout, including `@hasna/wallets`, which declares the retired
+`@hasna/cloud` today.
 
 ### Primary registry relocation
 

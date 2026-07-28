@@ -4,10 +4,13 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  PACKAGE_SCOPE,
   classifyNpmViewFailure,
+  classifyScopeSearchResult,
   deriveLocalPackageNames,
   getNoCloudInventory,
   resolveNpmPackageChecks,
+  unionScopeEnumerations,
 } from "./no-cloud-inventory";
 
 function withTempWorkspace(fn: (root: string) => void) {
@@ -510,6 +513,7 @@ describe("registry inventory sources", () => {
   const walletsPkg = "@hasna" + "/wallets";
   const reposPkg = "@hasna" + "/repos";
   const localOnlyPkg = "@hasna" + "/localonly";
+  const codersPkg = "@hasna" + "/coders";
 
   function manifest(root: string, dir: string, name: string) {
     const path = join(root, dir);
@@ -610,6 +614,76 @@ describe("registry inventory sources", () => {
     });
   });
 
+  it("keeps a deprecated published package that npm search cannot see", () => {
+    // THE REGRESSION THIS PINS. @hasna/coders@0.2.14 is published and live, and is
+    // merely deprecated, so `npm search` omits it exactly as it omits @hasna/cloud.
+    // It has no local manifest (its source repo was deleted), it was in the
+    // hardcoded list this change replaces, and it therefore dropped out of coverage
+    // at every scan root. Unconditionally pinning @hasna/cloud does not generalise
+    // to it. Measured on 2026-07-28: `npm search` returned 160 scoped names, the
+    // scope roster returned 170, and search \\ roster was empty — the roster is a
+    // strict superset, and two of the ten it adds (@hasna/cli@0.1.0 -> ^0.1.5,
+    // @hasna/open-projects@0.1.1 -> ^0.1.28) declare @hasna/cloud right now.
+    const inventory = resolveNpmPackageChecks([], {
+      enumerate: () => unionScopeEnumerations([
+        { source: "search", result: { status: "ok", names: [reposPkg], detail: null } },
+        { source: "roster", result: { status: "ok", names: [reposPkg, codersPkg], detail: null } },
+      ]),
+    });
+    expect(inventory.packages).toContain(codersPkg);
+    expect(inventory.registry_enumeration).toBe("ok");
+  });
+
+  it("stays ok when one registry source fails and the other answers", () => {
+    // npm search is flaky and the roster is a semi-public endpoint. Turning either
+    // one's failure into a hard error would make a common path fail while coverage
+    // was in fact complete, so a source failure degrades and is reported per source.
+    const enumeration = unionScopeEnumerations([
+      { source: "search", result: { status: "failed", names: [], detail: "network unreachable" } },
+      { source: "roster", result: { status: "ok", names: [reposPkg, codersPkg], detail: null } },
+    ]);
+    expect(enumeration.status).toBe("ok");
+    expect(enumeration.names).toEqual([codersPkg, reposPkg].sort());
+    expect(enumeration.sources?.find((s) => s.source === "search")?.status).toBe("failed");
+    expect(enumeration.detail).toContain("network unreachable");
+  });
+
+  it("fails only when every registry source fails", () => {
+    const enumeration = unionScopeEnumerations([
+      { source: "search", result: { status: "failed", names: [], detail: "search down" } },
+      { source: "roster", result: { status: "failed", names: [], detail: "roster down" } },
+    ]);
+    expect(enumeration.status).toBe("failed");
+    expect(enumeration.names).toEqual([]);
+  });
+
+  it("treats a saturated npm search as truncated rather than complete", () => {
+    // The registry search API hard-caps at 250 results whatever --searchlimit says:
+    // `npm search --json --searchlimit=1000 react` returns exactly 250. A result set
+    // sitting on the ceiling is indistinguishable from a complete one, so reporting
+    // it as `ok` would silently narrow coverage — the exact failure this change
+    // exists to remove, and it would falsify the README's claim that coverage only
+    // shrinks when a package is gone from both sources.
+    const saturated = classifyScopeSearchResult(Array.from({ length: 4 }, (_, i) => `${PACKAGE_SCOPE}/p${i}`), 4, 4);
+    expect(saturated.sources?.[0]?.status).toBe("truncated");
+    expect(saturated.names.length).toBe(4);
+    expect(saturated.detail).toContain("250");
+
+    const complete = classifyScopeSearchResult([`${PACKAGE_SCOPE}/p0`], 1, 4);
+    expect(complete.status).toBe("ok");
+    expect(complete.detail).toBeNull();
+  });
+
+  it("still surfaces truncation through the union without discarding the names", () => {
+    const enumeration = unionScopeEnumerations([
+      { source: "search", result: classifyScopeSearchResult([reposPkg, codersPkg], 2, 2) },
+    ]);
+    expect(enumeration.status).toBe("ok");
+    expect(enumeration.names).toContain(codersPkg);
+    expect(enumeration.detail).toContain("searchlimit");
+    expect(enumeration.sources?.[0]?.status).toBe("truncated");
+  });
+
   it("classifies a registry 404 as unpublished and anything else as a failure", () => {
     // An absent package and a broken npm client both exit non-zero. Collapsing
     // them is how a retired package reads as a transient blip.
@@ -664,8 +738,16 @@ describe("enclosing-repository detection", () => {
 
       const report = getNoCloudInventory({ root: inner, limit: 10 });
       const finding = report.repos.find((entry) => entry.repo_key === "hasna/brains");
-      expect(finding?.route_blocked_reason).toBeNull();
-      expect(finding?.routeable).toBe(true);
+      // Asserts the enclosing-repository question specifically, not `null`. When the
+      // scan root IS the repo, `path` falls back to the absolute path, so
+      // `auxiliaryPathReason` regexes the operator's TMPDIR for
+      // compact|improve|review|feature|worktree|codex|goal — and a TMPDIR containing
+      // any of those words (`.../pr34-35-adversarial-review`, or anything under
+      // `~/.hasna/repos/worktrees/`) made this assertion fail for a reason that has
+      // nothing to do with what the test is about. `nested-git-checkout` is still
+      // what an unfixed `main` returns here, so this keeps the discriminating power
+      // without re-importing the environment dependence the fix removes.
+      expect(finding?.route_blocked_reason).not.toBe("nested-git-checkout");
     });
   });
 
