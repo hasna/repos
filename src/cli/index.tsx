@@ -2281,8 +2281,8 @@ noCloudOps
   .description("Scan git repos for legacy Hasna cloud references and optional npm latest metadata")
   .option("-n, --limit <n>", "Max returned repos/npm packages", "200")
   .option("--max-depth <n>", "Max directory depth when discovering git roots", "8")
-  .option("--include-npm", "Also query npm latest metadata for known @hasna packages")
-  .option("--npm-package <name>", "Package name for npm metadata checks; repeat or comma-separate for multiple", collectValues, [])
+  .option("--include-npm", "Also query npm metadata for @hasna packages: local manifests unioned with the published scope")
+  .option("--npm-package <name>", "Check exactly these packages instead of the derived union; repeat or comma-separate", collectValues, [])
   .option("--pretty", "Pretty-print JSON")
   .action((path: string | undefined, opts: any) => {
     const root = path ?? process.cwd();
@@ -2294,6 +2294,31 @@ noCloudOps
       npmPackages: opts.npmPackage,
     });
     printOpsJson(report, opts.pretty);
+    // A source that failed or hit the registry's result ceiling still contributed,
+    // so this warns rather than failing — but it must not be silent, because an
+    // inventory that looks complete and is not is the whole defect.
+    const degraded = (report.summary.registry_enumeration_sources ?? [])
+      .filter((source) => source.status !== "ok");
+    if (report.summary.registry_enumeration === "ok" && degraded.length > 0) {
+      console.error(chalk.yellow(
+        `registry enumeration degraded: ${degraded.map((s) => `${s.source}=${s.status}`).join(", ")}; coverage may be narrower than the scope.`,
+      ));
+      if (report.summary.registry_enumeration_detail) {
+        console.error(chalk.dim(`  ${report.summary.registry_enumeration_detail}`));
+      }
+    }
+    if (report.summary.registry_enumeration === "failed") {
+      // The caller asked for registry coverage and did not get it. Reporting a
+      // narrower inventory at exit code 0 is the failure mode this whole change
+      // exists to remove, so it fails and says by how much.
+      console.error(chalk.red(
+        `registry enumeration failed, so this inventory covers only ${report.summary.registry_from_local_manifests} locally-declared package(s) plus @hasna/cloud.`,
+      ));
+      if (report.summary.registry_enumeration_detail) {
+        console.error(chalk.dim(`  ${report.summary.registry_enumeration_detail}`));
+      }
+      process.exitCode = 1;
+    }
   });
 
 // ── Knowledge Graph ──
