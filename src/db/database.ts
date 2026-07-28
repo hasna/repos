@@ -788,6 +788,29 @@ const MIGRATIONS: Migration[] = [
     version: 12,
     run: (db) => upgradePullRequestGateColumns(db),
   },
+  {
+    // Receipts for `repos registry prune`. A deletion primitive on the registry
+    // has to answer "who removed row 526, when, and against which plan" after
+    // the row is gone, so the removed rows are stored verbatim. repo_id is a
+    // plain INTEGER, not a foreign key: the row it refers to no longer exists,
+    // which is the whole point of the receipt.
+    version: 13,
+    sql: `
+      CREATE TABLE IF NOT EXISTS registry_prune_audit (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        plan_hash TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        row_count INTEGER NOT NULL,
+        rows_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_registry_prune_audit_created
+        ON registry_prune_audit(created_at);
+    `,
+  },
 ];
 
 function tableExists(db: Database, name: string): boolean {
