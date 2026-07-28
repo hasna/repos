@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   HOOK_MARKER_START,
@@ -65,6 +65,7 @@ describe("resolveGitDir", () => {
   it("resolves a relative pointer to a gitdir that exists", () => {
     const realGitDir = join(TEST_DIR, "relative-target", ".git");
     mkdirSync(realGitDir, { recursive: true });
+    writeFileSync(join(realGitDir, "HEAD"), "ref: refs/heads/main\n"); // as a real submodule gitdir has
     const consumer = join(TEST_DIR, "relative-consumer");
     mkdirSync(consumer, { recursive: true });
     writeFileSync(join(consumer, ".git"), "gitdir: ../relative-target/.git\n");
@@ -75,6 +76,32 @@ describe("resolveGitDir", () => {
   it("returns the .git directory itself for an ordinary checkout", () => {
     const repoPath = createTestRepo("ordinary-repo");
     expect(resolveGitDir(repoPath)).toBe(join(repoPath, ".git"));
+  });
+
+  it("returns null for a pointer to an ordinary directory that is not a git dir", () => {
+    // `gitdir: ../innocent` resolves to a real directory that is not a repository. Existence is
+    // not gitness — without this check an arbitrary directory acquires a hooks/ tree.
+    const innocent = join(TEST_DIR, "innocent");
+    mkdirSync(join(innocent, "subdir"), { recursive: true });
+    const traversal = join(TEST_DIR, "traversal-consumer");
+    mkdirSync(traversal, { recursive: true });
+    writeFileSync(join(traversal, ".git"), "gitdir: ../innocent\n");
+
+    expect(resolveGitDir(traversal)).toBeNull();
+    expect(installPostCommitHook(traversal).status).toBe("skipped");
+    expect(existsSync(join(innocent, "hooks"))).toBe(false);
+  });
+
+  it("returns null for a husk .git holding only hooks/ and worktrees/", () => {
+    // The shape this bug already left on disk. Re-touching one rewrites the mtimes that date
+    // whatever emptied it, so it must not be treated as a repository either.
+    const husk = join(TEST_DIR, "husk-repo");
+    mkdirSync(join(husk, ".git", "hooks"), { recursive: true });
+    mkdirSync(join(husk, ".git", "worktrees"), { recursive: true });
+
+    expect(resolveGitDir(husk)).toBeNull();
+    expect(installPostCommitHook(husk).status).toBe("skipped");
+    expect(existsSync(join(husk, ".git", "hooks", "post-commit"))).toBe(false);
   });
 
   it("returns null for a directory that has no .git at all", () => {
@@ -142,6 +169,32 @@ describe("repo-hooks", () => {
     expect(report).toContain("reported-orphan");
     expect(report).not.toContain("reported-healthy");
     expect(existsSync(goneRepo)).toBe(false);
+  });
+
+  it("isolates a failing repo so the rest of the batch still installs", () => {
+    // The non-recursive mkdir turns a gitdir that vanishes mid-run into a throw. In the watcher
+    // that throw would escape the fs.watch callback, so it must not leave the loop.
+    const blocked = join(TEST_DIR, "blocked-repo");
+    const blockedGitDir = join(TEST_DIR, "blocked-gitdir");
+    mkdirSync(blockedGitDir, { recursive: true });
+    writeFileSync(join(blockedGitDir, "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(blocked, { recursive: true });
+    writeFileSync(join(blocked, ".git"), `gitdir: ${blockedGitDir}\n`);
+    chmodSync(blockedGitDir, 0o500); // read+execute only: mkdir inside it fails with EACCES
+
+    const healthy = createTestRepo("after-the-failure");
+    let summary;
+    try {
+      summary = installPostCommitHooks([blocked, healthy], process.env["HASNA_REPOS_HOOK_QUEUE_PATH"]!);
+    } finally {
+      // Restore even if the call throws, or the unwritable dir breaks cleanup for every later test.
+      chmodSync(blockedGitDir, 0o700);
+    }
+
+    expect(summary.results[0]!.status).toBe("skipped");
+    expect(summary.results[0]!.reason).toBe("install_failed");
+    expect(summary.installed).toBe(1);
+    expect(existsSync(join(healthy, ".git", "hooks", "post-commit"))).toBe(true);
   });
 
   it("has nothing to report when every checkout is healthy", () => {

@@ -10,6 +10,7 @@ export interface HookInstallResult {
   hookPath: string | null;
   status: "installed" | "updated" | "unchanged" | "skipped";
   reason?: string;
+  error?: string;
 }
 
 export interface HookInstallSummary {
@@ -25,7 +26,18 @@ export type GitDirResolution =
   | { status: "missing_repo_root" }
   | { status: "missing_git_dir" }
   | { status: "dangling_git_dir"; target: string }
+  | { status: "not_a_git_dir"; target: string }
   | { status: "unreadable_git_dir" };
+
+/**
+ * A git directory always holds `HEAD`; a linked worktree's also holds `commondir`. Existence is
+ * not gitness — `gitdir: ../innocent` resolves to a perfectly real directory that is not a
+ * repository, and a husk left by this bug is a `.git` containing only `hooks/` and `worktrees/`.
+ * Writing into either is the same mistake as writing into one that is missing.
+ */
+function looksLikeGitDir(candidate: string): boolean {
+  return existsSync(join(candidate, "HEAD")) || existsSync(join(candidate, "commondir"));
+}
 
 /**
  * Resolve a checkout's real git directory.
@@ -44,7 +56,11 @@ export function resolveGitDirDetailed(repoPath: string): GitDirResolution {
 
   try {
     const stat = statSync(dotGitPath);
-    if (stat.isDirectory()) return { status: "ok", gitDir: dotGitPath };
+    if (stat.isDirectory()) {
+      return looksLikeGitDir(dotGitPath)
+        ? { status: "ok", gitDir: dotGitPath }
+        : { status: "not_a_git_dir", target: dotGitPath };
+    }
 
     const raw = readFileSync(dotGitPath, "utf-8");
     const match = raw.match(/^gitdir:\s*(.+)$/m);
@@ -54,6 +70,7 @@ export function resolveGitDirDetailed(repoPath: string): GitDirResolution {
     if (!existsSync(target) || !statSync(target).isDirectory()) {
       return { status: "dangling_git_dir", target };
     }
+    if (!looksLikeGitDir(target)) return { status: "not_a_git_dir", target };
     return { status: "ok", gitDir: target };
   } catch {
     return { status: "unreadable_git_dir" };
@@ -124,7 +141,22 @@ export function installPostCommitHook(repoPath: string, queuePath = getHookQueue
 }
 
 export function installPostCommitHooks(repoPaths: string[], queuePath = getHookQueuePath()): HookInstallSummary {
-  const results = repoPaths.map((repoPath) => installPostCommitHook(repoPath, queuePath));
+  const results = repoPaths.map((repoPath) => {
+    // One unwritable or vanishing repository must not abort the batch. The non-recursive mkdir
+    // turns a gitdir that disappears mid-run into a throw, and in the auto-index watcher that
+    // throw would escape the fs.watch callback and take the daemon down.
+    try {
+      return installPostCommitHook(repoPath, queuePath);
+    } catch (error) {
+      return {
+        repoPath,
+        hookPath: null,
+        status: "skipped" as const,
+        reason: "install_failed",
+        error: (error as Error).message,
+      };
+    }
+  });
   return {
     installed: results.filter((result) => result.status === "installed").length,
     updated: results.filter((result) => result.status === "updated").length,
