@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import { printJson, writeAllSync, writeStdout, type SyncWriter } from "./stdout.js";
 
@@ -218,5 +218,62 @@ describe("repos --json over a pipe", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * A writer module does nothing for a call site that bypasses it.
+ *
+ * This is not hypothetical. The 64 KiB truncation was fixed by routing every
+ * `--json` surface through `printJson`, and it came straight back on a *new*
+ * surface: `registry prune --json` was added with two fresh
+ * `console.log(JSON.stringify(...))` call sites, and its dry-run plan measured
+ * 126829 bytes to a file against exactly 65536 bytes through `bash -c
+ * 'set -o pipefail; ... | cat'` at exit code 0, with the JSON unparseable. The
+ * document cut in half there is a PRUNE PLAN — the record of which registry
+ * rows a deletion primitive intends to remove — so the surface that reopened the
+ * defect was the worst one available.
+ *
+ * `console.log` is the wrong tool for a machine-readable document on any fd that
+ * can be a pipe, so no amount of care at review time substitutes for a check
+ * that fails. This guard is the check: it makes reintroducing the bypass a red
+ * test rather than a defect discovered later by whatever consumed the truncated
+ * output.
+ */
+describe("no --json surface bypasses the completing writer", () => {
+  const SRC_ROOT = join(import.meta.dir, "..");
+  // `console.log` hands a fully-serialized document to an async, unflushed
+  // stdout path. Any JSON.stringify inside a console.log argument list is the
+  // defect, whatever the surrounding formatting.
+  const BYPASS = /console\.log\s*\(\s*JSON\.stringify/;
+
+  function sourceFiles(dir: string, found: string[] = []): string[] {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+        sourceFiles(full, found);
+      } else if (/\.tsx?$/.test(entry.name) && full !== import.meta.path) {
+        found.push(full);
+      }
+    }
+    return found;
+  }
+
+  test("no console.log(JSON.stringify(...)) remains anywhere under src/", () => {
+    const files = sourceFiles(SRC_ROOT);
+    // Guard the guard: if the walk finds nothing, an empty offender list would
+    // pass vacuously.
+    expect(files.length).toBeGreaterThan(20);
+    const offenders: string[] = [];
+    for (const file of files) {
+      const lines = readFileSync(file, "utf8").split("\n");
+      lines.forEach((line, i) => {
+        if (BYPASS.test(line)) offenders.push(`${relative(SRC_ROOT, file)}:${i + 1}`);
+      });
+    }
+    // Named in the failure so the fix is obvious: replace it with printJson /
+    // printJsonLine / printLine from src/cli/stdout.ts.
+    expect(offenders).toEqual([]);
   });
 });

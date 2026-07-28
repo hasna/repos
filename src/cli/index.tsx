@@ -786,7 +786,7 @@ registry
         limit: opts.limit === undefined ? undefined : intFlag(String(opts.limit), "--limit", 1),
       });
       if (json) {
-        console.log(JSON.stringify(result, null, 2));
+        printJson(result);
         return;
       }
       const { plan } = result;
@@ -833,7 +833,7 @@ registry
       const message = error instanceof Error ? error.message : "unknown registry prune error";
       if (json) {
         const details = error instanceof RegistryPruneError ? error.details : undefined;
-        console.log(JSON.stringify({ schema: "open-repos.registry-prune.v1", ok: false, error: { code, message, details } }, null, 2));
+        printJson({ schema: "open-repos.registry-prune.v1", ok: false, error: { code, message, details } });
       } else {
         console.error(chalk.red(`${code}: ${message}`));
       }
