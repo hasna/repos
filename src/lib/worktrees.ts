@@ -435,7 +435,9 @@ function recordedBaseSource(lease: WorktreeLease): "origin" | "local" {
     const metadata = JSON.parse(lease.owner_metadata) as { base_source?: unknown };
     return metadata.base_source === "local" ? "local" : "origin";
   } catch {
-    return "origin";
+    // Corrupt metadata cannot establish that the base came from a remote.
+    // Prefer the conservative answer instead of fabricating an origin fetch.
+    return "local";
   }
 }
 

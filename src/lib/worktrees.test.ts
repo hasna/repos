@@ -320,6 +320,19 @@ describe("addWorktree", () => {
     expect(second.base.source).toBe("local");
   });
 
+  test("the reuse path does not claim origin when its metadata is corrupt", () => {
+    const { db, repoName } = seed({ withOrigin: false });
+    const first = addWorktree({ repo: repoName, task: "corrupt-base-source" });
+    expect(first.base.source).toBe("local");
+
+    db.query("UPDATE worktree_leases SET owner_metadata = ? WHERE lease_id = ?")
+      .run("{", first.lease.lease_id);
+
+    const second = addWorktree({ repo: repoName, task: "corrupt-base-source" });
+    expect(second.reused).toBe(true);
+    expect(second.base.source).toBe("local");
+  });
+
   test("requires exactly one of --task and --name", () => {
     const { repoName } = seed();
     expect(codeOf(() => addWorktree({ repo: repoName }))).toBe("INVALID_REQUEST");
