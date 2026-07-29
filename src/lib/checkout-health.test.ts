@@ -330,6 +330,13 @@ describe("describeCheckoutRemedy", () => {
     expect(remedy).toContain("git clone https://github.com/hasna/repos");
   });
 
+  test("normalizes an SSH-form remote into a clonable HTTPS URL", () => {
+    const result = classifyCheckout(join(root, "nope"));
+    const remedy = describeCheckoutRemedy(result, { remoteUrl: "git@github.com:org/x.git" });
+    expect(remedy).toContain("git clone https://github.com/org/x <path>");
+    expect(remedy).not.toContain("git@github.com:");
+  });
+
   test("says so plainly when there is no remote to clone from", () => {
     const result = classifyCheckout(join(root, "nope"));
     expect(describeCheckoutRemedy(result, { remoteUrl: null })).toContain("no remote");
