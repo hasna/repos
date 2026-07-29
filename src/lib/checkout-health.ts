@@ -107,6 +107,8 @@ export interface PathProbe {
   presence: PathPresence;
   /** The errno that blocked the probe, when one did. Named in the message so an operator can act. */
   code: string | null;
+  /** File size when the probe found the path. Omitted by implementations that cannot establish it. */
+  size?: number;
 }
 
 /** Injectable filesystem, so every branch is reachable in a test. */
@@ -144,8 +146,8 @@ export const nodeCheckoutFs: CheckoutFs = {
   probe: (path) => {
     try {
       // `statSync`, not `existsSync`: the same syscall, but the errno survives.
-      statSync(path);
-      return { presence: "present", code: null };
+      const stat = statSync(path);
+      return { presence: "present", code: null, size: stat.size };
     } catch (error) {
       const code = errnoOf(error);
       return code !== null && ABSENT_ERRNOS.has(code)
@@ -220,13 +222,17 @@ function scanGitDirEntries(fs: CheckoutFs, gitDir: string): GitDirScan {
  * a ref that exists nowhere in `refs/` or `packed-refs`.
  */
 function hasAnyRef(fs: CheckoutFs, commonDir: string): boolean {
-  // Only a probe that positively establishes absence counts as absence here.
-  // Unreadable ref storage must not downgrade a populated repository to
-  // "no commits", because that tells a caller `git worktree add` will refuse when
-  // it would in fact succeed. (An unreadable common dir is normally already caught
-  // by `scanGitDirEntries`; the direction is stated here because this is where it
-  // is decided.)
-  if (probe(fs, join(commonDir, "packed-refs")).presence !== "absent") return true;
+  // Only positive evidence that ref storage is empty counts here. Unreadable ref
+  // storage must not downgrade a populated repository to "no commits", because
+  // that tells a caller `git worktree add` will refuse when it would in fact
+  // succeed. (An unreadable common dir is normally already caught by
+  // `scanGitDirEntries`; the direction is stated here because this is where it is
+  // decided.)
+  const packedRefs = probe(fs, join(commonDir, "packed-refs"));
+  if (packedRefs.presence === "unreadable") return true;
+  // A present but empty packed-refs contains no refs. If an injected filesystem
+  // cannot report its size, retain the conservative answer that refs may exist.
+  if (packedRefs.presence === "present" && packedRefs.size !== 0) return true;
   const headsDir = join(commonDir, "refs", "heads");
   const heads = probe(fs, headsDir);
   if (heads.presence === "absent") return false;
