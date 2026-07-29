@@ -361,6 +361,36 @@ describe("removeWorktree", () => {
     expect(root).toBeTruthy();
   });
 
+  test("a lease id from the database cannot steer the evidence archive out of the root", () => {
+    // The evidence directory is named after the lease id, and on the
+    // `<repo>/<worktree>` path that id comes from the row rather than from the
+    // argument — so it has never been through the reference parser. A row with
+    // `../..` in its primary key would place the archive outside the root.
+    const { root, repoName } = seed();
+    const created = addWorktree({ repo: repoName, task: "poisoned-lease" });
+    writeFileSync(join(created.path, "README.md"), "uncommitted\n");
+    getDb().prepare("UPDATE worktree_leases SET lease_id = ? WHERE lease_id = ?")
+      .run("../../../escaped", created.lease.lease_id);
+
+    const forced = removeWorktree({ ref: `${repoName}/poisoned-lease`, discardChanges: true });
+    expect(forced.removed).toBe(true);
+    expect(forced.evidence_path!.startsWith(join(root, ".evidence"))).toBe(true);
+    expect(existsSync(join(tempDir, "escaped"))).toBe(false);
+  });
+
+  test("removes an adopted stray that has no lease at all", () => {
+    // `<repo>/<name>` has to work for the 1465 leaseless directories measured
+    // under the live root, or the corpus stays unmanageable.
+    const { root, clonePath, repoName } = seed();
+    const stray = join(root, repoName, "hand-made");
+    git(clonePath, ["worktree", "add", "-b", "hand-made", stray]);
+
+    const result = removeWorktree({ ref: `${repoName}/hand-made` });
+    expect(result.removed).toBe(true);
+    expect(result.lease_id).toBeNull();
+    expect(existsSync(stray)).toBe(false);
+  });
+
   test("refuses to act on the parent checkout", () => {
     const { clonePath, repoName } = seed();
     const created = addWorktree({ repo: repoName, task: "parent" });
@@ -403,6 +433,9 @@ describe("listWorktrees", () => {
     expect(byPath.get(flat)?.issues).toContain("no-lease");
     expect(byPath.get(stationDir)?.issues).toContain("nested-layout");
     expect(byPath.get(orphan.path)?.issues).toContain("missing-directory");
+    // A lease whose directory is gone still reports the repo segment it lived
+    // under, so `worktree list <repo>` can surface it.
+    expect(byPath.get(orphan.path)?.repo_name).toBe(repoName);
     expect(report.summary.issue_count).toBeGreaterThanOrEqual(3);
   });
 

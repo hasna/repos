@@ -43,7 +43,7 @@
  * asserts that with a positive control.
  */
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import {
   existsSync,
@@ -293,6 +293,18 @@ export function assertWorktreeName(name: string | undefined): string {
     );
   }
   return name;
+}
+
+/**
+ * Coerce an untrusted string into one safe path segment.
+ *
+ * Used for values that come from stored rows rather than from arguments, where
+ * refusing outright would strand data the operator is trying to rescue. The
+ * digest keeps distinct inputs distinct without preserving anything traversable.
+ */
+function safePathSegment(value: string): string {
+  if (NAME_PATTERN.test(value) && !value.endsWith(".")) return value;
+  return `unsafe-${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
 }
 
 function assertRepoSegment(name: string): string {
@@ -789,10 +801,17 @@ function resolveRemovalTarget(db: Database, ref: string): ResolvedTarget {
  * something is worse than one that says what it omits.
  */
 function archiveBeforeReap(target: ResolvedTarget, leaseId: string): string {
+  // The archive directory is named after the lease, and on the
+  // `<repo>/<worktree>` path that id comes from the database row rather than
+  // from the argument — so unlike a lease-id reference it has never been
+  // through `parseWorktreeRef`. A row whose primary key contained `../..` would
+  // place the archive outside the root, which is the one thing this module
+  // promises cannot happen. Anything that is not a plain segment is replaced
+  // rather than trusted.
   const evidenceDir = join(
     worktreeRootDir(),
     ".evidence",
-    `${leaseId}-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+    `${safePathSegment(leaseId)}-${new Date().toISOString().replace(/[:.]/g, "-")}`,
   );
   mkdirSync(evidenceDir, { recursive: true });
 
@@ -1101,8 +1120,15 @@ export function listWorktrees(options: WorktreeListOptions = {}): WorktreeListRe
   }
 
   for (const lease of leases) {
+    // The repo segment comes from the lease's position under the root, not from
+    // the parent checkout's directory name — those differ (`open-repos` under
+    // the root, `clones/open-repos` on disk) and a listing keyed on the wrong
+    // one cannot be filtered by the same name `add` was given.
+    const relativeToRoot = isWithin(root, lease.worktree_path)
+      ? relative(root, lease.worktree_path).split(sep)
+      : [];
     const entry = record(lease.worktree_path, {
-      repo_name: lease.repo_path.split(sep).pop() ?? null,
+      repo_name: relativeToRoot.length >= 2 ? relativeToRoot[0]! : null,
       worktree_name: lease.worktree_path.split(sep).pop() ?? null,
       on_disk: existsSync(lease.worktree_path),
     });
