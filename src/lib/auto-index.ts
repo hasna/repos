@@ -8,7 +8,7 @@ import type { ScanResult } from "../types/index.js";
 import { getConfig, getHookQueuePath, getWorkspaceRoots } from "./config.js";
 import { getSourceMachineId } from "./machine-id.js";
 import { describeDanglingCheckouts, drainHookQueue, installPostCommitHooks } from "./repo-hooks.js";
-import { discoverRepos, scanRepoPaths } from "./scanner.js";
+import { discoverRepos, isRepoScanAdmissionPath, scanRepoPaths } from "./scanner.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 const WORKSPACE_BOOTSTRAP_STATE_KEY = "workspace_bootstrap";
@@ -1152,6 +1152,7 @@ export async function startAutoIndexWorker(
 
   const scheduleScan = (repoPath: string, source: string) => {
     const normalizedRepoPath = resolve(repoPath);
+    if (!isRepoScanAdmissionPath(normalizedRepoPath)) return;
     if (pendingScans.has(normalizedRepoPath)) return;
 
     const timeout = setTimeout(() => {
@@ -1187,7 +1188,12 @@ export async function startAutoIndexWorker(
       const watcher = watch(root, { recursive: true }, (_eventType, filename) => {
         if (!filename) return;
         const repoPath = resolveRepoPathFromWatchEvent(root, filename.toString());
-        if (!repoPath || knownRepos.has(repoPath) || !existsSync(join(repoPath, ".git"))) return;
+        if (
+          !repoPath
+          || !isRepoScanAdmissionPath(repoPath)
+          || knownRepos.has(repoPath)
+          || !existsSync(join(repoPath, ".git"))
+        ) return;
 
         knownRepos.add(repoPath);
         const hooks = installPostCommitHooks([repoPath], getHookQueuePath());
@@ -1208,6 +1214,7 @@ export async function startAutoIndexWorker(
   const hookQueueTimer = setInterval(() => {
     const queuedRepos = drainHookQueue(getHookQueuePath());
     for (const repoPath of queuedRepos) {
+      if (!isRepoScanAdmissionPath(repoPath)) continue;
       knownRepos.add(repoPath);
       scheduleScan(repoPath, "post-commit");
     }
