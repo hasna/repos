@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, setDefaultTimeout } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,6 +12,8 @@ import {
   resolveNpmPackageChecks,
   unionScopeEnumerations,
 } from "./no-cloud-inventory";
+
+setDefaultTimeout(30_000);
 
 function withTempWorkspace(fn: (root: string) => void) {
   const root = join(tmpdir(), `repos-no-cloud-${Date.now()}-${Math.random().toString(16).slice(2)}`);

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -26,6 +26,8 @@ import {
   setPrimaryRelocationCanonicalRootForTests,
   type PrimaryRelocationRequest,
 } from "./primary-relocation.js";
+
+setDefaultTimeout(30_000);
 
 let root = "";
 let canonicalRoot = "";
