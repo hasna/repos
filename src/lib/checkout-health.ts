@@ -228,11 +228,28 @@ function hasAnyRef(fs: CheckoutFs, commonDir: string): boolean {
   // succeed. (An unreadable common dir is normally already caught by
   // `scanGitDirEntries`; the direction is stated here because this is where it is
   // decided.)
-  const packedRefs = probe(fs, join(commonDir, "packed-refs"));
+  const packedRefsPath = join(commonDir, "packed-refs");
+  const packedRefs = probe(fs, packedRefsPath);
   if (packedRefs.presence === "unreadable") return true;
-  // A present but empty packed-refs contains no refs. If an injected filesystem
-  // cannot report its size, retain the conservative answer that refs may exist.
-  if (packedRefs.presence === "present" && packedRefs.size !== 0) return true;
+  if (packedRefs.presence === "present") {
+    if (packedRefs.size === undefined) return true;
+    // Avoid reading an arbitrarily large ref index on every checkout lookup.
+    // Git's header-only representation is tiny; larger files conservatively
+    // count as possibly populated rather than being read wholesale.
+    const MAX_EMPTY_PACKED_REFS_BYTES = 4 * 1024;
+    if (packedRefs.size > MAX_EMPTY_PACKED_REFS_BYTES) return true;
+    try {
+      // packed-refs may contain only its `# pack-refs with:` header. File size
+      // therefore cannot establish that a ref exists; only a non-comment entry
+      // can. Any unrecognised non-comment content stays on the conservative side.
+      const hasPackedRef = fs.readText(packedRefsPath)
+        .split(/\r?\n/)
+        .some((line) => line.length > 0 && !line.startsWith("#"));
+      if (hasPackedRef) return true;
+    } catch {
+      return true;
+    }
+  }
   const headsDir = join(commonDir, "refs", "heads");
   const heads = probe(fs, headsDir);
   if (heads.presence === "absent") return false;
