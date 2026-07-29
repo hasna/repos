@@ -531,6 +531,305 @@ describe("ops producers", () => {
     expect(result.repo.version_file).toBe("package.json");
     expect(result.state.intended_tag).toBe("v0.2.0");
     expect(result.summary.status).toBe("candidate");
+    // The candidate verdict now rests on a registry artifact whose gitHead is a
+    // commit in this repo, not on the version strings alone.
+    expect(result.state.registry.divergence.classification).toBe("DIVERGED");
+    expect(result.state.registry.artifact.git_head_reachability).toBe("reachable");
+    expect(result.publish_action.allowed).toBe(true);
+  });
+
+  /**
+   * Regression fixture: the live 2026-07-24 false positive.
+   *
+   * A fleet audit recorded "main=0.2.0 vs npm=0.1.0 DIVERGED" for hasna/cli and
+   * queued a publish. Review cancelled it. Publishing would have shipped
+   * UNLICENSED proprietary code to a public registry, overwritten a live
+   * deprecation redirect pointing users at @hasna/agency, violated the repo's
+   * own publishConfig, and bypassed the approval-gated release workflow.
+   *
+   * npmjs @hasna/cli@0.1.0's gitHead 207800eaf5bc582999b227a2ef7393b5e0991a4e
+   * is not a commit in hasna/cli at all — a different package sharing the name.
+   */
+  describe("hasna/cli registry divergence regression", () => {
+    const NPMJS_CLI_GIT_HEAD = "207800eaf5bc582999b227a2ef7393b5e0991a4e";
+
+    const hasnaCliRunner = (overrides: Partial<Parameters<typeof releaseRunner>[0]> = {}) => releaseRunner({
+      headSha: "abcdef1234567890abcdef1234567890abcdef12",
+      headCommittedAt: "2026-06-26T00:00:00Z",
+      latestReachableTag: "v0.1.0",
+      commitsSinceTag: "4",
+      latestGithubRelease: "v0.1.0",
+      latestNpmVersion: "0.1.0",
+      openPrCount: 0,
+      latestReleaseAncestor: true,
+      intendedTagExists: false,
+      ciRuns: [{ status: "completed", conclusion: "success", workflowName: "ci" }],
+      npmGitHead: NPMJS_CLI_GIT_HEAD,
+      npmGitHeadReachable: false,
+      ...overrides,
+    });
+
+    test("classifies the unreachable gitHead as UNRELATED-NAME, not DIVERGED", () => {
+      // publishConfig omitted on purpose: with the registry and licence checks
+      // out of the way, gitHead reachability is the only thing between this
+      // input and a "0.2.0 vs 0.1.0 DIVERGED" publish recommendation.
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", { license: "Apache-2.0" });
+
+      const result = buildReleaseCandidates({ repo: repoPath, githubRepo: "hasna/cli", fetch: false, runner: hasnaCliRunner() });
+
+      expect(result.state.registry.artifact.git_head).toBe(NPMJS_CLI_GIT_HEAD);
+      expect(result.state.registry.artifact.git_head_reachability).toBe("absent");
+      expect(result.state.registry.divergence.classification).toBe("UNRELATED-NAME");
+      expect(result.state.registry.divergence.divergent).toBe(false);
+      expect(result.gates.map((gate) => gate.id)).toContain("registry-unrelated-name");
+      expect(result.summary.status).toBe("blocked");
+      expect(result.publish_action.allowed).toBe(false);
+      // No seed may propose the release. Checked by title rather than by count,
+      // because a blocker seed is legitimate here and a publish seed is not.
+      expect(result.task_suggestions.filter((seed) => seed.title.startsWith("Prepare release"))).toEqual([]);
+    });
+
+    test("compares against publishConfig.registry and never fetches npmjs for it", () => {
+      const registryUrls: string[] = [];
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", {
+        license: "Apache-2.0",
+        publishConfig: { registry: "https://npm.pkg.github.com", tag: "internal" },
+      });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/cli",
+        fetch: false,
+        runner: hasnaCliRunner({ registryUrls }),
+      });
+
+      expect(result.state.registry.target.registry_url).toBe("https://npm.pkg.github.com");
+      expect(result.state.registry.target.registry_source).toBe("publishConfig.registry");
+      expect(result.state.registry.target.is_npmjs).toBe(false);
+      // Nothing was fetched at all: an npmjs document under this name describes
+      // a different package.
+      expect(registryUrls).toEqual([]);
+      expect(result.state.latest_npm_version).toBeNull();
+    });
+
+    test("positive control: the same capture records the npmjs URL when npmjs IS the target", () => {
+      // Without this, the empty-array assertion above would also pass if the
+      // stub simply never recorded anything.
+      const registryUrls: string[] = [];
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", { license: "Apache-2.0" });
+
+      buildReleaseCandidates({ repo: repoPath, githubRepo: "hasna/cli", fetch: false, runner: hasnaCliRunner({ registryUrls }) });
+
+      expect(registryUrls).toEqual(["https://registry.npmjs.org/@hasna%2Fcli"]);
+    });
+
+    test("classifies a non-npmjs registry out of npmjs scope and emits no task seed", () => {
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", {
+        license: "Apache-2.0",
+        publishConfig: { registry: "https://npm.pkg.github.com", access: "restricted", tag: "internal" },
+      });
+
+      const result = buildReleaseCandidates({ repo: repoPath, githubRepo: "hasna/cli", fetch: false, runner: hasnaCliRunner() });
+
+      expect(result.state.registry.target.scope).toBe("non-npmjs-registry");
+      expect(result.state.registry.divergence.classification).toBe("OUT-OF-NPMJS-SCOPE");
+      expect(result.gates.map((gate) => gate.id)).toContain("registry-out-of-npmjs-scope");
+      // `summary.status` reports the strongest reason the audit will not act, and
+      // a private registry is a publish refusal as well as an out-of-scope
+      // registry, so "refused" outranks "out-of-scope" here. The scope finding is
+      // not lost — it is on `divergence.classification` and in the gate above.
+      expect(result.summary.status).toBe("refused");
+      // Classified, not dropped: the reason travels with the report.
+      expect(result.publish_action.refusals.join(" ")).toContain("npm.pkg.github.com");
+      expect(result.task_suggestions).toEqual([]);
+      expect(result.summary.task_seeds).toBe(0);
+    });
+
+    test("classifies access=restricted on npmjs out of scope rather than measuring it anonymously", () => {
+      const registryUrls: string[] = [];
+      const repoPath = writePackageJsonVersion("@hasnaxyz/internal-thing", "0.2.0", {
+        license: "Apache-2.0",
+        publishConfig: { access: "restricted" },
+      });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasnaxyz/internal-thing",
+        fetch: false,
+        runner: hasnaCliRunner({ registryUrls }),
+      });
+
+      expect(result.state.registry.target.scope).toBe("npmjs-restricted");
+      expect(result.summary.status).toBe("out-of-scope");
+      expect(registryUrls).toEqual([]);
+      expect(result.task_suggestions).toEqual([]);
+    });
+
+    test("refuses a publish for an UNLICENSED package even on a genuine divergence", () => {
+      // Reachable gitHead and a real version gap: every other signal says
+      // "release this". The licence must still refuse it.
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", { license: "UNLICENSED" });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/cli",
+        fetch: false,
+        runner: hasnaCliRunner({ npmGitHeadReachable: true }),
+      });
+
+      expect(result.state.registry.divergence.classification).toBe("DIVERGED");
+      expect(result.state.registry.divergence.divergent).toBe(true);
+      expect(result.summary.status).toBe("refused");
+      expect(result.publish_action.allowed).toBe(false);
+      expect(result.publish_action.refusals.join(" ")).toContain("UNLICENSED");
+      expect(result.task_suggestions).toEqual([]);
+    });
+
+    test("the full fixture manifest is refused, with both refusals stated", () => {
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", {
+        license: "UNLICENSED",
+        publishConfig: { registry: "https://npm.pkg.github.com", access: "restricted", tag: "internal" },
+      });
+
+      const result = buildReleaseCandidates({ repo: repoPath, githubRepo: "hasna/cli", fetch: false, runner: hasnaCliRunner() });
+
+      expect(result.summary.status).toBe("refused");
+      expect(result.publish_action.allowed).toBe(false);
+      const refusals = result.publish_action.refusals.join(" | ");
+      expect(refusals).toContain("UNLICENSED");
+      expect(refusals).toContain("npm.pkg.github.com");
+      expect(result.task_suggestions).toEqual([]);
+      expect(result.summary.candidates).toBe(0);
+    });
+
+    test("buildProtectedRelease emits nothing for the fixture", () => {
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", {
+        license: "UNLICENSED",
+        publishConfig: { registry: "https://npm.pkg.github.com", access: "restricted", tag: "internal" },
+      });
+
+      const result = buildProtectedRelease({ repo: repoPath, githubRepo: "hasna/cli", fetch: false, runner: hasnaCliRunner() });
+
+      expect(result.summary.status).toBe("noop");
+      expect(result.summary.task_seeds).toBe(0);
+      expect(result.task_suggestions).toEqual([]);
+      expect(result.release.publish_action.allowed).toBe(false);
+    });
+
+    test("an artifact published without a gitHead is PROVENANCE-UNVERIFIED, not DIVERGED", () => {
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", { license: "Apache-2.0" });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/cli",
+        fetch: false,
+        runner: hasnaCliRunner({ npmGitHead: null }),
+      });
+
+      expect(result.state.registry.artifact.git_head).toBeNull();
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-UNVERIFIED");
+      expect(result.gates.map((gate) => gate.id)).toContain("registry-provenance-unverified");
+      expect(result.summary.status).toBe("blocked");
+      expect(result.task_suggestions.filter((seed) => seed.title.startsWith("Prepare release"))).toEqual([]);
+    });
+
+    /**
+     * Regression guard for the opposite failure: refusing to audit the fleet.
+     *
+     * Most published artifacts carry no `gitHead` at all — measured 2026-07-27
+     * (UTC) against live npmjs, 15 of the 36 readable `DEFAULT_PACKAGE_CHECKS`
+     * packages, including `@hasna/repos@0.1.36` itself. Treating that as a
+     * possible name collision blocked the release audit for all of them and filed
+     * a fresh "Resolve release blockers" seed per commit, because `latest` will
+     * never retroactively gain a `gitHead`.
+     *
+     * The artifact's own `repository` is the available corroboration, and npmjs
+     * `@hasna/repos@0.1.36` does declare `git+https://github.com/hasna/repos.git`
+     * while the incident artifact `@hasna/cli@0.1.0` declares nothing.
+     */
+    test("an artifact with no gitHead but a matching repository is still a candidate", () => {
+      const repoPath = writePackageJsonVersion("@hasna/repos", "0.1.37", {
+        license: "Apache-2.0",
+        repository: { type: "git", url: "git+https://github.com/hasna/repos.git" },
+      });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/repos",
+        fetch: false,
+        runner: hasnaCliRunner({
+          latestNpmVersion: "0.1.36",
+          latestReachableTag: "v0.1.36",
+          latestGithubRelease: "v0.1.36",
+          npmGitHead: null,
+          npmRepository: "git+https://github.com/hasna/repos.git",
+        }),
+      });
+
+      expect(result.state.registry.artifact.git_head).toBeNull();
+      expect(result.state.registry.artifact.repository).toBe("github.com/hasna/repos");
+      expect(result.state.registry.artifact.repository_attribution).toBe("match");
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-REPOSITORY-ONLY");
+      // Warn, not block: the audit proceeds, and says on what grade of evidence.
+      const gate = result.gates.find((entry) => entry.id === "registry-provenance-repository-only");
+      expect(gate?.status).toBe("warn");
+      expect(result.gates.filter((entry) => entry.status === "block")).toEqual([]);
+      expect(result.summary.status).toBe("candidate");
+      expect(result.publish_action.allowed).toBe(true);
+      expect(result.task_suggestions.map((seed) => seed.title)).toEqual(["Prepare release hasna/repos v0.1.37"]);
+    });
+
+    test("no gitHead and no repository stays blocked", () => {
+      // The tightening is not undone: with neither provenance axis, the audit
+      // still refuses. This is the npmjs @hasna/cli@0.1.0 shape.
+      const repoPath = writePackageJsonVersion("@hasna/repos", "0.1.37", { license: "Apache-2.0" });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/repos",
+        fetch: false,
+        runner: hasnaCliRunner({ npmGitHead: null, npmRepository: null }),
+      });
+
+      expect(result.state.registry.artifact.repository_attribution).toBe("absent");
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-UNVERIFIED");
+      expect(result.gates.map((gate) => gate.id)).toContain("registry-provenance-unverified");
+      expect(result.summary.status).toBe("blocked");
+      expect(result.task_suggestions.filter((seed) => seed.title.startsWith("Prepare release"))).toEqual([]);
+    });
+
+    test("no gitHead and a repository pointing at a different repo stays blocked", () => {
+      const repoPath = writePackageJsonVersion("@hasna/repos", "0.1.37", {
+        license: "Apache-2.0",
+        repository: { type: "git", url: "https://github.com/hasna/repos" },
+      });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/repos",
+        fetch: false,
+        runner: hasnaCliRunner({ npmGitHead: null, npmRepository: "https://github.com/someone-else/repos" }),
+      });
+
+      expect(result.state.registry.artifact.repository_attribution).toBe("mismatch");
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-UNVERIFIED");
+      expect(result.summary.status).toBe("blocked");
+    });
+
+    test("a shallow clone cannot establish absence, so it is unverified rather than unrelated", () => {
+      const repoPath = writePackageJsonVersion("@hasna/cli", "0.2.0", { license: "Apache-2.0" });
+
+      const result = buildReleaseCandidates({
+        repo: repoPath,
+        githubRepo: "hasna/cli",
+        fetch: false,
+        runner: hasnaCliRunner({ isShallow: true }),
+      });
+
+      expect(result.state.registry.artifact.git_head_reachability).toBe("unknown");
+      expect(result.state.registry.divergence.classification).toBe("PROVENANCE-UNVERIFIED");
+      expect(result.state.registry.divergence.classification).not.toBe("UNRELATED-NAME");
+    });
   });
 
   test("detects docs and agent-rule drift after source changes", () => {
@@ -685,16 +984,51 @@ describe("ops producers", () => {
     execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo, stdio: "pipe" });
     execFileSync("git", ["config", "user.name", "Test User"], { cwd: repo, stdio: "pipe" });
     execFileSync("git", ["commit", "--allow-empty", "-m", "initial"], { cwd: repo, stdio: "pipe" });
+    const repoHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" }).trim();
 
     const result = buildReleasePipelineParity({
       paths: [repo],
-      runner: () => ({ ok: true, stdout: "2.0.0", stderr: "", exitCode: 0 }),
+      // Command-aware: `npm view <pkg> version` and `npm view <pkg>@<v> gitHead`
+      // are different questions. The single-answer stub this replaced returned
+      // "2.0.0" to both, so the high-priority drift seed was raised without the
+      // artifact ever being tied to the repo.
+      runner: (command, args) => args.includes("gitHead")
+        ? { ok: true, stdout: repoHead, stderr: "", exitCode: 0 }
+        : { ok: true, stdout: "2.0.0", stderr: "", exitCode: 0 },
     });
 
     expect(result.summary.flagged).toBe(1);
     const seed = result.task_suggestions[0]!;
     expect(seed.priority).toBe("high");
     expect((seed.metadata["issue_codes"] as string[])).toContain("npm_latest_without_git_tag");
+  });
+
+  test("release pipeline parity does not raise a high priority drift seed for an unrelated npm package", () => {
+    const repo = mkdtempSync(join(tmpdir(), "open-repos-parity-collision-"));
+    tempDirs.push(repo);
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "@hasna/parity-collision", version: "1.0.0" }));
+    mkdirSync(join(repo, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(repo, ".github", "workflows", "ci.yml"), "on:\n  push:\n    branches: [main]\njobs: {}\n");
+    writeFileSync(join(repo, ".github", "workflows", "publish.yml"), "on:\n  push:\n    tags: [\"v*\"]\njobs: {}\n");
+    execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["commit", "--allow-empty", "-m", "initial"], { cwd: repo, stdio: "pipe" });
+
+    const result = buildReleasePipelineParity({
+      paths: [repo],
+      runner: (command, args) => args.includes("gitHead")
+        // hasna/cli's real npmjs gitHead: not a commit in this repo.
+        ? { ok: true, stdout: "207800eaf5bc582999b227a2ef7393b5e0991a4e", stderr: "", exitCode: 0 }
+        : { ok: true, stdout: "2.0.0", stderr: "", exitCode: 0 },
+    });
+
+    const codes = result.items[0]!.issue_codes;
+    expect(codes).toContain("registry_unrelated_name");
+    expect(codes).not.toContain("npm_latest_without_git_tag");
+    // The seed, if any, must not be the high-priority "publish bypassed the tag
+    // pipeline" task that the collision used to produce.
+    expect(result.task_suggestions.filter((seed) => seed.priority === "high")).toEqual([]);
   });
 });
 
@@ -706,13 +1040,23 @@ function writeCargoVersion(version: string): string {
   return repoPath;
 }
 
-function writePackageJsonVersion(name: string, version: string): string {
+function writePackageJsonVersion(name: string, version: string, extra: Record<string, unknown> = {}): string {
   const repoPath = mkdtempSync(join(tmpdir(), "open-repos-release-test-"));
   tempDirs.push(repoPath);
-  writeFileSync(join(repoPath, "package.json"), JSON.stringify({ name, version }, null, 2));
+  writeFileSync(join(repoPath, "package.json"), JSON.stringify({ name, version, ...extra }, null, 2));
   return repoPath;
 }
 
+/**
+ * Stub for the release producers.
+ *
+ * The registry response is a faithful packument shape — `dist-tags.latest` plus
+ * `versions[latest].gitHead` — because provenance is now part of the contract.
+ * The older stub returned only `dist-tags`, so every test that asserted
+ * "candidate" was asserting it for an artifact with no provenance at all: the
+ * exact shape of the hasna/cli input that produced the false positive. Those
+ * assertions passed while measuring nothing about lineage.
+ */
 function releaseRunner(opts: {
   headSha: string;
   headCommittedAt: string;
@@ -727,11 +1071,37 @@ function releaseRunner(opts: {
   failGithubRelease?: boolean;
   failNpm?: boolean;
   failOpenPrs?: boolean;
+  /** gitHead of the published artifact. `null` publishes without provenance. */
+  npmGitHead?: string | null;
+  /**
+   * `repository` on the published artifact. The weaker provenance axis, and the
+   * only one available for the ~40% of fleet artifacts published without a
+   * gitHead. `null` publishes with no repository at all, as npmjs @hasna/cli did.
+   */
+  npmRepository?: string | null;
+  /** Whether that gitHead is a commit in this repo. Default true. */
+  npmGitHeadReachable?: boolean;
+  isShallow?: boolean;
+  /** Registry document URLs the stub was asked for, for positive controls. */
+  registryUrls?: string[];
 }): CommandRunner {
+  const publishedGitHead = opts.npmGitHead === undefined ? "b1a9f00dcafe1234567890abcdef1234567890ab" : opts.npmGitHead;
   return (command, args) => {
     const text = `${command} ${args.join(" ")}`;
     if (command === "git" && args.includes("config") && args.includes("remote.origin.url")) {
       return { status: 0, stdout: "https://github.com/hasna/codewith.git\n", stderr: "" };
+    }
+    if (command === "git" && args.includes("rev-parse") && args.includes("--is-inside-work-tree")) {
+      return { status: 0, stdout: "true\n", stderr: "" };
+    }
+    if (command === "git" && args.includes("rev-parse") && args.includes("--is-shallow-repository")) {
+      return { status: 0, stdout: `${opts.isShallow === true}\n`, stderr: "" };
+    }
+    if (command === "git" && args.includes("cat-file")) {
+      const reachable = opts.npmGitHeadReachable !== false;
+      return reachable
+        ? { status: 0, stdout: "", stderr: "" }
+        : { status: 128, stdout: "", stderr: `fatal: Not a valid object name ${publishedGitHead}^{commit}` };
     }
     if (command === "git" && args.includes("rev-parse") && args.includes("origin/main")) {
       return { status: 0, stdout: `${opts.headSha}\n`, stderr: "" };
@@ -763,8 +1133,25 @@ function releaseRunner(opts: {
       return { status: 0, stdout: JSON.stringify(opts.ciRuns), stderr: "" };
     }
     if (command === "curl") {
-      if (opts.failNpm) return { status: 22, stdout: "", stderr: "404" };
-      return { status: 0, stdout: JSON.stringify({ "dist-tags": { latest: opts.latestNpmVersion } }), stderr: "" };
+      opts.registryUrls?.push(args[args.length - 1] ?? "");
+      // "could not resolve host" rather than a bare "404": a 404 is a
+      // *definitive* answer that the registry holds nothing, which is a
+      // different finding from an unreachable registry. This stub's intent is
+      // the unverifiable case.
+      if (opts.failNpm) return { status: 6, stdout: "", stderr: "curl: (6) Could not resolve host: registry.npmjs.org" };
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          "dist-tags": { latest: opts.latestNpmVersion },
+          versions: {
+            [opts.latestNpmVersion]: {
+              ...(publishedGitHead === null ? {} : { gitHead: publishedGitHead }),
+              ...(opts.npmRepository ? { repository: { type: "git", url: opts.npmRepository } } : {}),
+            },
+          },
+        }),
+        stderr: "",
+      };
     }
     return { status: 1, stdout: "", stderr: `unexpected command: ${text}` };
   };

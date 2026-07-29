@@ -1,13 +1,13 @@
 import { existsSync, watch } from "node:fs";
 import { createHash } from "node:crypto";
-import { hostname } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Client } from "pg";
 import { getDb, getDbPath } from "../db/database.js";
 import { applyPostgresMigrations } from "../db/pg-migrations.js";
 import type { ScanResult } from "../types/index.js";
 import { getConfig, getHookQueuePath, getWorkspaceRoots } from "./config.js";
-import { drainHookQueue, installPostCommitHooks } from "./repo-hooks.js";
+import { getSourceMachineId } from "./machine-id.js";
+import { describeDanglingCheckouts, drainHookQueue, installPostCommitHooks } from "./repo-hooks.js";
 import { discoverRepos, scanRepoPaths } from "./scanner.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
@@ -214,10 +214,6 @@ async function prepareRemoteSearchPath(remote: ReposRemoteSyncClient, schema: st
   // selection transaction-local so an injected, caller-owned connection is
   // returned with exactly the same session search_path it had on entry.
   await remote.query(`SET LOCAL search_path TO ${quoted}`);
-}
-
-function getSourceMachineId(): string {
-  return process.env["HASNA_MACHINE_ID"] || process.env["OPEN_MACHINES_ID"] || process.env["MACHINE_ID"] || hostname();
 }
 
 function redactErrorMessage(_error: unknown, _databaseUrl: string | null): string {
@@ -1103,6 +1099,8 @@ export async function ensureWorkspaceBootstrap(
 
   const repoPaths = discoverRepos(roots);
   const hooks = installPostCommitHooks(repoPaths, getHookQueuePath());
+  const danglingReport = describeDanglingCheckouts(hooks);
+  if (danglingReport) opts.onProgress?.(`[warn] ${danglingReport}`);
   opts.onProgress?.(`Bootstrapping repo index from ${roots.join(", ")}`);
   const scan = await scanRepoPaths(repoPaths, {
     full: opts.full,
@@ -1193,8 +1191,11 @@ export async function startAutoIndexWorker(
 
         knownRepos.add(repoPath);
         const hooks = installPostCommitHooks([repoPath], getHookQueuePath());
+        const dangling = describeDanglingCheckouts(hooks);
         opts.onProgress?.(
-          `[new] discovered ${basename(repoPath)} (${hooks.installed} hook installed, ${hooks.updated} updated)`,
+          dangling
+            ? `[warn] ${dangling}`
+            : `[new] discovered ${basename(repoPath)} (${hooks.installed} hook installed, ${hooks.updated} updated)`,
         );
         scheduleScan(repoPath, "workspace-watch");
       });
@@ -1217,8 +1218,11 @@ export async function startAutoIndexWorker(
       if (knownRepos.has(repoPath)) continue;
       knownRepos.add(repoPath);
       const hooks = installPostCommitHooks([repoPath], getHookQueuePath());
+      const dangling = describeDanglingCheckouts(hooks);
       opts.onProgress?.(
-        `[new] found ${basename(repoPath)} during rescan (${hooks.installed} hook installed, ${hooks.updated} updated)`,
+        dangling
+          ? `[warn] ${dangling}`
+          : `[new] found ${basename(repoPath)} during rescan (${hooks.installed} hook installed, ${hooks.updated} updated)`,
       );
       scheduleScan(repoPath, "workspace-rescan");
     }

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
@@ -17,6 +18,12 @@ export interface NoCloudInventoryOptions {
   maxDepth?: number;
   includeNpm?: boolean;
   npmPackages?: string[];
+  /**
+   * Registry-side enumeration, injectable so tests never depend on the network —
+   * an inventory test that silently loses its registry source would be testing
+   * the very regression this guards against.
+   */
+  enumerateScopedPackages?: () => ScopeEnumeration;
 }
 
 export interface NoCloudRepoFinding {
@@ -66,6 +73,17 @@ export interface NoCloudInventoryReport {
     registry_packages: number;
     registry_cloud_deps: number;
     registry_unpublished: number;
+    /** How many checked names each source contributed. null when not enumerated. */
+    registry_from_local_manifests: number;
+    registry_from_registry: number | null;
+    /**
+     * Whether the registry-side enumeration ran. `failed` means the inventory is
+     * narrower than it should be, and says so rather than looking complete.
+     */
+    registry_enumeration: ScopeEnumerationStatus;
+    registry_enumeration_detail: string | null;
+    /** Per-source outcome, so a degraded or truncated source is visible. */
+    registry_enumeration_sources: ScopeEnumerationSource[] | null;
   };
   repos: NoCloudRepoFinding[];
   npm: NoCloudNpmFinding[];
@@ -78,7 +96,6 @@ const DEFAULT_MAX_DEPTH = 8;
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_LOCKFILE_BYTES = 64 * 1024 * 1024;
 const SCHEMA_VERSION = "1.3" as const;
-const PACKAGE_SCOPE = "@hasna";
 
 const CLOUD_PACKAGE = "@hasna" + "/cloud";
 const CLOUD_PATTERNS = [
@@ -92,19 +109,81 @@ const CLOUD_PATTERNS = [
 ];
 
 /**
- * The registry inventory is DERIVED from the package.json name of each repo actually
- * scanned. It used to be a frozen literal list, which silently outlived its contents:
- * @hasna/swarm was unpublished on 2026-07-27 while still named in that list, so the
- * report kept asserting a package that no longer existed. Deriving it means a renamed,
- * retired or unpublished package drops out on its own.
+ * The registry inventory: which published packages this report checks.
+ *
+ * It was a frozen literal list of 37 names that no source of truth maintained.
+ * The list outlived its contents — `@hasna/swarm` was unpublished on 2026-07-27
+ * while still named in it, and `@hasna/deployment` is a live 404 today — so the
+ * report kept asserting packages that no longer exist.
+ *
+ * Deriving the list from the `package.json` of each scanned repo fixes the
+ * staleness and introduces a worse failure in its place: **derivation can only
+ * see packages that have a local manifest.** `iapp-wallets` has none, so
+ * `@hasna/wallets@0.1.10` — which actively declares the retired
+ * `"@hasna/cloud": "^0.1.24"` — silently stops being checked. Fifteen published
+ * packages drop out of coverage that way. Swapping a stale narrow source for a
+ * different narrow source is not a fix; both fail the same way, silently and
+ * downward.
+ *
+ * So the two sources are UNIONED, and the report says what each contributed:
+ *
+ *   1. **local manifests** under the scan roots — authoritative for what this
+ *      machine has checked out, and immediately correct for renames;
+ *   2. **the registry itself** (`npm search` over the scope) — authoritative for
+ *      what is actually published, including packages with no local checkout.
+ *
+ * Neither is authoritative alone, which is exactly why neither may replace the
+ * other. Coverage now only shrinks when a package is genuinely gone from both.
+ *
+ * `@hasna/cloud` is added unconditionally and can never be removed by either
+ * source. It is the subject of the whole report, and it is *not* discoverable
+ * from the registry enumeration: `npm search` omits deprecated packages, and
+ * `@hasna/cloud@0.1.41` is deprecated — the precise fact the report exists to
+ * surface. A source that cannot see the thing being audited must not be able to
+ * drop it.
  */
-export function deriveNpmPackageChecks(repoRoots: string[]): string[] {
-  const names = new Set<string>([CLOUD_PACKAGE]);
+export const PACKAGE_SCOPE = "@hasna" as const;
+
+export type ScopeEnumerationStatus = "ok" | "failed" | "skipped";
+
+/**
+ * `truncated` exists because a result set sitting exactly on the registry's
+ * result ceiling is indistinguishable from a complete one, and calling that `ok`
+ * is the silent narrowing this module exists to prevent.
+ */
+export type ScopeSourceStatus = "ok" | "failed" | "truncated";
+
+export interface ScopeEnumerationSource {
+  source: string;
+  status: ScopeSourceStatus;
+  names: number;
+  detail: string | null;
+}
+
+export interface ScopeEnumeration {
+  status: ScopeEnumerationStatus;
+  names: string[];
+  detail: string | null;
+  /** Per-source outcome, so a degraded source is visible even when the union is ok. */
+  sources?: ScopeEnumerationSource[];
+}
+
+export interface NpmPackageInventory {
+  packages: string[];
+  from_local_manifests: number;
+  from_registry: number | null;
+  registry_enumeration: ScopeEnumerationStatus;
+  registry_enumeration_detail: string | null;
+  registry_enumeration_sources: ScopeEnumerationSource[] | null;
+}
+
+/** Package names declared by the manifests of the repos actually scanned. */
+export function deriveLocalPackageNames(repoRoots: string[]): string[] {
+  const names = new Set<string>();
   for (const repoRoot of repoRoots) {
     const name = localPackageName(repoRoot);
     if (name && name.startsWith(`${PACKAGE_SCOPE}/`)) names.add(name);
   }
-  names.delete(CLOUD_PACKAGE);
   return [...names].sort();
 }
 
@@ -122,9 +201,203 @@ function localPackageName(repoRoot: string): string | null {
 }
 
 /**
- * An absent package and an unusable npm client both make `npm view` exit non-zero.
- * Collapsing them into one status is what let a retired package read as a transient
- * failure, so a 404 is reported as `unpublished` and everything else stays a failure.
+ * The registry search API caps a result set at 250 however large `--searchlimit`
+ * is: `npm search --json --searchlimit=1000 react` returns exactly 250. So the
+ * ceiling is a property of the registry, not of this parameter, and a saturated
+ * result cannot be raised out of truncation by asking for more.
+ */
+const SEARCH_RESULT_CEILING = 250;
+
+function scopedNamesFrom(values: unknown[]): string[] {
+  const names = new Set<string>();
+  for (const entry of values) {
+    const name = typeof entry === "string" ? entry : (entry as { name?: unknown })?.name;
+    if (typeof name === "string" && name.startsWith(`${PACKAGE_SCOPE}/`)) names.add(name);
+  }
+  return [...names].sort();
+}
+
+/**
+ * Decide whether a search result is complete or merely as much as the registry
+ * would return.
+ *
+ * `rawResultCount` is the unfiltered result count, not the scoped subset: the
+ * ceiling applies to what the search returned, and `npm search @hasna` is a fuzzy
+ * text search whose results include unrelated packages that consume slots.
+ */
+export function classifyScopeSearchResult(
+  scopedNames: string[],
+  rawResultCount: number,
+  searchLimit: number,
+): ScopeEnumeration {
+  if (rawResultCount >= searchLimit) {
+    return {
+      status: "ok",
+      names: scopedNames,
+      detail: `npm search returned ${rawResultCount} result(s), the maximum for --searchlimit=${searchLimit}`
+        + ` (the registry search API caps a result set at ${SEARCH_RESULT_CEILING} regardless), so this`
+        + " enumeration is truncated and coverage may be narrower than the scope",
+      sources: [{ source: "search", status: "truncated", names: scopedNames.length, detail: null }],
+    };
+  }
+  return { status: "ok", names: scopedNames, detail: null };
+}
+
+/**
+ * Source 1 — `npm search` over the scope.
+ *
+ * Correct for what is indexed, and that is strictly less than what is published:
+ * it omits deprecated packages, and measured on 2026-07-28 it also omitted live
+ * non-deprecated ones (`@hasna/assistants-sdk@0.1.7`, `@hasna/configs-sdk@0.1.3`).
+ * A search index is not an enumeration, so it cannot be the only registry source.
+ */
+export function enumerateScopeSearch(searchLimit = SEARCH_RESULT_CEILING): ScopeEnumeration {
+  try {
+    const raw = execFileSync("npm", ["search", "--json", `--searchlimit=${searchLimit}`, PACKAGE_SCOPE], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 60_000,
+      maxBuffer: 8 * 1024 * 1024,
+    }).trim();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return { status: "failed", names: [], detail: "npm search did not return a JSON array" };
+    }
+    const classified = classifyScopeSearchResult(scopedNamesFrom(parsed), parsed.length, searchLimit);
+    return classified;
+  } catch (error) {
+    return { status: "failed", names: [], detail: redactText(describeExecFailure(error)) };
+  }
+}
+
+/**
+ * Source 2 — the scope roster.
+ *
+ * This is the source that sees what search cannot. Measured on 2026-07-28 the
+ * roster returned 170 names against search's 160, `search \\ roster` was empty —
+ * so the roster is a strict superset — and the ten it adds include
+ * `@hasna/coders@0.2.14`, which was in the hardcoded list this module replaced and
+ * otherwise dropped out of coverage entirely, plus two packages that declare the
+ * retired `@hasna/cloud` today (`@hasna/cli@0.1.0` at `^0.1.5`,
+ * `@hasna/open-projects@0.1.1` at `^0.1.28`).
+ *
+ * It needs no credential. `npm access list packages` fails E401 when it sends a
+ * token that lacks org read — the failure is caused by *offering* the credential,
+ * not by lacking one — while `GET /-/org/<scope>/package` answers 200
+ * unauthenticated. So an authenticated attempt is retried with the user config
+ * suppressed, which drops the token. Only the user-level config is dropped:
+ * project and global `.npmrc` still apply, so a custom registry configured there
+ * is still honoured.
+ */
+export function enumerateScopeRoster(scope = PACKAGE_SCOPE): ScopeEnumeration {
+  const attempt = (extraArgs: string[]): { names: string[] } => {
+    const raw = execFileSync("npm", ["access", "list", "packages", scope, "--json", ...extraArgs], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 60_000,
+      maxBuffer: 8 * 1024 * 1024,
+    }).trim();
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) return { names: scopedNamesFrom(parsed) };
+    if (parsed && typeof parsed === "object") return { names: scopedNamesFrom(Object.keys(parsed)) };
+    throw new Error("npm access list packages did not return a JSON object or array");
+  };
+
+  let firstFailure = "";
+  try {
+    return { status: "ok", names: attempt([]).names, detail: null };
+  } catch (error) {
+    firstFailure = redactText(describeExecFailure(error));
+  }
+  try {
+    // Anonymous retry. The path is never created; npm treats a missing user
+    // config as empty, which is exactly the point.
+    return { status: "ok", names: attempt(["--userconfig", join(tmpdir(), "repos-no-cloud-anonymous-npmrc")]).names, detail: null };
+  } catch (error) {
+    return {
+      status: "failed",
+      names: [],
+      detail: `${firstFailure}\n(anonymous retry) ${redactText(describeExecFailure(error))}`.slice(0, 1000),
+    };
+  }
+}
+
+/**
+ * Combine the registry-side sources.
+ *
+ * A source failure degrades; it does not fail the enumeration. Making either
+ * source's failure fatal would make a common path fail while coverage was in fact
+ * complete — `npm search` is flaky and the roster is a semi-public endpoint — and
+ * "correct but breaks a common path" is still a regression. Only every source
+ * failing means the registry side contributed nothing, which is the case that has
+ * to be reported loudly. Names from a `truncated` source are kept: partial
+ * coverage beats none, as long as the partiality is visible.
+ */
+export function unionScopeEnumerations(
+  entries: Array<{ source: string; result: ScopeEnumeration }>,
+): ScopeEnumeration {
+  const names = new Set<string>();
+  const sources: ScopeEnumerationSource[] = [];
+  const details: string[] = [];
+
+  for (const { source, result } of entries) {
+    for (const name of result.names) names.add(name);
+    const status: ScopeSourceStatus = result.status === "failed"
+      ? "failed"
+      : result.sources?.some((inner) => inner.status === "truncated") ? "truncated" : "ok";
+    sources.push({ source, status, names: result.names.length, detail: result.detail });
+    if (result.detail) details.push(`${source}: ${result.detail}`);
+  }
+
+  const everySourceFailed = entries.length > 0 && sources.every((source) => source.status === "failed");
+  return {
+    status: everySourceFailed ? "failed" : "ok",
+    names: [...names].sort(),
+    detail: details.length > 0 ? details.join("\n") : null,
+    sources,
+  };
+}
+
+/** Both registry-side sources, unioned. */
+export function enumerateScopedPackages(searchLimit = SEARCH_RESULT_CEILING): ScopeEnumeration {
+  return unionScopeEnumerations([
+    { source: "roster", result: enumerateScopeRoster() },
+    { source: "search", result: enumerateScopeSearch(searchLimit) },
+  ]);
+}
+
+function describeExecFailure(error: unknown): string {
+  const failure = error as { stderr?: unknown; stdout?: unknown; message?: unknown };
+  return [failure.stderr, failure.stdout, failure.message]
+    .map((part) => (typeof part === "string" ? part : Buffer.isBuffer(part) ? part.toString("utf-8") : ""))
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 500) || "npm search failed with no diagnostic output";
+}
+
+/** Union the two sources, with `@hasna/cloud` pinned in unconditionally. */
+export function resolveNpmPackageChecks(
+  repoRoots: string[],
+  opts: { enumerate?: () => ScopeEnumeration } = {},
+): NpmPackageInventory {
+  const local = deriveLocalPackageNames(repoRoots);
+  const enumeration = (opts.enumerate ?? (() => enumerateScopedPackages()))();
+  const packages = new Set<string>([CLOUD_PACKAGE, ...local, ...enumeration.names]);
+  return {
+    packages: [...packages].sort(),
+    from_local_manifests: local.length,
+    from_registry: enumeration.status === "ok" ? enumeration.names.length : null,
+    registry_enumeration: enumeration.status,
+    registry_enumeration_detail: enumeration.detail,
+    registry_enumeration_sources: enumeration.sources ?? null,
+  };
+}
+
+/**
+ * An absent package and an unusable npm client both make `npm view` exit
+ * non-zero. Collapsing them into one status is what let a retired package read as
+ * a transient blip, so a registry 404 is reported as `unpublished` and everything
+ * else stays a failure.
  */
 export function classifyNpmViewFailure(detail: string): "unpublished" | "npm-view-failed" {
   if (/\bE404\b/.test(detail) || /\b404 Not Found\b/i.test(detail)) return "unpublished";
@@ -262,10 +535,42 @@ function collectGitRoots(root: string, maxDepth: number): { roots: string[]; exc
   return { roots: [...roots].sort(), excluded: [...excluded].sort() };
 }
 
+/**
+ * Is this directory the top of a real git working tree?
+ *
+ * `existsSync(dir + "/.git")` is not that question, and answering the wrong one
+ * here is the defect. Any directory holding a `.git` entry — an empty `.git`
+ * directory, a gutted skeleton, a stray file — was accepted as an enclosing
+ * repository, so every checkout below it was reported `nested-git-checkout`,
+ * `routeable: false`, with `canonical_path` decided from a repo that does not
+ * exist.
+ *
+ * That is production behaviour, not a test artifact. It is also why this module's
+ * own suite was environment-dependent: a bare `/tmp/.git` on the host — not a
+ * valid repository — became the "parent" of every fixture created under `TMPDIR`,
+ * which is how 7 tests failed on an untouched `main` and were mistaken for a
+ * broken baseline. Asking git resolves both at once.
+ *
+ * Deliberately *not* bounded at the scan root. A checkout nested inside another
+ * real checkout is an unsafe remediation target whether or not the scan happened
+ * to start below the parent, and this module's own contract says so: scanning a
+ * nested checkout directly must still report it as nested, so a nested repo
+ * cannot be laundered into a routeable one by pointing the scan at it.
+ */
+function isGitWorkTreeTop(dir: string): boolean {
+  if (!existsSync(join(dir, ".git"))) return false;
+  // Same question the scanner asks before trusting a remote: `git -C` searches
+  // upwards, so only an answer naming this exact directory proves the repository
+  // is here rather than somewhere above it.
+  const toplevel = runGit(dir, ["rev-parse", "--show-toplevel"]);
+  if (!toplevel) return false;
+  return resolve(toplevel).replaceAll("\\", "/") === resolve(dir).replaceAll("\\", "/");
+}
+
 function nearestAncestorGitRoot(root: string): string | null {
-  let current = dirname(root);
+  let current = dirname(resolve(root));
   while (current !== dirname(current)) {
-    if (existsSync(join(current, ".git"))) return current;
+    if (isGitWorkTreeTop(current)) return current;
     current = dirname(current);
   }
   return null;
@@ -536,11 +841,7 @@ function npmFinding(pkg: string): NoCloudNpmFinding {
       status: dep ? "published-cloud-dep" : "published",
     };
   } catch (error) {
-    const failure = error as { stderr?: unknown; stdout?: unknown; message?: unknown };
-    const detail = [failure.stderr, failure.stdout, failure.message]
-      .map((part) => (typeof part === "string" ? part : Buffer.isBuffer(part) ? part.toString("utf-8") : ""))
-      .join("\n");
-    return { package: pkg, version: null, cloud_dep: null, status: classifyNpmViewFailure(detail) };
+    return { package: pkg, version: null, cloud_dep: null, status: classifyNpmViewFailure(describeExecFailure(error)) };
   }
 }
 
@@ -558,10 +859,15 @@ export function getNoCloudInventory(options: NoCloudInventoryOptions = {}): NoCl
       if (a.files !== b.files) return b.files - a.files;
       return a.path.localeCompare(b.path);
     });
-  const npmPackages = options.includeNpm
-    ? (options.npmPackages?.length ? options.npmPackages : deriveNpmPackageChecks(roots))
-    : [];
-  const npm = npmPackages.map(npmFinding);
+  // An explicit --npm-package list is the caller naming exactly what to check, so
+  // it is used verbatim; otherwise both sources are unioned.
+  const explicit = options.includeNpm ? options.npmPackages?.filter(Boolean) ?? [] : [];
+  const inventory: NpmPackageInventory = !options.includeNpm
+    ? { packages: [], from_local_manifests: 0, from_registry: null, registry_enumeration: "skipped", registry_enumeration_detail: null, registry_enumeration_sources: null }
+    : explicit.length > 0
+      ? { packages: [...explicit], from_local_manifests: 0, from_registry: null, registry_enumeration: "skipped", registry_enumeration_detail: null, registry_enumeration_sources: null }
+      : resolveNpmPackageChecks(roots, { enumerate: options.enumerateScopedPackages });
+  const npm = inventory.packages.map(npmFinding);
   const truncated = repoFindings.length > limit || npm.length > limit;
   const repos = repoFindings.slice(0, limit);
   const npmLimited = npm.slice(0, limit);
@@ -582,6 +888,11 @@ export function getNoCloudInventory(options: NoCloudInventoryOptions = {}): NoCl
       registry_packages: npm.length,
       registry_cloud_deps: npm.filter((entry) => entry.status === "published-cloud-dep").length,
       registry_unpublished: npm.filter((entry) => entry.status === "unpublished").length,
+      registry_from_local_manifests: inventory.from_local_manifests,
+      registry_from_registry: inventory.from_registry,
+      registry_enumeration: inventory.registry_enumeration,
+      registry_enumeration_detail: inventory.registry_enumeration_detail,
+      registry_enumeration_sources: inventory.registry_enumeration_sources,
     },
     repos,
     npm: npmLimited,

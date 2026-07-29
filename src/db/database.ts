@@ -788,7 +788,137 @@ const MIGRATIONS: Migration[] = [
     version: 12,
     run: (db) => upgradePullRequestGateColumns(db),
   },
+  {
+    // Receipts for `repos registry prune`. A deletion primitive on the registry
+    // has to answer "who removed row 526, when, and against which plan" after
+    // the row is gone, so the removed rows are stored verbatim. repo_id is a
+    // plain INTEGER, not a foreign key: the row it refers to no longer exists,
+    // which is the whole point of the receipt.
+    version: 13,
+    sql: `
+      CREATE TABLE IF NOT EXISTS registry_prune_audit (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        plan_hash TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        row_count INTEGER NOT NULL,
+        rows_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_registry_prune_audit_created
+        ON registry_prune_audit(created_at);
+    `,
+  },
+  {
+    // Worktree leases: who claimed which worktree, off which base, for which
+    // task, on which machine.
+    //
+    // This table is not new. It exists on the live registry on this station,
+    // holding three rows dated 2026-07-09/10, and `primary-relocation` and
+    // `registry-prune` have both known about it for months — but no migration
+    // ever created it and no shipped build ever inserted into it. It arrived
+    // from a build that is not in this tree, which means a fresh install has
+    // never had the table at all while an old station silently does. Two
+    // divergent schemas for the same name is the exact shape that makes a
+    // later migration unsafe to write.
+    //
+    // So this states the schema in the tree, matching the live one column for
+    // column, and adds nothing to it. `IF NOT EXISTS` keeps the existing rows
+    // and their history; the column check below turns a *different* pre-existing
+    // shape into a loud failure rather than an INSERT that fails at runtime on
+    // one station and works on another.
+    version: 14,
+    run: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS worktree_leases (
+          lease_id TEXT PRIMARY KEY,
+          repo_id TEXT NOT NULL,
+          repo_path TEXT NOT NULL,
+          repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+          machine_id TEXT NOT NULL,
+          worktree_path TEXT NOT NULL UNIQUE,
+          branch TEXT NOT NULL,
+          base_ref TEXT NOT NULL,
+          base_sha TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          owner_metadata TEXT NOT NULL DEFAULT '{}',
+          cleanup_policy TEXT NOT NULL,
+          status TEXT NOT NULL,
+          git_common_dir TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          claimed_at TEXT NOT NULL,
+          verified_at TEXT,
+          released_at TEXT,
+          last_error TEXT,
+          UNIQUE(repo_id, machine_id, task_id, run_id, base_ref)
+        );
+      `);
+
+      // The shape check runs BEFORE the indexes, and that ordering is the whole
+      // point of splitting the statements.
+      //
+      // Adversarial review found the first version of this migration unusable on
+      // exactly the station it was written to protect: with the indexes in the
+      // same `exec` block, `CREATE INDEX … ON worktree_leases(repo_id)` reached a
+      // pre-existing table that has no `repo_id` and SQLite raised "no such
+      // column: repo_id" first. The diagnostic below never ran — it was dead
+      // code for its only input — and because the migration marker is written
+      // after `run()`, every subsequent `getDb()` failed the same way. One
+      // divergent table bricked every `repos` verb on that station with no
+      // in-CLI recovery.
+      const present = columnNames(db, "worktree_leases");
+      const missing = WORKTREE_LEASE_COLUMNS.filter((column) => !present.has(column));
+      if (missing.length > 0) {
+        throw new Error(
+          `worktree_leases exists with an unexpected schema; missing columns: ${missing.join(", ")}. `
+          + "Back up ~/.hasna/repos/repos.db, then rename or drop the table so this migration can create it.",
+        );
+      }
+
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_worktree_leases_repo ON worktree_leases(repo_id);
+        CREATE INDEX IF NOT EXISTS idx_worktree_leases_task ON worktree_leases(task_id);
+        CREATE INDEX IF NOT EXISTS idx_worktree_leases_status ON worktree_leases(status);
+        CREATE INDEX IF NOT EXISTS idx_worktree_leases_machine ON worktree_leases(machine_id);
+      `);
+    },
+  },
 ];
+
+/**
+ * Every column the lease writers depend on. Compared against the live table so
+ * a station carrying the out-of-tree variant fails at migration time — where
+ * the operator can see it — rather than at the first INSERT.
+ */
+const WORKTREE_LEASE_COLUMNS = [
+  "lease_id",
+  "repo_id",
+  "repo_path",
+  "repo_catalog_id",
+  "machine_id",
+  "worktree_path",
+  "branch",
+  "base_ref",
+  "base_sha",
+  "task_id",
+  "run_id",
+  "mode",
+  "owner_metadata",
+  "cleanup_policy",
+  "status",
+  "git_common_dir",
+  "created_at",
+  "updated_at",
+  "claimed_at",
+  "verified_at",
+  "released_at",
+  "last_error",
+] as const;
 
 function tableExists(db: Database, name: string): boolean {
   return db.query("SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?").get(name) !== null;

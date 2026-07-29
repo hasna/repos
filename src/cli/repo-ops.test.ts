@@ -134,6 +134,9 @@ describe("repo ops CLI commands", () => {
       summary: {
         repos: 0,
         routeable: 0,
+        // Without --include-npm nothing is enumerated, and the report says so
+        // rather than reporting a zero that could mean either.
+        registry_enumeration: "skipped",
       },
     });
   });

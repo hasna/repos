@@ -6,6 +6,20 @@ import { getRepo, listPullRequestsWithRepo } from "../db/repos.js";
 import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
 import { getReleasePipelineParity, type OpsCommandRunner } from "./repo-ops.js";
 import type { PullRequest } from "../types/index.js";
+import {
+  attributeRepository,
+  normalizeRepositoryIdentity,
+  classifyRegistryDivergence,
+  describePublishRefusal,
+  detectPackageNameAuthority,
+  gitHeadProbeArgs,
+  probeGitHeadReachability,
+  resolveRegistryTarget,
+  type PublishManifest,
+  type RegistryArtifactState,
+  type RegistryDivergence,
+  type RegistryTarget,
+} from "./registry-target.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 export interface TaskSeed {
@@ -376,14 +390,41 @@ export interface ReleaseCandidateResult {
       npm_package: ExternalCheck<string>;
       open_prs: ExternalCheck<number>;
     };
+    /**
+     * Which registry was consulted, what it holds, and whether that artifact
+     * belongs to this repo's history. `latest_npm_version` above is kept for
+     * consumers, but on its own it is the field that produced the hasna/cli
+     * false positive — read `registry.divergence.classification` instead.
+     */
+    registry: {
+      target: RegistryTarget;
+      artifact: RegistryArtifactState;
+      divergence: RegistryDivergence;
+    };
   };
   gates: Array<{
     id: string;
     status: "pass" | "block" | "warn";
     message: string;
   }>;
+  /**
+   * The single fail-closed answer to "may this audit propose a publish?".
+   * Empty `refusals` is the only thing that authorizes a release task seed.
+   */
+  publish_action: {
+    allowed: boolean;
+    refusals: string[];
+  };
   summary: {
-    status: "noop" | "candidate" | "blocked";
+    /**
+     * The strongest reason the producer will not act, in decreasing severity:
+     * `refused` (manifest policy forbids publishing this package at all),
+     * `out-of-scope` (this audit cannot measure the package's registry),
+     * `blocked`, `candidate`, `noop`. A non-npmjs registry is both a refusal and
+     * out of scope and therefore reports `refused`; the scope finding is still
+     * on `state.registry.divergence.classification`.
+     */
+    status: "noop" | "candidate" | "blocked" | "out-of-scope" | "refused";
     candidates: number;
     blockers: number;
     task_seeds: number;
@@ -581,6 +622,7 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
   const runner = options.runner ?? spawnCommand;
   const timeoutMs = normalizePositiveInteger(options.timeoutMs, 20_000);
   const branch = options.branch ?? "main";
+  const manifest = readPublishManifest(repoPath);
   const packageName = options.packageName ?? inferPackageName(repoPath) ?? "unknown";
   const tagPrefix = options.tagPrefix ?? "v";
   const versionFile = options.versionFile ?? inferVersionFile(repoPath) ?? "package.json";
@@ -605,7 +647,34 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
   const intendedVersion = readVersion(repoPath, versionFile);
   const intendedTag = intendedVersion ? `${tagPrefix}${intendedVersion}` : null;
   const githubReleaseCheck = latestGithubReleaseTag(githubRepo, tagPrefix, runner, timeoutMs);
-  const npmPackageCheck = latestNpmPackageVersion(packageName, runner, timeoutMs);
+
+  // The registry to compare against comes from the manifest, never from a
+  // hardcoded npmjs URL. `options.packageName` still wins for callers that
+  // override it (Cargo repos publishing under a different npm name), but the
+  // registry, access, licence and provenance all come from package.json.
+  const registryTarget = resolveRegistryTarget(
+    manifest ? { ...manifest, name: packageName === "unknown" ? manifest.name : packageName } : { name: packageName === "unknown" ? null : packageName },
+  );
+  const registryRead = readRegistryArtifact(registryTarget, runner, timeoutMs);
+  const npmPackageCheck = registryRead.check;
+  const registryArtifact: RegistryArtifactState = {
+    ...registryRead.artifact,
+    git_head_reachability: resolveGitHeadReachability(repoPath, registryRead.artifact.git_head, runner, timeoutMs),
+    // Both identities for this repo: what its own manifest declares, and the
+    // `owner/name` the audit was pointed at. `githubRepo` is itself inferred from
+    // `remote.origin.url` when not passed, so this covers the remote too.
+    repository_attribution: attributeRepository(registryRead.artifact.repository, [
+      (manifest as { repository?: unknown } | null)?.repository,
+      githubRepo === "unknown/unknown" ? null : githubRepo,
+    ]),
+  };
+  const registryDivergence: RegistryDivergence = classifyRegistryDivergence({
+    target: registryTarget,
+    repoVersion: intendedVersion,
+    artifact: registryArtifact,
+    nameAuthority: resolvePackageNameAuthority(repoPath, manifest),
+  });
+
   const openPrsCheck = countOpenPrs(githubRepo, runner, timeoutMs);
   const latestGithubRelease = githubReleaseCheck.value;
   const latestNpmVersion = npmPackageCheck.value;
@@ -627,6 +696,54 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
   if (options.includeOpenPrBlocker !== false && !openPrsCheck.ok) {
     gates.push({ id: "open-pr-check", status: "block", message: openPrsCheck.error ?? `could not verify open PRs for ${githubRepo}` });
   }
+
+  // Registry scope and provenance are settled before any version comparison is
+  // reported, because a version comparison against the wrong registry — or
+  // against an artifact from another repo's history — is the defect this
+  // producer shipped. `registry_target.registry_source` records whether npmjs
+  // was declared or defaulted to.
+  if (!registryTarget.in_npmjs_divergence_scope) {
+    gates.push({
+      id: "registry-out-of-npmjs-scope",
+      status: "warn",
+      message: `${packageName} is out of npmjs divergence scope (${registryTarget.scope}): ${registryTarget.out_of_scope_reasons.join("; ")}`,
+    });
+  }
+  if (registryDivergence.classification === "UNRELATED-NAME") {
+    gates.push({
+      id: "registry-unrelated-name",
+      status: "block",
+      message: registryDivergence.reasons.join("; "),
+    });
+  }
+  if (registryDivergence.classification === "PROVENANCE-UNVERIFIED") {
+    gates.push({
+      id: "registry-provenance-unverified",
+      status: "block",
+      message: registryDivergence.reasons.join("; "),
+    });
+  }
+  if (registryDivergence.classification === "PROVENANCE-REPOSITORY-ONLY") {
+    // Warn, not block. Most published artifacts carry no gitHead at all — 15 of
+    // 36 readable fleet packages on 2026-07-27 (UTC), `@hasna/repos` among them —
+    // so blocking here would stop the release audit for most of the fleet and
+    // file a fresh blocker task on every commit, which is the churn this producer
+    // is supposed to avoid. The artifact declaring exactly this repository is
+    // weaker evidence than a reachable gitHead, and it is recorded as such.
+    gates.push({
+      id: "registry-provenance-repository-only",
+      status: "warn",
+      message: registryDivergence.reasons.join("; "),
+    });
+  }
+  if (registryDivergence.classification === "NOT-PUBLISHED-NAME-UNVERIFIED") {
+    gates.push({
+      id: "registry-published-name-unverified",
+      status: "block",
+      message: registryDivergence.reasons.join("; "),
+    });
+  }
+
   if (latestNpmVersion && intendedVersion && compareVersions(intendedVersion, latestNpmVersion) < 0) {
     gates.push({
       id: "version-regression",
@@ -678,8 +795,30 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
   if (commitsSinceReachableTag === 0) gates.push({ id: "no-new-commits", status: "pass", message: `${ref} has no commits since ${latestReachableTag}` });
 
   const blockers = gates.filter((gate) => gate.status === "block");
+
+  // A hard, fail-closed refusal. This is the one place that decides whether the
+  // producer may propose a release at all, and it starts from the manifest's own
+  // policy (UNLICENSED / private registry / private: true) rather than from
+  // anything observed on a registry. Publishing hasna/cli's `main` to npmjs
+  // would have disclosed UNLICENSED code and overwritten a live deprecation
+  // redirect; no combination of version numbers may authorize that.
+  const hardRefusals = registryTarget.publish_refusals.map((refusal) => describePublishRefusal(refusal, registryTarget));
+  const publishRefusals = [...hardRefusals];
+  if (!registryTarget.in_npmjs_divergence_scope) publishRefusals.push(...registryTarget.out_of_scope_reasons);
+  for (const reason of registryDivergence.publish_refusals) {
+    if (!publishRefusals.includes(reason)) publishRefusals.push(reason);
+  }
+  if (blockers.length > 0) publishRefusals.push(`${blockers.length} release gate(s) blocking`);
+  const publishAction = { allowed: publishRefusals.length === 0, refusals: publishRefusals };
+
   const taskSeeds: TaskSeed[] = [];
-  if (blockers.length > 0) {
+  if (hardRefusals.length > 0 || !registryTarget.in_npmjs_divergence_scope) {
+    // Emit nothing. A refused or out-of-scope package is reported in
+    // `publish_action` and `state.registry` so it stays auditable, but it gets
+    // no task seed: a release-candidate seed is the publish action itself, and a
+    // blocker seed would recreate the same task on every producer run for a
+    // package that is correctly configured to publish elsewhere.
+  } else if (blockers.length > 0) {
     taskSeeds.push(releaseBlockerTaskSeed({
       repoPath,
       githubRepo,
@@ -693,7 +832,7 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
       latestNpmVersion,
       blockers,
     }));
-  } else if (headSha && intendedVersion && intendedTag && (commitsSinceReachableTag ?? 0) > 0) {
+  } else if (publishAction.allowed && headSha && intendedVersion && intendedTag && (commitsSinceReachableTag ?? 0) > 0) {
     taskSeeds.push(releaseCandidateTaskSeed({
       repoPath,
       githubRepo,
@@ -710,7 +849,15 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
     }));
   }
 
-  const status = blockers.length > 0 ? "blocked" : taskSeeds.length > 0 ? "candidate" : "noop";
+  const status: ReleaseCandidateResult["summary"]["status"] = hardRefusals.length > 0
+    ? "refused"
+    : !registryTarget.in_npmjs_divergence_scope
+      ? "out-of-scope"
+      : blockers.length > 0
+        ? "blocked"
+        : taskSeeds.length > 0
+          ? "candidate"
+          : "noop";
   return {
     schema: "open-repos.release-candidates.v1",
     generated_at: new Date().toISOString(),
@@ -740,8 +887,14 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
         npm_package: npmPackageCheck,
         open_prs: openPrsCheck,
       },
+      registry: {
+        target: registryTarget,
+        artifact: registryArtifact,
+        divergence: registryDivergence,
+      },
     },
     gates,
+    publish_action: publishAction,
     summary: {
       status,
       candidates: status === "candidate" ? 1 : 0,
@@ -1026,7 +1179,14 @@ export function buildTaskRouteHealth(options: TaskRouteHealthOptions): TaskRoute
 
 export function buildProtectedRelease(options: ProtectedReleaseOptions): ProtectedReleaseResult {
   const release = buildReleaseCandidates(options);
-  const taskSeeds = release.summary.status === "candidate" && release.state.head_sha && release.state.intended_tag
+  // `publish_action.allowed` is re-checked here rather than inferred from the
+  // status. This producer is the one that emits an approval-gated *release*
+  // task, so it fails closed on its own terms: a future status value that is
+  // neither "blocked" nor a refusal must not become a release by default.
+  const taskSeeds = release.summary.status === "candidate"
+    && release.publish_action.allowed
+    && release.state.head_sha
+    && release.state.intended_tag
     ? [protectedReleaseTaskSeed(release, options.approvalLabel)]
     : [];
   return {
@@ -1325,22 +1485,168 @@ function latestGithubReleaseTag(githubRepo: string, tagPrefix: string, runner: C
   return okCheck<string>(tags[0] ?? null);
 }
 
-function latestNpmPackageVersion(packageName: string, runner: CommandRunner, timeoutMs: number): ExternalCheck<string> {
-  if (packageName === "unknown") return failedCheck("cannot read npm package state without a package name");
-  const registryName = packageName.replace("/", "%2F");
-  const result = runner("curl", ["-fsS", `https://registry.npmjs.org/${registryName}`], { timeoutMs });
-  if (result.status !== 0) {
-    return failedCheck(`could not read npm package ${packageName}: ${compactPreview(result.stderr || result.stdout || result.error?.message || "")}`);
-  }
+/**
+ * The publish-relevant slice of package.json.
+ *
+ * `inferPackageName` reads only `name`, which is why the audit never saw that
+ * hasna/cli declares `publishConfig.registry` npm.pkg.github.com and
+ * `license: "UNLICENSED"`.
+ */
+function readPublishManifest(repoPath: string): PublishManifest | null {
+  const packageJsonPath = `${repoPath.replace(/\/+$/, "")}/package.json`;
+  if (!existsSync(packageJsonPath)) return null;
   try {
-    const parsed = JSON.parse(result.stdout) as { "dist-tags"?: { latest?: unknown } };
-    const latest = parsed["dist-tags"]?.latest;
-    return typeof latest === "string" && latest.length > 0
-      ? okCheck(latest)
-      : failedCheck(`npm package ${packageName} has no dist-tags.latest`);
+    return JSON.parse(readFileSync(packageJsonPath, "utf8")) as PublishManifest;
   } catch {
-    return failedCheck(`could not parse npm package ${packageName} registry response`);
+    return null;
   }
+}
+
+/** Registry document URL. npm encodes the scope separator as %2F in this path. */
+function registryDocumentUrl(registryUrl: string, packageName: string): string {
+  return `${registryUrl.replace(/\/+$/, "")}/${packageName.replace("/", "%2F")}`;
+}
+
+const UNREADABLE_ARTIFACT: RegistryArtifactState = {
+  readable: false,
+  published: false,
+  version: null,
+  git_head: null,
+  git_head_reachability: "unknown",
+  repository: null,
+  repository_attribution: "absent",
+};
+
+/**
+ * Read the registry document for `target.package_name` from the registry the
+ * package actually publishes to.
+ *
+ * Out-of-scope packages are not fetched at all: a `publishConfig.registry` of
+ * npm.pkg.github.com means an npmjs document under the same name describes a
+ * *different* package, and `access: "restricted"` means the real document is
+ * not anonymously readable, so either fetch would measure the wrong thing.
+ *
+ * A definitive 404 still fails the external check — the producer's existing
+ * fail-closed posture for unverifiable registry state is deliberately
+ * unchanged here — but it is recorded as `published: false` so a first release
+ * is distinguishable from an outage in the report.
+ */
+function readRegistryArtifact(
+  target: RegistryTarget,
+  runner: CommandRunner,
+  timeoutMs: number,
+): { check: ExternalCheck<string>; artifact: RegistryArtifactState } {
+  if (!target.package_name) {
+    return { check: failedCheck("cannot read registry state without a package name"), artifact: UNREADABLE_ARTIFACT };
+  }
+  if (!target.in_npmjs_divergence_scope) {
+    return {
+      // Not checked, and not a failure: the scope gate carries the meaning.
+      check: { checked: false, ok: true, value: null, error: null },
+      artifact: UNREADABLE_ARTIFACT,
+    };
+  }
+
+  const url = registryDocumentUrl(target.registry_url, target.package_name);
+  const result = runner("curl", ["-fsS", url], { timeoutMs });
+  if (result.status !== 0) {
+    const diagnostic = result.stderr || result.stdout || result.error?.message || "";
+    // curl -fsS reports the HTTP status in its stderr message on >=400.
+    if (/\b404\b/.test(diagnostic)) {
+      return {
+        check: failedCheck(`${target.registry_host} has no published ${target.package_name}`),
+        artifact: { ...UNREADABLE_ARTIFACT, readable: true },
+      };
+    }
+    return {
+      check: failedCheck(`could not read ${target.package_name} from ${target.registry_host}: ${compactPreview(diagnostic)}`),
+      artifact: UNREADABLE_ARTIFACT,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout) as {
+      "dist-tags"?: { latest?: unknown };
+      repository?: unknown;
+      versions?: Record<string, { gitHead?: unknown; repository?: unknown } | undefined>;
+    };
+    const latest = parsed["dist-tags"]?.latest;
+    if (typeof latest !== "string" || latest.length === 0) {
+      return {
+        check: failedCheck(`${target.package_name} on ${target.registry_host} has no dist-tags.latest`),
+        artifact: { ...UNREADABLE_ARTIFACT, readable: true },
+      };
+    }
+    const gitHead = parsed.versions?.[latest]?.gitHead;
+    // Version-level `repository` first, document-level as the fallback: npm
+    // records it per version, and a package that moved repos should be judged on
+    // what the published version claimed, not on the latest document metadata.
+    const repository = parsed.versions?.[latest]?.repository ?? parsed.repository ?? null;
+    return {
+      check: okCheck(latest),
+      artifact: {
+        readable: true,
+        published: true,
+        version: latest,
+        git_head: typeof gitHead === "string" && gitHead.trim().length > 0 ? gitHead.trim() : null,
+        git_head_reachability: "unknown",
+        repository: normalizeRepositoryIdentity(repository),
+        repository_attribution: "absent",
+      },
+    };
+  } catch {
+    return {
+      check: failedCheck(`could not parse the ${target.registry_host} document for ${target.package_name}`),
+      artifact: UNREADABLE_ARTIFACT,
+    };
+  }
+}
+
+/**
+ * Resolve whether the registry artifact's commit exists in this checkout.
+ *
+ * Only runs when there is a `gitHead` to probe, so repos with provenance-free
+ * artifacts do not pay for two extra git calls.
+ */
+function resolveGitHeadReachability(
+  repoPath: string,
+  gitHead: string | null,
+  runner: CommandRunner,
+  timeoutMs: number,
+): RegistryArtifactState["git_head_reachability"] {
+  if (!gitHead) return "unknown";
+  return probeGitHeadReachability({
+    gitHead,
+    isGitRepo: gitOutput(repoPath, runner, timeoutMs, ["rev-parse", "--is-inside-work-tree"]) === "true",
+    isShallow: gitOutput(repoPath, runner, timeoutMs, ["rev-parse", "--is-shallow-repository"]) === "true",
+    runProbe: (sha) => {
+      const probe = runner("git", ["-C", repoPath, ...gitHeadProbeArgs(sha)], { timeoutMs });
+      return { status: probe.status, stderr: probe.stderr };
+    },
+  });
+}
+
+/**
+ * Publish-time name rewriting, read from the repo rather than from a list of
+ * repos known to do it. See `detectPackageNameAuthority`.
+ */
+function resolvePackageNameAuthority(repoPath: string, manifest: PublishManifest | null): "manifest" | "publish-script" {
+  const sources: Array<string | null> = [];
+  const scripts = (manifest as { scripts?: Record<string, unknown> } | null)?.scripts;
+  if (scripts && typeof scripts === "object") {
+    for (const value of Object.values(scripts)) if (typeof value === "string") sources.push(value);
+  }
+  for (const candidate of [".github/workflows/publish.yml", ".github/workflows/publish.yaml", "scripts/publish.ts", "scripts/publish.sh"]) {
+    const path = `${repoPath.replace(/\/+$/, "")}/${candidate}`;
+    if (!existsSync(path)) continue;
+    try {
+      sources.push(readFileSync(path, "utf8"));
+    } catch {
+      // An unreadable publish script leaves the manifest authoritative; it does
+      // not license a claim in either direction.
+    }
+  }
+  return detectPackageNameAuthority(sources);
 }
 
 function countOpenPrs(githubRepo: string, runner: CommandRunner, timeoutMs: number): ExternalCheck<number> {

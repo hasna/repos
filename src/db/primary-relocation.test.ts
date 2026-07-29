@@ -1279,6 +1279,10 @@ describe("primary relocation v2 reconciliation", () => {
   it("rebinds catalog and path-only leases, reconciles graph edges, and preserves prior audits", () => {
     const pair = seedPair();
     const db = getDb();
+    // Migration 14 now creates the shipped lease table on open. These cases
+    // deliberately exercise the *reduced* shape carried by stations whose table
+    // predates that migration, so the fixture replaces it.
+    db.exec("DROP TABLE IF EXISTS worktree_leases");
     db.exec(`CREATE TABLE worktree_leases (
       lease_id TEXT PRIMARY KEY, repo_path TEXT NOT NULL,
       repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
@@ -1319,6 +1323,10 @@ describe("primary relocation v2 reconciliation", () => {
     const db = getDb();
     const thirdPath = join(root, "third-registered-repo");
     insertRepo(1700, thirdPath, "third", "https://github.com/hasna/third.git");
+    // Migration 14 now creates the shipped lease table on open. These cases
+    // deliberately exercise the *reduced* shape carried by stations whose table
+    // predates that migration, so the fixture replaces it.
+    db.exec("DROP TABLE IF EXISTS worktree_leases");
     db.exec(`CREATE TABLE worktree_leases (
       lease_id TEXT PRIMARY KEY, repo_path TEXT NOT NULL,
       repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
@@ -1434,6 +1442,10 @@ describe("primary relocation v2 reconciliation", () => {
     const pair = seedPair();
     const db = getDb();
     insertChildFixtures(pair.legacyId, pair.targetId);
+    // Migration 14 now creates the shipped lease table on open. These cases
+    // deliberately exercise the *reduced* shape carried by stations whose table
+    // predates that migration, so the fixture replaces it.
+    db.exec("DROP TABLE IF EXISTS worktree_leases");
     db.exec(`CREATE TABLE worktree_leases (
       lease_id TEXT PRIMARY KEY, repo_path TEXT NOT NULL,
       repo_catalog_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
