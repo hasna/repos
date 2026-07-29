@@ -1,12 +1,12 @@
 import { existsSync, watch } from "node:fs";
 import { createHash } from "node:crypto";
-import { hostname } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Client } from "pg";
 import { getDb, getDbPath } from "../db/database.js";
 import { applyPostgresMigrations } from "../db/pg-migrations.js";
 import type { ScanResult } from "../types/index.js";
 import { getConfig, getHookQueuePath, getWorkspaceRoots } from "./config.js";
+import { getSourceMachineId } from "./machine-id.js";
 import { describeDanglingCheckouts, drainHookQueue, installPostCommitHooks } from "./repo-hooks.js";
 import { discoverRepos, scanRepoPaths } from "./scanner.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
@@ -214,10 +214,6 @@ async function prepareRemoteSearchPath(remote: ReposRemoteSyncClient, schema: st
   // selection transaction-local so an injected, caller-owned connection is
   // returned with exactly the same session search_path it had on entry.
   await remote.query(`SET LOCAL search_path TO ${quoted}`);
-}
-
-function getSourceMachineId(): string {
-  return process.env["HASNA_MACHINE_ID"] || process.env["OPEN_MACHINES_ID"] || process.env["MACHINE_ID"] || hostname();
 }
 
 function redactErrorMessage(_error: unknown, _databaseUrl: string | null): string {
