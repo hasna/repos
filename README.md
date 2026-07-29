@@ -111,7 +111,8 @@ CLI output is compact by default so it stays readable in agent terminals:
 
 `repos no-cloud inventory --include-npm` checks published `@hasna` packages for a
 surviving dependency on the retired `@hasna/cloud`. The list of packages to check is the
-**union of two sources**, because neither is authoritative alone:
+**union of local manifests and two registry sources**, because none is
+authoritative alone:
 
 - **local manifests** under the scan root — correct for what this machine has checked out,
   but blind to any package whose repo is not cloned here, and keyed on the manifest `name`,

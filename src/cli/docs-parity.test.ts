@@ -102,6 +102,11 @@ describe("documentation parity", () => {
     const links = Array.from(README.matchAll(/\]\((docs\/[^)]+\.md)\)/g), (match) => match[1]!);
     expect(links.length).toBeGreaterThan(0);
     for (const link of links) expect(Bun.file(resolve(ROOT, link)).size).toBeGreaterThan(0);
+
+    const packageJson = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf8")) as {
+      files?: string[];
+    };
+    expect(packageJson.files).toContain("docs");
   });
 
   test("the configuration reference covers every product-specific environment variable", () => {

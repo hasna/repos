@@ -56,5 +56,6 @@ with the `Content-Type` header. `OPTIONS` receives an empty preflight response.
 When `dashboard/dist` is present, `/` and static asset paths serve the React
 dashboard. Non-API paths fall back to its `index.html`. The dashboard provides
 repo/org listing, repository detail, commit timeline, search, global stats,
-checkout health, and a scan action. Missing static assets or unknown API paths
-return a JSON 404.
+checkout health, and a scan action. Because every unknown non-API path receives
+the SPA fallback, a missing static asset also receives `index.html`. Unknown API
+paths return a JSON 404.

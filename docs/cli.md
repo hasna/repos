@@ -20,11 +20,13 @@ that offer it, while `--json` returns full machine-readable records. Paginated
 list commands accept `--limit` and `--offset` or `--cursor`; `repos repos` and
 `repos prs` warn on stderr when a JSON page is not the complete result.
 
-Before most read commands, the CLI bootstraps an empty or differently configured
+Before most commands, the CLI bootstraps an empty or differently configured
 index, installs its marked `post-commit` hook block, and scans configured
-workspace roots. Set `HASNA_REPOS_AUTO_BOOTSTRAP=0` to disable this. Explicit
-scan/watch, mutation, maintenance, and operational command groups do not trigger
-that implicit scan. See [Configuration and storage](configuration.md).
+workspace roots. Set `HASNA_REPOS_AUTO_BOOTSTRAP=0` to disable this. Scan/watch,
+database utilities, repository import/create/clone, and the `ops`, package,
+ports, triage, docs, release, no-cloud, registry, and worktree groups skip that
+implicit scan. Other commands, including `archive`, `events`, and `webhooks`,
+can trigger it. See [Configuration and storage](configuration.md).
 
 Repository names are convenient but can be ambiguous. `repos repo`, `repos
 show`, and `repos inspect` accept `--remote <host/org/name>` for an exact remote
