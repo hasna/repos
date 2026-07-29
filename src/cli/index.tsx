@@ -52,7 +52,7 @@ import {
   summarizeCheckoutStates,
   type CheckoutHealth,
 } from "../lib/checkout-health.js";
-import { printJson, printJsonLine, printLine } from "./stdout.js";
+import { printError, printJson, printJsonLine, printLine } from "./stdout.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
 import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
 import { getActivityHeatmap, getContributorStats, getStaleRepos, getRecentActivity } from "../lib/analytics.js";
@@ -2417,7 +2417,7 @@ program
 function requireUsableCheckout(repo: { name: string; path: string; remote_url?: string | null }): string {
   const health = classifyCheckout(repo.path);
   if (health.usable) return repo.path;
-  console.error(chalk.red(formatUnusableCheckout(repo, health)));
+  printError(chalk.red(formatUnusableCheckout(repo, health)));
   process.exit(1);
 }
 

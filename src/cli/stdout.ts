@@ -106,6 +106,11 @@ export function printLine(text: string, writer: SyncWriter = fdWriter(1)): Stdou
   return writeStdout(`${text}\n`, writer);
 }
 
+/** Write `text` plus a newline to stderr, completing the write before returning. */
+export function printError(text: string, writer: SyncWriter = fdWriter(2)): StdoutWriteOutcome {
+  return writeAllSync(`${text}\n`, writer);
+}
+
 /**
  * Emit a machine-readable JSON document on stdout.
  *

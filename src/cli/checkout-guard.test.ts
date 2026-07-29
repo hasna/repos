@@ -29,6 +29,22 @@ function runCli(dbPath: string, args: string[]) {
   };
 }
 
+function runCdWithStderrPiped(dbPath: string, name: string) {
+  return Bun.spawnSync({
+    cmd: [
+      "bash",
+      "-c",
+      'set -o pipefail; bun run src/cli/index.tsx cd "$1" --exact 2>&1 >/dev/null | cat',
+      "repos-stderr-pipe",
+      name,
+    ],
+    cwd: repoRoot,
+    env: { ...process.env, HASNA_REPOS_AUTO_BOOTSTRAP: "0", HASNA_REPOS_DB_PATH: dbPath },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+}
+
 function git(cwd: string, args: string[]): number {
   return Bun.spawnSync({
     cmd: ["git", ...args],
@@ -203,6 +219,25 @@ describe("repos cd refuses rather than printing an unusable path", () => {
     const result = runCli(dbPath, ["cd", "gutted"]);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("git clone https://github.com/hasna/gutted");
+  });
+
+  test("completes the refusal on a stderr pipe before exiting", () => {
+    // The ordinary refusal is currently smaller than a pipe buffer, so make its
+    // repeated row name large enough to prove the final bytes survive. A normal
+    // spawn capture does not reproduce queued-write truncation; this must pass
+    // through a real shell pipeline, like the original stdout regression test.
+    tempDir = mkdtempSync(join(tmpdir(), "repos-guard-cd-stderr-pipe-"));
+    const name = `missing-${"x".repeat(40_000)}-tail`;
+    const dbPath = seed([{ name, path: join(tempDir, "gone") }]);
+
+    const result = runCdWithStderrPiped(dbPath, name);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toBe("");
+    expect(result.stdout.byteLength).toBeGreaterThan(65_536);
+    const refusal = result.stdout.toString();
+    expect(refusal.trimEnd()).toEndWith(
+      `Inspect the row with: repos repo ${name} --json --allow-unusable-checkout`,
+    );
   });
 });
 
