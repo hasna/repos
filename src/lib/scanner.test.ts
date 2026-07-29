@@ -3,7 +3,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
-import { scanRepos } from "./scanner";
+import { scanRepoPaths, scanRepos } from "./scanner";
 import { listRepos, listCommits, listBranches, listTags, listRemotes } from "../db/repos";
 
 const TEST_DIR = join(import.meta.dir, "../../.test-repos");
@@ -45,6 +45,27 @@ describe("scanner", () => {
     const result = await scanRepos([TEST_DIR]);
     expect(result.repos_found).toBe(2);
     expect(result.repos_new).toBe(2);
+  });
+
+  it("does not admit linked worktrees discovered beneath or passed as the scan root", async () => {
+    const primary = createTestRepo("primary-checkout", 1);
+    const worktree = join(TEST_DIR, "worktrees", "primary-checkout", "task-a");
+    mkdirSync(join(worktree, ".."), { recursive: true });
+    execFileSync("git", ["worktree", "add", "-b", "task-a", worktree], {
+      cwd: primary,
+      stdio: "pipe",
+    });
+
+    const discovered = await scanRepos([TEST_DIR]);
+    expect(discovered.repos_found).toBe(1);
+    expect(listRepos().map((repo) => repo.path)).toEqual([primary]);
+
+    const rootedAtWorktree = await scanRepos([worktree]);
+    expect(rootedAtWorktree.repos_found).toBe(0);
+
+    const directlyPassed = await scanRepoPaths([worktree]);
+    expect(directlyPassed.repos_found).toBe(0);
+    expect(listRepos().map((repo) => repo.path)).toEqual([primary]);
   });
 
   it("should index commits from discovered repos", async () => {

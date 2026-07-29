@@ -12,6 +12,7 @@ import {
   replaceBranches,
   bulkInsertTags,
   bulkInsertRemotes,
+  isDerivedCheckoutPath,
 } from "../db/repos.js";
 import type { ScanResult } from "../types/index.js";
 
@@ -64,6 +65,11 @@ export function discoverRepos(rootDirs: string[], maxDepth?: number): string[] {
     const realDir = resolve(dir);
     if (visited.has(realDir)) return;
     visited.add(realDir);
+
+    // Worktrees and throwaway build copies are derived from a primary checkout.
+    // They must not acquire their own registry rows or be searched for nested
+    // repositories, even when a derived checkout is itself the scan root.
+    if (isDerivedCheckoutPath(realDir)) return;
 
     if (isGitRepo(realDir)) {
       repos.push(realDir);
@@ -342,6 +348,12 @@ export async function scanRepoPaths(
 ): Promise<ScanResult> {
   const start = Date.now();
   const { full = false, onProgress, workers: maxWorkers = 4 } = opts;
+  // scanRepoPaths is also called directly by the auto-index worker and repo
+  // lifecycle, so enforce the same admission rule as discovery here rather
+  // than relying on every caller to have gone through discoverRepos first.
+  const admittedRepoPaths = repoPaths.filter((repoPath) =>
+    !isDerivedCheckoutPath(resolve(repoPath))
+  );
 
   const progressBar = new cliProgress.SingleBar({
     format: "  indexing [{bar}] {percentage}% | {value}/{total} | {filename}",
@@ -349,8 +361,8 @@ export async function scanRepoPaths(
     noTTYOutput: !!onProgress,
   });
 
-  if (repoPaths.length > 0) {
-    progressBar.start(repoPaths.length, 0, { filename: "" });
+  if (admittedRepoPaths.length > 0) {
+    progressBar.start(admittedRepoPaths.length, 0, { filename: "" });
   }
 
   let repos_new = 0;
@@ -360,8 +372,8 @@ export async function scanRepoPaths(
   let tags_indexed = 0;
 
   const chunks: string[][] = [];
-  for (let i = 0; i < repoPaths.length; i += maxWorkers) {
-    chunks.push(repoPaths.slice(i, i + maxWorkers));
+  for (let i = 0; i < admittedRepoPaths.length; i += maxWorkers) {
+    chunks.push(admittedRepoPaths.slice(i, i + maxWorkers));
   }
 
   let completed = 0;
@@ -378,14 +390,14 @@ export async function scanRepoPaths(
         branches_indexed += result.value.branches;
         tags_indexed += result.value.tags;
       }
-      progressBar.increment({ filename: basename(repoPaths[completed - 1]!) });
+      progressBar.increment({ filename: basename(admittedRepoPaths[completed - 1]!) });
     }
   }
 
   progressBar.stop();
 
   return {
-    repos_found: repoPaths.length,
+    repos_found: admittedRepoPaths.length,
     repos_new,
     repos_updated,
     commits_indexed,
