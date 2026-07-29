@@ -449,6 +449,24 @@ describe("removeWorktree", () => {
   });
 });
 
+describe("releaseWorktree argument shape", () => {
+  test("a <repo>/<worktree> pair is refused rather than silently matching no lease", () => {
+    // The pair form is valid for `remove`, so handing it to `release` is a
+    // plausible mistake. Looking up a lease id of "" and reporting
+    // LEASE_NOT_FOUND would send the caller hunting for a missing row.
+    const { repoName } = seed();
+    addWorktree({ repo: repoName, task: "release-shape" });
+    expect(codeOf(() => releaseWorktree({ leaseId: `${repoName}/release-shape` }))).toBe("INVALID_REQUEST");
+  });
+
+  test("a filesystem path is refused by shape", () => {
+    const { repoName } = seed();
+    const created = addWorktree({ repo: repoName, task: "release-path" });
+    expect(codeOf(() => releaseWorktree({ leaseId: created.path }))).toBe("INVALID_REQUEST");
+    expect(existsSync(created.path)).toBe(true);
+  });
+});
+
 describe("listWorktrees", () => {
   test("reconciles leases against disk and names the measured corruption classes", () => {
     const { root, repoName } = seed();

@@ -97,6 +97,7 @@ export type WorktreeErrorCode =
   | "NOT_A_WORKTREE"
   | "BASE_REF_UNRESOLVABLE"
   | "LEASE_NOT_FOUND"
+  | "LEASE_CONFLICT"
   | "WORKTREE_DIRTY"
   | "WORKTREE_UNPUSHED"
   | "TRUSTED_HOME_UNAVAILABLE"
@@ -699,7 +700,21 @@ export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
     released_at: null,
     last_error: null,
   };
-  upsertLease(db, lease);
+  try {
+    upsertLease(db, lease);
+  } catch (error) {
+    // The worktree exists on disk at this point. The lease table carries two
+    // more uniqueness constraints than the primary key, so a concurrent `add`
+    // that won the race leaves this insert failing over a directory that is
+    // already there. Reporting a raw SQLite error would read as a bug in the
+    // registry; the recoverable truth is that the worktree is unleased.
+    fail("LEASE_CONFLICT", "the worktree was created but its lease could not be recorded", {
+      path: target,
+      lease_id: lease.lease_id,
+      hint: "another process holds a conflicting lease; run `repos worktree adopt <path> --apply` to reconcile",
+      git_stderr: redactGitDiagnostics(String((error as Error).message ?? "")),
+    });
+  }
 
   return {
     schema: WORKTREE_LEASE_SCHEMA,
@@ -997,7 +1012,11 @@ export interface ReleaseWorktreeResult {
 
 export function releaseWorktree(request: ReleaseWorktreeRequest): ReleaseWorktreeResult {
   const db = request.db ?? getDb();
-  const lease = leaseById(db, parseWorktreeRef(request.leaseId).kind === "lease" ? request.leaseId : "");
+  const parsed = parseWorktreeRef(request.leaseId);
+  if (parsed.kind !== "lease") {
+    fail("INVALID_REQUEST", "release takes a lease id; use `worktree remove` for a <repo>/<worktree> pair");
+  }
+  const lease = leaseById(db, parsed.leaseId);
   if (!lease) fail("LEASE_NOT_FOUND", `no lease '${request.leaseId}'`, { lease_id: request.leaseId });
 
   const timestamp = nowIso();
