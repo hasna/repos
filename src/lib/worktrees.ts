@@ -547,11 +547,19 @@ export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
   // something else on a shared station.
   const resolvedTarget = assertInsideRoot(target, "the computed worktree path");
   if (!isDerivedCheckoutPath(resolvedTarget)) {
-    // `repos scan` classifies paths under a `worktrees/` segment as derived
-    // checkouts and skips registering them. Registry rows 981-985 on this
-    // station are `~/.hasna/loops/worktrees/open-repos/*` registered *as repos*,
-    // so this exclusion has failed before. Assert it here rather than discover
-    // the pollution in the registry later.
+    // The path must be classified as a derived checkout, so that a remote
+    // lookup resolving `github.com/hasna/<x>` prefers the primary clone over
+    // any worktree of it (`getRepoByRemote` narrows on exactly this predicate).
+    //
+    // What this does NOT buy, measured 2026-07-29 and stated here so nobody
+    // reads more into it: `repos scan` still *registers* worktrees as repos.
+    // `repos scan --root <a fresh worktree under the canonical root>` took the
+    // index from 1669 rows to 1670 and added a row for the worktree. The
+    // derived-checkout predicate governs resolution ranking, not scan
+    // admission — which is why registry rows 981-985 are
+    // `~/.hasna/loops/worktrees/open-repos/*` registered as repositories.
+    // Fixing scan admission is filed separately; this assertion is only about
+    // the ranking property.
     fail("LAYOUT_INVARIANT_VIOLATED", "the computed worktree path is not recognised as a derived checkout", {
       path: resolvedTarget,
       root,
