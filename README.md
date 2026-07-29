@@ -286,6 +286,7 @@ The dry run also reports what would cascade away, which is usually the number th
     cascades: 134010 branches row(s)
     cascades: 15760 pull_requests row(s)
 ```
+
 ### Checkout health
 
 A registry row is only useful if its `path` is a checkout something can be done to.

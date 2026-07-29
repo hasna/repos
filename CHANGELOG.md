@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Adds fail-closed checkout health for repository lookups and a registry-wide health command
+(#33).
+
+- `repos repo` / `repos show` / `repos inspect` still print a matched registry row, but now
+  exit 1 when its path is not a usable git checkout. `--allow-unusable-checkout` preserves
+  the metadata-only workflow when a successful exit is required.
+- `repos registry health` counts usable and unusable registry rows, groups failures by
+  checkout state, and can list or filter the affected rows.
+
 Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adopt | release`.
 
 - **The path is computed, never supplied.** `add` takes a repo and a name and places the
