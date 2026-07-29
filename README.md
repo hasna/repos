@@ -140,6 +140,14 @@ The destination is computed from the repo name and the worktree name. A name mus
 single path segment, and the computed path is re-checked against the root after symlink
 resolution, so `--name ../../elsewhere` is refused before anything touches the filesystem.
 
+Caller-supplied refs (`--base`, `--branch`) are validated before they reach git. `git fetch
+origin <ref>` parses options anywhere on the line and `--upload-pack=<cmd>` names a program to
+run, so a ref beginning with `-` is not a ref — it is an argument to git. `check-ref-format`
+alone does not catch it (`refs/heads/--upload-pack=x` is a well-formed ref name); the leading-
+dash refusal and a conservative charset do, with `--` separators at the call sites as a second
+gate. The regression test keeps a positive control that fires the same payload at git directly,
+so "rejected" cannot quietly become "everything is rejected".
+
 The base ref is **fetched and pinned from origin**. A repo that has an origin must fetch;
 a fetch failure is `BASE_REF_UNRESOLVABLE` and the command stops, because branching off a
 stale local HEAD produces a PR carrying other people's reverts. A repo with no remote at all

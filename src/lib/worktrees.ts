@@ -85,6 +85,7 @@ const RESERVED_ROOT_ENTRIES = new Set([".evidence"]);
 export type WorktreeErrorCode =
   | "INVALID_REQUEST"
   | "INVALID_WORKTREE_NAME"
+  | "INVALID_BASE_REF"
   | "INVALID_BRANCH_NAME"
   | "BRANCH_EXISTS"
   | "REPO_NOT_FOUND"
@@ -496,7 +497,7 @@ function resolveBase(parent: ParentCheckout, baseRef: string): ResolvedBase {
     return { ref: baseRef, sha: local.stdout, source: "local" };
   }
 
-  const fetched = runGit(parent.path, ["fetch", "--quiet", "origin", baseRef], {
+  const fetched = runGit(parent.path, ["fetch", "--quiet", "origin", "--", baseRef], {
     allowFailure: true,
     timeout: GIT_FETCH_TIMEOUT_MS,
   });
@@ -521,12 +522,54 @@ function resolveBase(parent: ParentCheckout, baseRef: string): ResolvedBase {
   return { ref: baseRef, sha: sha.stdout, source: "origin" };
 }
 
-function assertBranchName(parent: ParentCheckout, branch: string): string {
-  const ok = runGit(parent.path, ["check-ref-format", `refs/heads/${branch}`], { allowFailure: true });
-  if (!ok.ok) {
-    fail("INVALID_BRANCH_NAME", `'${branch}' is not a valid branch name`, { branch });
+/**
+ * Ref-shaped arguments a caller supplies, which git will happily read as
+ * options.
+ *
+ * `git fetch origin <ref>` parses options anywhere on the command line, and
+ * `--upload-pack=<cmd>` names a program to execute. So a `--base` value
+ * beginning with `-` is not a ref at all — it is an argument to git, and it
+ * runs commands. Measured on this station before the guard existed:
+ * `addWorktree({ base: "--upload-pack=touch <marker>; git-upload-pack" })`
+ * returned success and created the marker file. The regression test keeps a
+ * positive control that fires the same payload at git directly, so "rejected"
+ * cannot quietly become "rejected because everything is rejected".
+ *
+ * `git check-ref-format` is not sufficient on its own: it is given
+ * `refs/heads/<value>`, so `refs/heads/--upload-pack=x` is a well-formed ref
+ * name and exits 0. The leading-dash refusal and the charset are what do the
+ * work; check-ref-format is the second gate, not the first. `--` separators are
+ * added at the call sites that support them, so validation and git's own
+ * parsing both have to fail before an option is smuggled through.
+ */
+const REF_ARGUMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/@+-]{0,254}$/;
+
+function assertRefArgument(
+  parent: ParentCheckout,
+  value: string,
+  code: "INVALID_BASE_REF" | "INVALID_BRANCH_NAME",
+  label: string,
+): string {
+  const printable = String(value).replace(/[^\x20-\x7e]/g, "?").slice(0, 120);
+  if (
+    typeof value !== "string"
+    || !REF_ARGUMENT_PATTERN.test(value)
+    || value.includes("..")
+    || value.endsWith(".")
+    || value.endsWith("/")
+    || value.endsWith(".lock")
+  ) {
+    fail(code, `'${printable}' is not a usable ${label}`, {
+      hint: "a ref must start with a letter or digit; a leading '-' would be read by git as an option",
+    });
   }
-  return branch;
+  const wellFormed = runGit(parent.path, ["check-ref-format", "--allow-onelevel", `refs/heads/${value}`], {
+    allowFailure: true,
+  });
+  if (!wellFormed.ok) {
+    fail(code, `'${printable}' is not a well-formed ${label}`, {});
+  }
+  return value;
 }
 
 /** Is this directory a *linked* worktree, as opposed to a primary checkout? */
@@ -580,7 +623,16 @@ export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
 
   const machineId = request.machineId ?? getSourceMachineId();
   const runId = request.runId ?? "";
-  const baseRef = request.base ?? repo.default_branch ?? "main";
+  // Every caller-supplied ref is validated here, before any filesystem or git
+  // work, so a hostile value cannot reach git even on a code path that fails
+  // for some other reason first.
+  const baseRef = assertRefArgument(
+    parent,
+    request.base ?? repo.default_branch ?? "main",
+    "INVALID_BASE_REF",
+    "base ref",
+  );
+  const branch = assertRefArgument(parent, request.branch ?? worktreeName, "INVALID_BRANCH_NAME", "branch name");
   const repoId = repoIdentity(repo);
 
   const existing =
@@ -610,7 +662,6 @@ export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
     });
   }
 
-  const branch = assertBranchName(parent, request.branch ?? worktreeName);
   const branchExists = runGit(parent.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
     allowFailure: true,
   });
@@ -831,8 +882,16 @@ function archiveBeforeReap(target: ResolvedTarget, leaseId: string): string {
     const branch = target.branch ?? gitOut(target.path, ["rev-parse", "--abbrev-ref", "HEAD"], {
       allowFailure: true,
     });
-    if (branch && branch !== "HEAD") {
-      runGit(target.path, ["bundle", "create", join(evidenceDir, "branch.bundle"), branch], {
+    // The branch reaches `git bundle create <file> <rev>` as a revision
+    // argument, and a stored lease row is not a validated argument — the same
+    // reasoning as the evidence directory name above. A branch that is not
+    // ref-shaped is bundled by object id instead of by name, so the commits are
+    // still preserved and nothing hostile reaches git's option parser.
+    const revision = branch && branch !== "HEAD" && REF_ARGUMENT_PATTERN.test(branch)
+      ? branch
+      : gitOut(target.path, ["rev-parse", "HEAD"], { allowFailure: true });
+    if (revision) {
+      runGit(target.path, ["bundle", "create", join(evidenceDir, "branch.bundle"), revision], {
         allowFailure: true,
       });
     }
@@ -897,9 +956,11 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
     : ["worktree", "remove", resolved]);
   runGit(parentForGit, ["worktree", "prune"], { allowFailure: true });
   if (branch && branch !== "HEAD") {
-    runGit(parentForGit, request.discardChanges ? ["branch", "-D", branch] : ["branch", "-d", branch], {
-      allowFailure: true,
-    });
+    runGit(
+      parentForGit,
+      request.discardChanges ? ["branch", "-D", "--", branch] : ["branch", "-d", "--", branch],
+      { allowFailure: true },
+    );
   }
 
   if (target.lease) {

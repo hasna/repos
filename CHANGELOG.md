@@ -15,6 +15,12 @@ Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adop
   `<repo>/<worktree>` and nothing else, so the destroy-then-create hazard (a helper that
   force-removed whatever path it was given) is unrepresentable rather than guarded. Containment
   is re-checked after symlink resolution.
+- **Ref arguments cannot smuggle a git option.** `--base` and `--branch` are validated before
+  they reach git: `git fetch origin <ref>` parses options anywhere on the line, and
+  `--upload-pack=<cmd>` names a program to execute. Measured before the guard existed, an `add`
+  with such a `--base` returned success and ran the command. `check-ref-format` alone does not
+  catch it, because it is handed `refs/heads/<value>` and `refs/heads/--upload-pack=x` is
+  well-formed; the leading-dash refusal and charset do, with `--` separators as a second gate.
 - **Bases are pinned from origin, fail-closed.** A repo with an origin must fetch; the failure
   is `BASE_REF_UNRESOLVABLE` rather than a silent branch off a stale local HEAD. A repo with no
   remote resolves locally and reports `base.source: "local"`.

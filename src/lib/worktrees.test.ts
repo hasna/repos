@@ -278,6 +278,36 @@ describe("addWorktree", () => {
     expect(result.base.source).toBe("local");
   });
 
+  test("a ref argument cannot smuggle a git option, and the payload is live", () => {
+    // `git fetch origin <ref>` parses options anywhere on the line, so a ref
+    // beginning with `-` is not a ref — it is an argument to git. `--upload-pack`
+    // names a command to run. This is the one input on `add` that is neither a
+    // slug nor computed, so it is the one that has to be argued about.
+    const { clonePath, repoName } = seed();
+    const marker = join(tempDir, "pwned-marker");
+    const payload = `--upload-pack=touch ${marker}; git-upload-pack`;
+
+    expect(codeOf(() => addWorktree({ repo: repoName, task: "inject-base", base: payload })))
+      .toBe("INVALID_BASE_REF");
+    expect(existsSync(marker)).toBe(false);
+
+    expect(codeOf(() => addWorktree({ repo: repoName, task: "inject-branch", branch: "-D" })))
+      .toBe("INVALID_BRANCH_NAME");
+
+    // POSITIVE CONTROL. Without this the assertion above proves only that some
+    // string was rejected. Handed to git the way an unvalidated ref would be,
+    // the same payload executes and creates the marker — so the check above had
+    // something real to stop.
+    expect(existsSync(marker)).toBe(false);
+    try {
+      git(clonePath, ["fetch", "--quiet", "origin", payload]);
+    } catch {
+      // git may still exit non-zero after running the payload; the marker is
+      // the observation that matters.
+    }
+    expect(existsSync(marker)).toBe(true);
+  });
+
   test("requires exactly one of --task and --name", () => {
     const { repoName } = seed();
     expect(codeOf(() => addWorktree({ repo: repoName }))).toBe("INVALID_REQUEST");
