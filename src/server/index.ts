@@ -20,6 +20,11 @@ import { getHealthReport } from "../lib/utils.js";
 import { handleMcpHttpRoutes } from "../mcp/http.js";
 import { getCliVersion } from "../cli/version.js";
 import { apiJsonResponse } from "./output.js";
+import {
+  isTrustedScanRequest,
+  resolveConfiguredScanRoots,
+  SERVER_HOSTNAME,
+} from "./security.js";
 
 const VERSION = getCliVersion();
 
@@ -61,8 +66,8 @@ function broadcast(event: string, data?: unknown) {
   }
 }
 
-function json(data: unknown, status = 200): Response {
-  return apiJsonResponse(data, status);
+function json(data: unknown, status = 200, cors = true): Response {
+  return apiJsonResponse(data, status, { cors });
 }
 
 function parseQuery(url: URL): Record<string, string> {
@@ -84,6 +89,7 @@ process.on("SIGTERM", () => autoIndexWorker.stop());
 
 Bun.serve({
   port: PORT,
+  hostname: SERVER_HOSTNAME,
   websocket: {
     open(ws) {
       clients.add(ws);
@@ -110,6 +116,9 @@ Bun.serve({
 
     // CORS preflight
     if (req.method === "OPTIONS") {
+      if (path === "/api/scan") {
+        return new Response(null, { status: 403 });
+      }
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
@@ -188,8 +197,38 @@ Bun.serve({
     }
 
     if (path === "/api/scan" && req.method === "POST") {
-      const body = req.headers.get("content-type")?.includes("json") ? await req.json() : {};
-      const result = await ensureWorkspaceBootstrap(body.roots, { force: true, full: body.full });
+      if (!isTrustedScanRequest(req)) {
+        return json({ error: "Forbidden" }, 403, false);
+      }
+      if (!req.headers.get("content-type")?.includes("json")) {
+        return json({ error: "Content-Type must be application/json" }, 415, false);
+      }
+
+      let body: { roots?: unknown; full?: unknown };
+      try {
+        const parsed = await req.json();
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return json({ error: "Request body must be a JSON object" }, 400, false);
+        }
+        body = parsed as { roots?: unknown; full?: unknown };
+      } catch {
+        return json({ error: "Request body must be valid JSON" }, 400, false);
+      }
+      if (body.full !== undefined && typeof body.full !== "boolean") {
+        return json({ error: "full must be a boolean" }, 400, false);
+      }
+
+      let roots: string[];
+      try {
+        roots = resolveConfiguredScanRoots(body.roots);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : "Invalid roots" }, 400, false);
+      }
+
+      const result = await ensureWorkspaceBootstrap(roots, {
+        force: true,
+        full: body.full as boolean | undefined,
+      });
       const hookSummary = {
         installed: result.hooks.installed,
         updated: result.hooks.updated,
@@ -197,7 +236,7 @@ Bun.serve({
         skipped: result.hooks.skipped,
       };
       broadcast("scan:complete", { ...result.scan, hooks: hookSummary });
-      return json({ ...result.scan, hooks: hookSummary });
+      return json({ ...result.scan, hooks: hookSummary }, 200, false);
     }
 
     // ── Dashboard static files ──
@@ -217,4 +256,4 @@ Bun.serve({
   },
 });
 
-console.log(`repos server running on http://localhost:${PORT}`);
+console.log(`repos server running on http://${SERVER_HOSTNAME}:${PORT}`);

@@ -573,7 +573,7 @@ repos-serve  # Default port: 19450
 | `/api/prs` | GET | List PRs |
 | `/api/search` | GET | Unified search |
 | `/api/stats` | GET | Global stats |
-| `/api/scan` | POST | Trigger scan |
+| `/api/scan` | POST | Scan configured roots (requires the dashboard's `X-Repos-Scan: 1` CSRF header) |
 
 ## SDK
 

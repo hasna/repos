@@ -2,6 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { apiJsonResponse } from "./output.js";
 
 describe("dashboard HTTP output", () => {
+  it("can omit CORS headers from privileged responses", () => {
+    const response = apiJsonResponse({ ok: true }, 200, { cors: false });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+  });
+
   it("sanitizes remote identities before serializing API responses", async () => {
     const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker`;
     const response = apiJsonResponse([{ id: 1, remote_url: unsafe }]);

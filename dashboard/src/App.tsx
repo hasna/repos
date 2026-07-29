@@ -112,7 +112,11 @@ export function App() {
 
   const doScan = async () => {
     setScanning(true);
-    await fetch(`${API}/scan`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    await fetch(`${API}/scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Repos-Scan": "1" },
+      body: "{}",
+    });
   };
 
   const openRepo = async (repo: Repo) => {
