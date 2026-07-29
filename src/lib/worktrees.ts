@@ -67,6 +67,7 @@ import { getDb } from "../db/database.js";
 import { AmbiguousRepoNameError, getRepo, isDerivedCheckoutPath } from "../db/repos.js";
 import type { Repo } from "../types/index.js";
 import { resolveTrustedAccountHome } from "./account-home.js";
+import { classifyCheckout } from "./checkout-health.js";
 import { getSourceMachineId } from "./machine-id.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
@@ -377,38 +378,29 @@ interface ParentCheckout {
  *
  * The live counter-example: registry row 92 points at
  * `/home/hasna/workspace/hasna/opensource/open-repos`, whose `.git` holds only
- * `hooks/` and `worktrees/`. `git rev-parse` there exits 128 with "not a git
- * repository", and a verb that assumes health turns that into an opaque git
- * failure two calls later.
+ * `hooks/` and `worktrees/`. {@link classifyCheckout} owns the structural
+ * verdict so registry lookup and worktree creation cannot disagree about this
+ * path as their checks evolve.
  */
 function assertHealthyParent(repo: Repo): ParentCheckout {
   const path = repo.path;
-  if (!existsSync(path)) {
-    fail("PARENT_CHECKOUT_BROKEN", `the registered checkout for '${repo.name}' does not exist`, {
+  const checkout = classifyCheckout(path);
+  if (!checkout.usable) {
+    fail("PARENT_CHECKOUT_BROKEN", `the registered checkout for '${repo.name}' is unusable: ${checkout.detail}`, {
       repo: repo.name,
       path,
-      hint: "the registry row is stale; re-clone the repo or prune the row",
+      hint: checkout.state === "unreadable"
+        ? "check permissions and mounts before retrying; do not re-clone over an unreadable path"
+        : "repair or re-clone the checkout, or prune its registry row",
     });
   }
-  const inside = runGit(path, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true });
-  if (!inside.ok || inside.stdout !== "true") {
-    fail("PARENT_CHECKOUT_BROKEN", `the registered checkout for '${repo.name}' is not a git repository`, {
-      repo: repo.name,
-      path,
-      git_stderr: inside.stderr,
-      hint: "the checkout is a husk (a .git holding only hooks/ and worktrees/ is the known shape); re-clone it",
-    });
-  }
-  const commonDir = gitOut(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-    allowFailure: true,
-  });
-  if (!commonDir) {
-    fail("PARENT_CHECKOUT_BROKEN", `the git directory for '${repo.name}' could not be resolved`, {
+  if (!checkout.common_dir) {
+    fail("PARENT_CHECKOUT_BROKEN", `the registered checkout for '${repo.name}' has no resolvable common git directory`, {
       repo: repo.name,
       path,
     });
   }
-  return { path: realpathOrSelf(path), commonDir: realpathOrSelf(commonDir) };
+  return { path: realpathOrSelf(path), commonDir: realpathOrSelf(checkout.common_dir) };
 }
 
 function repoIdentity(repo: Repo): string {

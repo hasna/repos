@@ -220,6 +220,20 @@ describe("addWorktree", () => {
       .toBe("PARENT_CHECKOUT_BROKEN");
   });
 
+  test("uses the structural checkout verdict for a bare parent repository", () => {
+    // `git rev-parse --is-inside-work-tree` answers false for a bare repository,
+    // although classifyCheckout identifies it as usable and git can create a
+    // linked worktree from it. This pins classifyCheckout as the sole verdict.
+    const { root, originPath, repoName, db } = seed();
+    db.query("UPDATE repos SET path = ? WHERE name = ?").run(originPath, repoName);
+
+    const result = addWorktree({ repo: repoName, task: "bare-parent" });
+
+    expect(result.path).toBe(join(root, repoName, "bare-parent"));
+    expect(result.lease.git_common_dir).toBe(realpathSync(originPath));
+    expect(git(originPath, ["worktree", "list", "--porcelain"])).toContain(realpathSync(result.path));
+  });
+
   test("refuses an occupied path and leaves its contents untouched", () => {
     // THE REGRESSION THIS PINS. iapp-factory's addWorktree began by force-removing
     // whatever sat at the target path — `git worktree remove --force`, `prune`,
