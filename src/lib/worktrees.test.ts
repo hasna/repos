@@ -153,11 +153,25 @@ describe("worktree name and path computation", () => {
     // $HOME is process environment state any caller can set. If the root moved
     // with it, every containment check in this module would be bypassable by
     // one exported variable — the cheapest possible escape.
-    const before = worktreeRootDir();
+    //
+    // The answer is compared before and after rather than against a literal,
+    // because on a container whose uid has no passwd entry the correct answer is
+    // TRUSTED_HOME_UNAVAILABLE — and "it refuses identically with a forged HOME"
+    // is the same property as "it answers identically with a forged HOME".
+    const read = () => {
+      try {
+        return `path:${worktreeRootDir()}`;
+      } catch (error) {
+        return `error:${(error as WorktreeError).code}`;
+      }
+    };
+    const before = read();
+    expect(before === "error:TRUSTED_HOME_UNAVAILABLE" || before.startsWith("path:/")).toBe(true);
+
     const original = process.env["HOME"];
     process.env["HOME"] = "/tmp/not-the-real-home";
     try {
-      expect(worktreeRootDir()).toBe(before);
+      expect(read()).toBe(before);
     } finally {
       if (original === undefined) delete process.env["HOME"];
       else process.env["HOME"] = original;
