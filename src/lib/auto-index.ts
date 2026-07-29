@@ -134,6 +134,14 @@ function emptyHookSummary(): ReturnType<typeof installPostCommitHooks> {
   };
 }
 
+function appendDanglingWarning(
+  message: string,
+  hooks: ReturnType<typeof installPostCommitHooks>,
+): string {
+  const dangling = describeDanglingCheckouts(hooks);
+  return dangling ? `${message}; [warn] ${dangling}` : message;
+}
+
 function getAutomationState<T>(key: string): { value: T; updatedAt: string } | null {
   const db = getDb();
   const row = db.query("SELECT value, updated_at FROM automation_state WHERE key = ?").get(key) as {
@@ -1099,9 +1107,10 @@ export async function ensureWorkspaceBootstrap(
 
   const repoPaths = discoverRepos(roots);
   const hooks = installPostCommitHooks(repoPaths, getHookQueuePath());
-  const danglingReport = describeDanglingCheckouts(hooks);
-  if (danglingReport) opts.onProgress?.(`[warn] ${danglingReport}`);
-  opts.onProgress?.(`Bootstrapping repo index from ${roots.join(", ")}`);
+  opts.onProgress?.(appendDanglingWarning(
+    `Bootstrapping repo index from ${roots.join(", ")}`,
+    hooks,
+  ));
   const scan = await scanRepoPaths(repoPaths, {
     full: opts.full,
     onProgress: opts.onProgress,
@@ -1191,12 +1200,10 @@ export async function startAutoIndexWorker(
 
         knownRepos.add(repoPath);
         const hooks = installPostCommitHooks([repoPath], getHookQueuePath());
-        const dangling = describeDanglingCheckouts(hooks);
-        opts.onProgress?.(
-          dangling
-            ? `[warn] ${dangling}`
-            : `[new] discovered ${basename(repoPath)} (${hooks.installed} hook installed, ${hooks.updated} updated)`,
-        );
+        opts.onProgress?.(appendDanglingWarning(
+          `[new] discovered ${basename(repoPath)} (${hooks.installed} hook installed, ${hooks.updated} updated)`,
+          hooks,
+        ));
         scheduleScan(repoPath, "workspace-watch");
       });
       rootWatchers.push(watcher);
@@ -1218,12 +1225,10 @@ export async function startAutoIndexWorker(
       if (knownRepos.has(repoPath)) continue;
       knownRepos.add(repoPath);
       const hooks = installPostCommitHooks([repoPath], getHookQueuePath());
-      const dangling = describeDanglingCheckouts(hooks);
-      opts.onProgress?.(
-        dangling
-          ? `[warn] ${dangling}`
-          : `[new] found ${basename(repoPath)} during rescan (${hooks.installed} hook installed, ${hooks.updated} updated)`,
-      );
+      opts.onProgress?.(appendDanglingWarning(
+        `[new] found ${basename(repoPath)} during rescan (${hooks.installed} hook installed, ${hooks.updated} updated)`,
+        hooks,
+      ));
       scheduleScan(repoPath, "workspace-rescan");
     }
   }, cfg.workspaceRescanIntervalMs ?? 30000);

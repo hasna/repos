@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
 import { execSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
@@ -8,9 +8,11 @@ import { listRepos } from "../db/repos";
 import {
   cleanupRemoteIdentities,
   ensureWorkspaceBootstrap,
+  startAutoIndexWorker,
   syncRepoCatalog,
   type ReposRemoteSyncClient,
 } from "./auto-index";
+import { clearConfigCache } from "./config";
 import { HOOK_MARKER_START } from "./repo-hooks";
 
 const TEST_DIR = join(tmpdir(), `repos-auto-index-${process.pid}`);
@@ -254,8 +256,35 @@ function createTestRepo(name: string, commits = 1): string {
   return repoPath;
 }
 
+function configureFastAutoIndexWorker(): void {
+  const configPath = join(TEST_DIR, "auto-index-config.json");
+  writeFileSync(configPath, JSON.stringify({
+    hookPollIntervalMs: 1000,
+    watchDebounceMs: 10,
+    workspaceRescanIntervalMs: 20,
+  }));
+  process.env["HASNA_REPOS_CONFIG_PATH"] = configPath;
+  clearConfigCache();
+}
+
+async function waitForProgress(
+  messages: string[],
+  predicate: (message: string) => boolean,
+  timeoutMs = 3000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const match = messages.find(predicate);
+    if (match) return match;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for auto-index progress. Received: ${messages.join(" | ")}`);
+}
+
 beforeEach(() => {
   closeDb();
+  delete process.env["HASNA_REPOS_CONFIG_PATH"];
+  clearConfigCache();
   process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
   process.env["HASNA_REPOS_HOOK_QUEUE_PATH"] = join(TEST_DIR, "hook-events.tsv");
   delete process.env["HASNA_REPOS_STORAGE_MODE"];
@@ -272,7 +301,9 @@ beforeEach(() => {
 
 afterAll(() => {
   closeDb();
+  clearConfigCache();
   rmSync(TEST_DIR, { recursive: true, force: true });
+  delete process.env["HASNA_REPOS_CONFIG_PATH"];
   delete process.env["HASNA_REPOS_DB_PATH"];
   delete process.env["HASNA_REPOS_HOOK_QUEUE_PATH"];
   delete process.env["HASNA_REPOS_STORAGE_MODE"];
@@ -287,8 +318,12 @@ afterAll(() => {
 describe("auto-index", () => {
   it("bootstraps a workspace and installs post-commit hooks", async () => {
     const repoPath = createTestRepo("bootstrap-repo", 2);
+    const messages: string[] = [];
 
-    const result = await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
+    const result = await ensureWorkspaceBootstrap([TEST_DIR], {
+      onProgress: (message) => messages.push(message),
+      syncRemote: false,
+    });
     const hookPath = join(repoPath, ".git", "hooks", "post-commit");
 
     expect(result.bootstrapped).toBe(true);
@@ -296,10 +331,80 @@ describe("auto-index", () => {
     expect(result.hooks.installed).toBe(1);
     expect(listRepos().length).toBe(1);
     expect(readFileSync(hookPath, "utf-8")).toContain(HOOK_MARKER_START);
+    expect(messages).toContain(`Bootstrapping repo index from ${TEST_DIR}`);
 
     const second = await ensureWorkspaceBootstrap([TEST_DIR], { syncRemote: false });
     expect(second.bootstrapped).toBe(false);
     expect(second.hooks.unchanged).toBe(0);
+  });
+
+  it("warns about a dangling checkout without hiding watcher discovery or indexing", async () => {
+    configureFastAutoIndexWorker();
+    const messages: string[] = [];
+    const orphan = join(TEST_DIR, "watcher-orphan");
+    mkdirSync(orphan);
+    const worker = await startAutoIndexWorker([TEST_DIR], {
+      onProgress: (message) => messages.push(message),
+      syncRemote: false,
+    });
+
+    try {
+      writeFileSync(
+        join(orphan, ".git"),
+        `gitdir: ${join(TEST_DIR, "gone-repo", ".git", "worktrees", "watcher-orphan")}\n`,
+      );
+
+      const discovery = await waitForProgress(
+        messages,
+        (message) => message.startsWith("[new] discovered watcher-orphan"),
+      );
+      expect(discovery).toContain("[warn]");
+      expect(discovery).toContain("orphan worktrees");
+      expect(discovery).toContain("watcher-orphan");
+      await waitForProgress(
+        messages,
+        (message) => message.startsWith("[workspace-watch] watcher-orphan indexed"),
+      );
+    } finally {
+      worker.stop();
+    }
+  });
+
+  it("discovers and schedules a new repository during the rescan timer", async () => {
+    configureFastAutoIndexWorker();
+    const messages: string[] = [];
+    const worker = await startAutoIndexWorker([TEST_DIR], {
+      onProgress: (message) => messages.push(message),
+      syncRemote: false,
+    });
+    const stagingRoot = `${TEST_DIR}-rescan-staging`;
+
+    try {
+      rmSync(stagingRoot, { recursive: true, force: true });
+      mkdirSync(stagingRoot, { recursive: true });
+      const stagedRepo = join(stagingRoot, "rescan-repo");
+      mkdirSync(stagedRepo);
+      execSync("git init", { cwd: stagedRepo, stdio: "pipe" });
+      execSync('git config user.email "test@test.com"', { cwd: stagedRepo, stdio: "pipe" });
+      execSync('git config user.name "Test User"', { cwd: stagedRepo, stdio: "pipe" });
+      writeFileSync(join(stagedRepo, "file.txt"), "content");
+      execSync("git add .", { cwd: stagedRepo, stdio: "pipe" });
+      execSync('git commit -m "commit"', { cwd: stagedRepo, stdio: "pipe" });
+      renameSync(stagedRepo, join(TEST_DIR, "rescan-repo"));
+
+      const discovery = await waitForProgress(
+        messages,
+        (message) => message.startsWith("[new] found rescan-repo during rescan"),
+      );
+      expect(discovery).not.toContain("[warn]");
+      await waitForProgress(
+        messages,
+        (message) => message.startsWith("[workspace-rescan] rescan-repo indexed"),
+      );
+    } finally {
+      worker.stop();
+      rmSync(stagingRoot, { recursive: true, force: true });
+    }
   });
 
   it("pushes the local catalog to an app-owned remote sync store", async () => {
