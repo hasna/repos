@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Hook resolution failures are now public and classified.** The package root exports
+  `resolveGitDirDetailed`, `GitDirResolution`, and `describeDanglingCheckouts`.
+  `HookInstallResult.reason` may now be `missing_repo_root`, `missing_git_dir`,
+  `dangling_git_dir`, `not_a_git_dir`, `unreadable_git_dir`, or `install_failed`,
+  and may include an `error` string when installation fails.
+
 Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adopt | release`.
 
 - **The path is computed, never supplied.** `add` takes a repo and a name and places the

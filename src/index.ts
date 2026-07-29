@@ -102,7 +102,14 @@ export type {
 } from "./lib/repo-lifecycle.js";
 export { resolveTrustedAccountHome } from "./lib/account-home.js";
 export { getSourceMachineId } from "./lib/machine-id.js";
-export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
+export {
+  describeDanglingCheckouts,
+  drainHookQueue,
+  installPostCommitHook,
+  installPostCommitHooks,
+  resolveGitDirDetailed,
+} from "./lib/repo-hooks.js";
+export type { GitDirResolution } from "./lib/repo-hooks.js";
 export { discoverRepos, scanRepoPaths, scanRepos, watchRepos } from "./lib/scanner.js";
 export {
   syncGithubPRs,

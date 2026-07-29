@@ -2,9 +2,10 @@ import { afterAll, beforeEach, describe, expect, it } from "bun:test";
 import { execSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { describeDanglingCheckouts, resolveGitDirDetailed } from "../index";
+import type { GitDirResolution } from "../index";
 import {
   HOOK_MARKER_START,
-  describeDanglingCheckouts,
   drainHookQueue,
   installPostCommitHook,
   installPostCommitHooks,
@@ -37,6 +38,15 @@ afterAll(() => {
 });
 
 describe("resolveGitDir", () => {
+  it("exports detailed resolution from the package root", () => {
+    const bare = join(TEST_DIR, "public-resolution");
+    mkdirSync(bare, { recursive: true });
+
+    const resolution: GitDirResolution = resolveGitDirDetailed(bare);
+
+    expect(resolution).toEqual({ status: "missing_git_dir" });
+  });
+
   it("returns null and fabricates nothing when the .git file points at a missing gitdir", () => {
     // An orphan worktree: the checkout survives, but the repository it belonged to is gone.
     const goneRepo = join(TEST_DIR, "gone-repo");
