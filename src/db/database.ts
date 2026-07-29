@@ -857,20 +857,35 @@ const MIGRATIONS: Migration[] = [
           last_error TEXT,
           UNIQUE(repo_id, machine_id, task_id, run_id, base_ref)
         );
+      `);
 
+      // The shape check runs BEFORE the indexes, and that ordering is the whole
+      // point of splitting the statements.
+      //
+      // Adversarial review found the first version of this migration unusable on
+      // exactly the station it was written to protect: with the indexes in the
+      // same `exec` block, `CREATE INDEX … ON worktree_leases(repo_id)` reached a
+      // pre-existing table that has no `repo_id` and SQLite raised "no such
+      // column: repo_id" first. The diagnostic below never ran — it was dead
+      // code for its only input — and because the migration marker is written
+      // after `run()`, every subsequent `getDb()` failed the same way. One
+      // divergent table bricked every `repos` verb on that station with no
+      // in-CLI recovery.
+      const present = columnNames(db, "worktree_leases");
+      const missing = WORKTREE_LEASE_COLUMNS.filter((column) => !present.has(column));
+      if (missing.length > 0) {
+        throw new Error(
+          `worktree_leases exists with an unexpected schema; missing columns: ${missing.join(", ")}. `
+          + "Back up ~/.hasna/repos/repos.db, then rename or drop the table so this migration can create it.",
+        );
+      }
+
+      db.exec(`
         CREATE INDEX IF NOT EXISTS idx_worktree_leases_repo ON worktree_leases(repo_id);
         CREATE INDEX IF NOT EXISTS idx_worktree_leases_task ON worktree_leases(task_id);
         CREATE INDEX IF NOT EXISTS idx_worktree_leases_status ON worktree_leases(status);
         CREATE INDEX IF NOT EXISTS idx_worktree_leases_machine ON worktree_leases(machine_id);
       `);
-
-      const present = columnNames(db, "worktree_leases");
-      const missing = WORKTREE_LEASE_COLUMNS.filter((column) => !present.has(column));
-      if (missing.length > 0) {
-        throw new Error(
-          `worktree_leases exists with an unexpected schema; missing columns: ${missing.join(", ")}`,
-        );
-      }
     },
   },
 ];

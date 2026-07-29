@@ -18,6 +18,15 @@
  *   - the module references no credential name *and* the same scanner, run over
  *     a file that does reference them, flags every one.
  *
+ * It also pins the LIMIT, which the first version of this file did not and which
+ * adversarial review was right to call an overclaim. Every fixture here uses a
+ * local bare-path origin — an input that can never demand authentication, so on
+ * its own it cannot tell "needs no credential" apart from "needs one this
+ * fixture never asks for". The last test therefore points the same code at an
+ * endpoint that genuinely returns 401 and asserts the hard failure, so the
+ * boundary between what this plane does and does not deliver is measured rather
+ * than asserted in prose.
+ *
  * No credential value is ever read, printed or asserted on. The probes report
  * booleans, counts and variable *names*.
  */
@@ -172,6 +181,7 @@ const report = {
 };
 
 try {
+  if (process.env.DRIVER_SKIP_PROBES === "1") throw new Error("skipped");
   execFileSync("gh", ["auth", "status"], { stdio: ["ignore", "pipe", "pipe"], timeout: 20000 });
   report.gh_auth_status_rc = 0;
 } catch (error) {
@@ -238,6 +248,19 @@ function runDriver(
   return { report, code: result.exitCode, stderr };
 }
 
+/** First line of a child's stdout, without draining the whole stream. */
+async function readFirstLine(child: { stdout: ReadableStream<Uint8Array> }): Promise<string> {
+  const reader = child.stdout.getReader();
+  let buffered = "";
+  while (!buffered.includes("\n")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffered += new TextDecoder().decode(value);
+  }
+  reader.releaseLock();
+  return buffered;
+}
+
 describe("the worktree plane needs no GitHub credential", () => {
   test("add, list and remove all succeed in a child process holding no credential", () => {
     const seeded = seed();
@@ -300,6 +323,62 @@ describe("the worktree plane needs no GitHub credential", () => {
     expect(report.gh_hosts_file_reachable).toBe(true);
     expect(report.gh_auth_status_rc).toBe(0);
   });
+});
+
+describe("the limit of the claim", () => {
+  test("a remote that demands authentication hard-fails, with no credential to offer", async () => {
+    // THE CAVEAT, MEASURED. `add` fetches the base through the parent checkout's
+    // own remote, so a private https remote needs whatever ambient git
+    // credential that remote demands. With none, the verb fails closed rather
+    // than branching off a stale local ref — correct behaviour, and also the
+    // precise reason the credential broker (design Phase 2) is not optional.
+    //
+    // The endpoint is local and answers git's ref-discovery request with 401, so
+    // this is a real authentication demand rather than a connection failure
+    // standing in for one.
+    //
+    // It runs in its own PROCESS, not in this one: the driver is launched with
+    // `Bun.spawnSync`, which blocks this thread, so a `Bun.serve` here could
+    // never answer and git would sit until its 120-second timeout. That is not a
+    // hypothetical — it is what the first version of this test did.
+    const seeded = seed();
+    const serverPath = join(tempDir, "auth-server.ts");
+    writeFileSync(
+      serverPath,
+      `const server = Bun.serve({ port: 0, fetch: () => new Response("authentication required", {\n`
+      + `  status: 401, headers: { "WWW-Authenticate": 'Basic realm=\"git\"' } }) });\n`
+      + `process.stdout.write(String(server.port) + "\\n");\n`
+      + `await Bun.sleep(120000);\n`,
+    );
+    const server = Bun.spawn({ cmd: ["bun", "run", serverPath], stdout: "pipe", stderr: "pipe" });
+    try {
+      const parsedPort = Number.parseInt((await readFirstLine(server)).trim(), 10);
+      expect(Number.isInteger(parsedPort) && parsedPort > 0).toBe(true);
+
+      execFileSync("git", ["remote", "set-url", "origin", `http://127.0.0.1:${parsedPort}/private.git`], {
+        cwd: seeded.clonePath,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 30_000,
+      });
+
+      const { report } = runDriver(
+        seeded,
+        sanitizedEnv(seeded, {
+          DRIVER_EXERCISE: "1",
+          DRIVER_ROOT: seeded.root,
+          // The gh probes are covered above; this case is about one code path.
+          DRIVER_SKIP_PROBES: "1",
+        }),
+      );
+      expect(report.credential_env_names).toEqual([]);
+      expect(report.ok).toBe(false);
+      expect(report.error).toContain("BASE_REF_UNRESOLVABLE");
+      // Nothing was created for the failed claim.
+      expect(existsSync(join(seeded.root, "open-credfree", "credfree-check"))).toBe(false);
+    } finally {
+      server.kill();
+    }
+  }, 60_000);
 });
 
 describe("the worktree module names no credential", () => {

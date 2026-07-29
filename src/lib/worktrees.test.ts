@@ -308,6 +308,18 @@ describe("addWorktree", () => {
     expect(existsSync(marker)).toBe(true);
   });
 
+  test("the reuse path reports how the base was actually resolved", () => {
+    // Adversarial-review finding P2-4: `source` was hardcoded to "origin" on
+    // re-entry, so the field that exists to evidence the fail-closed fetch
+    // fabricated itself on the second call.
+    const { repoName } = seed({ withOrigin: false });
+    const first = addWorktree({ repo: repoName, task: "base-source" });
+    expect(first.base.source).toBe("local");
+    const second = addWorktree({ repo: repoName, task: "base-source" });
+    expect(second.reused).toBe(true);
+    expect(second.base.source).toBe("local");
+  });
+
   test("requires exactly one of --task and --name", () => {
     const { repoName } = seed();
     expect(codeOf(() => addWorktree({ repo: repoName }))).toBe("INVALID_REQUEST");
@@ -386,6 +398,53 @@ describe("removeWorktree", () => {
 
     const forced = removeWorktree({ ref: created.lease.lease_id, discardChanges: true });
     expect(existsSync(join(forced.evidence_path!, "branch.bundle"))).toBe(true);
+  });
+
+  test("the archive bundles what is actually about to be destroyed, not what the lease says", () => {
+    // Adversarial-review finding P1-1. The bundle was built from the lease's
+    // branch. A detached HEAD — rebase, bisect, an explicit `checkout --detach`,
+    // all ordinary — puts the commits somewhere that branch does not point, so
+    // `remove --discard-changes` counted them as unpushed, bundled the wrong
+    // ref, destroyed the worktree, and reported an evidence path as though the
+    // archive were complete. The commits existed on no ref afterwards.
+    const { clonePath, repoName } = seed();
+    const created = addWorktree({ repo: repoName, task: "detached" });
+    git(created.path, ["checkout", "--detach", "--quiet", "HEAD"]);
+    const lost = commit(created.path, "ONLY-ON-DETACHED-HEAD.md", "the commit that must survive\n");
+
+    const forced = removeWorktree({ ref: created.lease.lease_id, discardChanges: true });
+    expect(forced.removed).toBe(true);
+
+    const bundlePath = join(forced.evidence_path!, "branch.bundle");
+    expect(existsSync(bundlePath)).toBe(true);
+    // Contents, not existence: a bundle of the wrong ref satisfies existsSync.
+    const heads = git(clonePath, ["bundle", "list-heads", bundlePath]);
+    expect(heads).toContain(lost);
+    // And the archive checked itself: no INCOMPLETE marker means the bundle was
+    // verified to contain HEAD, not merely written.
+    expect(existsSync(join(forced.evidence_path!, "INCOMPLETE.txt"))).toBe(false);
+  });
+
+  test("deletes the branch this worktree has checked out, not the one the lease claims", () => {
+    // Adversarial-review finding P2-3. The lease's branch is a stored value. It
+    // goes stale the moment anyone switches branches inside the worktree, and
+    // `adopt --all --apply` freezes an adopt-time name into every lease. Deleting
+    // by that name reached into the parent checkout — often a shared clone — and
+    // force-deleted an unrelated live branch, silently, because the delete runs
+    // with allowFailure.
+    const { clonePath, repoName } = seed();
+    const created = addWorktree({ repo: repoName, task: "stale-lease-branch" });
+    git(clonePath, ["branch", "keep-me-please"]);
+    git(created.path, ["checkout", "-b", "actually-checked-out", "--quiet"]);
+    getDb().prepare("UPDATE worktree_leases SET branch = 'keep-me-please' WHERE lease_id = ?")
+      .run(created.lease.lease_id);
+
+    const result = removeWorktree({ ref: created.lease.lease_id, discardChanges: true });
+    expect(result.branch).toBe("actually-checked-out");
+
+    const branches = git(clonePath, ["branch", "--format=%(refname:short)"]).split("\n");
+    expect(branches).toContain("keep-me-please");
+    expect(branches).not.toContain("actually-checked-out");
   });
 
   test("refuses when the lease path has been replaced by a symlink out of the root", () => {
@@ -494,6 +553,9 @@ describe("listWorktrees", () => {
     expect(byPath.get(flat)?.issues).toContain("flat-layout");
     expect(byPath.get(flat)?.issues).toContain("no-lease");
     expect(byPath.get(stationDir)?.issues).toContain("nested-layout");
+    // The repo segment is carried down, or `worktree list <repo>` filters out a
+    // violation sitting literally inside that repo's directory.
+    expect(byPath.get(stationDir)?.repo_name).toBe("station01");
     expect(byPath.get(orphan.path)?.issues).toContain("missing-directory");
     // A lease whose directory is gone still reports the repo segment it lived
     // under, so `worktree list <repo>` can surface it.

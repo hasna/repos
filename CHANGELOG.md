@@ -35,9 +35,17 @@ Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adop
   from an out-of-tree build and had never been created by any shipped migration, so a fresh
   install did not have it while an old station silently did. Migration 14 states the schema in
   the tree and fails loudly on a divergent pre-existing shape.
-- **No GitHub credential is involved.** The whole plane runs on a station that holds none;
-  this is asserted in a child process built from an empty environment, with positive controls
-  proving the probes can detect a credential when one is present.
+- **These verbs read no credential of their own.** Nothing touches `gh`, a token environment
+  variable, or a vault — asserted in a child process built from an empty environment, with
+  positive controls proving the probes can detect a credential when one is present. The limit
+  is stated and measured rather than glossed: `add` fetches the base through the parent
+  checkout's own remote, so a private https or keyless ssh remote still needs an ambient git
+  credential and fails closed with `BASE_REF_UNRESOLVABLE` without one. A test points the same
+  code at a local endpoint returning 401 and asserts that failure.
+- **The teardown archive verifies its own output.** `--discard-changes` bundles `HEAD`, not the
+  lease's claimed branch — a detached HEAD (rebase, bisect) puts commits where that branch does
+  not point — and then checks the bundle actually contains `HEAD`, writing an `INCOMPLETE.txt`
+  rather than reporting a successful archive it did not take.
 
 ## 0.1.36
 

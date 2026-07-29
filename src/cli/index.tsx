@@ -873,9 +873,13 @@ registry
  *     whatever path it was handed; here there is no argument in which a victim
  *     path can be passed.
  *
- * None of these verbs touch a GitHub credential. Base refs are fetched through
- * the parent checkout's own remote configuration, so a station holding no
- * GitHub credential at all still has the full worktree plane.
+ * None of these verbs read a credential of their own — no `gh`, no token
+ * environment variable, no vault. They are not credential-free end to end,
+ * though, and the first version of this comment claimed they were: `add`
+ * fetches the base ref through the parent checkout's own remote, so a private
+ * https remote or a keyless ssh remote still needs whatever ambient git
+ * credential that remote demands, and without one `add` fails closed with
+ * BASE_REF_UNRESOLVABLE. Closing that gap is the credential broker's job.
  */
 const worktree = program
   .command("worktree")
@@ -944,6 +948,12 @@ worktree
         staleDays: intFlag(String(opts.staleDays), "--stale-days", 0),
       });
       const entries = repo ? result.entries.filter((entry) => entry.repo_name === repo) : result.entries;
+      // A repo filter cannot express a violation that belongs to no repo — a
+      // checkout sitting flat at the root has no repo segment by definition.
+      // Say how many were set aside rather than let the filter read as "clean".
+      const hiddenViolations = repo
+        ? result.entries.filter((entry) => entry.repo_name !== repo && entry.issues.length > 0).length
+        : 0;
       // Recomputed, not carried over: a summary describing the whole root next
       // to a filtered listing reads as "this repo has 1468 problems".
       const summary = {
@@ -953,7 +963,7 @@ worktree
         on_disk: entries.filter((entry) => entry.on_disk).length,
       };
       if (json) {
-        printJson({ ...result, entries, summary });
+        printJson({ ...result, entries, summary: { ...summary, hidden_issue_entries: hiddenViolations } });
         return;
       }
       console.log(chalk.bold(`Worktrees under ${result.root}`));
@@ -962,6 +972,11 @@ worktree
         console.log(`  ${flags} ${compactText(entry.path, 110)}`);
       }
       console.log(chalk.dim(`  ${entries.length} entr(ies), ${summary.issue_count} with issues.`));
+      if (hiddenViolations > 0) {
+        console.log(chalk.dim(
+          `  ${hiddenViolations} entr(ies) with issues are outside this repo's segment; run without a repo to see them.`,
+        ));
+      }
     } catch (error) {
       printWorktreeError(error, json, WORKTREE_LIST_SCHEMA);
     }

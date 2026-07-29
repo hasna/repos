@@ -179,12 +179,18 @@ copied.
 and it is a dry run unless `--apply` is given — 444 top-level entries is not a corpus anybody
 should mutate on the strength of a flag typed once.
 
-**None of these verbs touch a GitHub credential.** Base refs are fetched through the parent
-checkout's existing remote configuration; nothing here reads `gh`, a token environment
-variable, or a vault. A station holding no GitHub credential at all still has the whole
-worktree plane, and `src/lib/worktrees-credential-isolation.test.ts` proves it in a child
-process built from an empty environment, with positive controls showing the probes can
-detect a credential when one is present.
+**These verbs read no credential of their own.** Nothing here touches `gh`, a token
+environment variable, or a vault, and `src/lib/worktrees-credential-isolation.test.ts` proves
+it in a child process built from an empty environment, with positive controls showing the
+probes can detect a credential when one is present.
+
+That is not the same as "works with no credential on the station". `add` fetches the base ref
+through the parent checkout's existing remote, so a **private https remote or an ssh remote
+without a key still needs whatever ambient git credential that remote demands** — without one,
+`add` fails closed with `BASE_REF_UNRESOLVABLE`. That limit is measured, not assumed: a test
+points the same code at a local endpoint returning 401 and asserts the hard failure. Public
+remotes, local remotes, and repos with no remote need nothing. Removing the remaining
+dependency is what the credential broker (design Phase 2) is for.
 
 ### Registry prune
 

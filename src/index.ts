@@ -55,7 +55,6 @@ export {
   redactGitDiagnostics,
   releaseWorktree,
   removeWorktree,
-  setWorktreeRootForTests,
   worktreeRootDir,
 } from "./lib/worktrees.js";
 export type {

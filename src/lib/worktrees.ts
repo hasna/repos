@@ -35,12 +35,20 @@
  *
  * ## What this plane deliberately does not do
  *
- * It touches no network credential. Fetching a base ref uses the parent
- * checkout's existing remote configuration; nothing here reads `gh`, a token
- * env var, or the vault. That is what makes the worktree plane shippable ahead
- * of the credential broker: a station with no GitHub credential at all still
- * gets full worktree capability. `src/lib/worktrees-credential-isolation.test.ts`
- * asserts that with a positive control.
+ * It reads no credential of its own. Nothing here touches `gh`, a token
+ * environment variable, or the vault, and
+ * `src/lib/worktrees-credential-isolation.test.ts` asserts that with positive
+ * controls.
+ *
+ * It is NOT true that the plane works with no credential on the station at all,
+ * and the first version of this comment said so. `add` fetches the base ref
+ * through the parent checkout's existing remote configuration, so for a private
+ * https remote or an ssh remote without a key the fetch needs whatever ambient
+ * git credential that remote demands, and without one `add` hard-fails with
+ * BASE_REF_UNRESOLVABLE — measured, and pinned by a test. That is the design's
+ * stated Phase 1 caveat, and it is what the credential broker (Phase 2) exists
+ * to remove. Public remotes, local remotes, and repos with no remote need
+ * nothing.
  */
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -49,6 +57,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   realpathSync,
   writeFileSync,
@@ -169,8 +178,18 @@ export interface WorktreeLease {
  */
 export function redactGitDiagnostics(text: string): string {
   return text
-    .replace(/(\w+:\/\/)[^\s/@]*:[^\s/@]*@/g, "$1<redacted>@")
-    .replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, "$1<redacted>");
+    // The whole authority, up to the LAST `@` before the host. Matching
+    // `user:pass@` specifically missed two shapes adversarial review found:
+    // `https://<token>@host` (no colon at all — how GitLab and GitHub PATs are
+    // usually embedded) and a password containing `@`, which left its tail in
+    // the clear as `https://<redacted>@ss@host`.
+    .replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/]*@/g, "$1<redacted>@")
+    // Bare tokens outside a URL. Provider prefixes are enumerated rather than
+    // guessed at, and this list is expected to grow.
+    .replace(
+      /\b(gh[pousr]_|github_pat_|glpat-|glrt-|xoxb-|sk-ant-|sk-proj-|npm_|AKIA)[A-Za-z0-9_-]+/g,
+      "$1<redacted>",
+    );
 }
 
 interface GitOptions {
@@ -403,6 +422,23 @@ function repoIdentity(repo: Repo): string {
 
 // ── leases ───────────────────────────────────────────────────────────────────
 
+/**
+ * How the base was resolved when the lease was first claimed.
+ *
+ * The reuse path used to return a hardcoded `"origin"`, so a worktree branched
+ * from a repo with no remote reported `local` on creation and `origin` on
+ * re-entry — the field that exists to evidence the fail-closed fetch fabricated
+ * itself on the second call. The lease's own metadata has the answer.
+ */
+function recordedBaseSource(lease: WorktreeLease): "origin" | "local" {
+  try {
+    const metadata = JSON.parse(lease.owner_metadata) as { base_source?: unknown };
+    return metadata.base_source === "local" ? "local" : "origin";
+  } catch {
+    return "origin";
+  }
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -573,14 +609,41 @@ function assertRefArgument(
   return value;
 }
 
-/** Is this directory a *linked* worktree, as opposed to a primary checkout? */
+/**
+ * Is this directory a *linked* worktree, as opposed to a primary checkout, a
+ * submodule, or an ordinary directory?
+ *
+ * Read from the filesystem rather than by asking git. `git worktree add` writes
+ * `.git` as a FILE holding `gitdir: <common>/worktrees/<name>`, while a primary
+ * checkout has `.git` as a directory and a submodule's pointer goes to
+ * `<parent>/.git/modules/<name>` — so the `worktrees/` segment in the pointer is
+ * the exact discriminator, and it needs no subprocess.
+ *
+ * That matters at the scale this runs at: `worktree list` measured 54 seconds on
+ * the live root because this predicate spawned two `git rev-parse` processes for
+ * each of roughly 1,900 candidate directories. Reading one small file instead
+ * removes ~3,800 process spawns from a read-only report.
+ */
 function isLinkedWorktree(path: string): boolean {
-  const gitDir = gitOut(path, ["rev-parse", "--path-format=absolute", "--git-dir"], { allowFailure: true });
-  const commonDir = gitOut(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-    allowFailure: true,
-  });
-  if (!gitDir || !commonDir) return false;
-  return realpathOrSelf(gitDir) !== realpathOrSelf(commonDir);
+  const pointer = join(path, ".git");
+  let stats;
+  try {
+    stats = lstatSync(pointer);
+  } catch {
+    return false;
+  }
+  // A primary checkout keeps its object store here; it is not a linked worktree.
+  if (stats.isDirectory()) return false;
+  if (!stats.isFile()) return false;
+  try {
+    const gitdir = readFileSync(pointer, "utf8").match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (!gitdir) return false;
+    // `<common>/worktrees/<name>` is git's linked-worktree layout. A submodule
+    // points at `<parent>/.git/modules/<name>` and is correctly excluded.
+    return /(^|\/)worktrees\/[^/]+\/?$/.test(gitdir);
+  } catch {
+    return false;
+  }
 }
 
 export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
@@ -651,7 +714,7 @@ export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
       path: existing.worktree_path,
       created: false,
       reused: true,
-      base: { ref: existing.base_ref, sha: existing.base_sha, source: "origin" },
+      base: { ref: existing.base_ref, sha: existing.base_sha, source: recordedBaseSource(existing) },
       lease: leaseById(db, existing.lease_id)!,
     };
   }
@@ -674,6 +737,21 @@ export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
 
   mkdirSync(dirname(target), { recursive: true });
   runGit(parent.path, ["worktree", "add", "--quiet", "-b", branch, target, base.sha]);
+
+  // Re-assert containment on what was actually created. The check above ran
+  // before `git worktree add`, and nothing stops a component of the path from
+  // being replaced with a symlink in between on a shared station. This does not
+  // close the race — it detects the outcome, and reports rather than deletes,
+  // because deleting a path that just moved out of the root is the exact
+  // mistake this module exists to prevent.
+  const created = resolveThroughExisting(target);
+  if (!isWithin(realpathOrSelf(root), created)) {
+    fail("LAYOUT_INVARIANT_VIOLATED", "the created worktree does not resolve inside the canonical root", {
+      path: created,
+      root,
+      hint: "nothing was removed; inspect the path before acting on it",
+    });
+  }
 
   const timestamp = nowIso();
   const lease: WorktreeLease = {
@@ -881,35 +959,63 @@ function archiveBeforeReap(target: ResolvedTarget, leaseId: string): string {
   );
   mkdirSync(evidenceDir, { recursive: true });
 
+  // Each capture records its own failure. `runGit` caps child output at 32 MB,
+  // so a diff larger than that throws, is swallowed by `allowFailure`, and would
+  // otherwise be written as an empty patch next to a successful-looking
+  // `evidence_path`. An archive that silently omits something is worse than one
+  // that says what it could not take.
+  const incomplete: string[] = [];
+  const capture = (file: string, args: string[]) => {
+    const result = runGit(target.path, args, { allowFailure: true });
+    writeFileSync(join(evidenceDir, file), `${result.stdout}\n`);
+    if (!result.ok) incomplete.push(`${file}: git ${args[0]} failed: ${result.stderr}`);
+  };
+
   const status = gitOut(target.path, ["status", "--porcelain"], { allowFailure: true });
   writeFileSync(join(evidenceDir, "dirty-status.txt"), `${status}\n`);
-  writeFileSync(
-    join(evidenceDir, "tracked-changes.patch"),
-    `${gitOut(target.path, ["diff", "HEAD"], { allowFailure: true })}\n`,
-  );
-  writeFileSync(
-    join(evidenceDir, "untracked-files.txt"),
-    `${gitOut(target.path, ["ls-files", "--others", "--exclude-standard"], { allowFailure: true })}\n`,
-  );
+  capture("tracked-changes.patch", ["diff", "HEAD"]);
+  capture("untracked-files.txt", ["ls-files", "--others", "--exclude-standard"]);
 
   const unpushed = countUnpushedCommits(target.path);
   if (unpushed > 0) {
-    const branch = target.branch ?? gitOut(target.path, ["rev-parse", "--abbrev-ref", "HEAD"], {
+    // `HEAD` is always bundled, and it is what makes this archive honest.
+    //
+    // The first version bundled the *lease's* branch. A detached HEAD — rebase,
+    // bisect, an explicit `checkout --detach`, all ordinary — puts the commits
+    // where that branch does not point, so the unpushed count was right, the
+    // bundle was of the wrong ref, and the commits were destroyed while
+    // `evidence_path` reported an archive. `HEAD` is the ref that describes
+    // what is about to be deleted, attached or not.
+    //
+    // The checked-out branch is added alongside it when there is one, so the
+    // bundle can be restored by name. The lease's claimed branch is deliberately
+    // NOT used: it is a stored value that may have gone stale, and this is the
+    // last chance to preserve the data.
+    const revisions = ["HEAD"];
+    const headBranch = gitOut(target.path, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
+    if (headBranch && headBranch !== "HEAD" && REF_ARGUMENT_PATTERN.test(headBranch)) {
+      revisions.push(headBranch);
+    }
+    const bundlePath = join(evidenceDir, "branch.bundle");
+    const bundled = runGit(target.path, ["bundle", "create", bundlePath, ...revisions], {
       allowFailure: true,
     });
-    // The branch reaches `git bundle create <file> <rev>` as a revision
-    // argument, and a stored lease row is not a validated argument — the same
-    // reasoning as the evidence directory name above. A branch that is not
-    // ref-shaped is bundled by object id instead of by name, so the commits are
-    // still preserved and nothing hostile reaches git's option parser.
-    const revision = branch && branch !== "HEAD" && REF_ARGUMENT_PATTERN.test(branch)
-      ? branch
-      : gitOut(target.path, ["rev-parse", "HEAD"], { allowFailure: true });
-    if (revision) {
-      runGit(target.path, ["bundle", "create", join(evidenceDir, "branch.bundle"), revision], {
-        allowFailure: true,
-      });
+    if (!bundled.ok) {
+      incomplete.push(`branch.bundle: git bundle failed: ${bundled.stderr}`);
+    } else {
+      // The archive verifies its own output, because until now it did not.
+      // `git bundle create` declines an empty range without failing loudly, and
+      // an archive that reports success while holding nothing is worse than no
+      // archive: the caller acts on `evidence_path` and the commits are gone.
+      const headSha = gitOut(target.path, ["rev-parse", "HEAD"], { allowFailure: true });
+      const heads = gitOut(target.path, ["bundle", "list-heads", bundlePath], { allowFailure: true });
+      if (!headSha || !heads.includes(headSha)) {
+        incomplete.push(`branch.bundle: does not contain HEAD (${headSha.slice(0, 12) || "unresolved"})`);
+      }
     }
+  }
+  if (incomplete.length > 0) {
+    writeFileSync(join(evidenceDir, "INCOMPLETE.txt"), `${incomplete.join("\n")}\n`);
   }
   return evidenceDir;
 }
@@ -963,14 +1069,23 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
     : null;
 
   const parentForGit = target.parentPath && existsSync(target.parentPath) ? target.parentPath : resolved;
-  const branch =
-    target.branch ?? (gitOut(resolved, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true }) || null);
+  // The branch to delete is the one this worktree actually has checked out, read
+  // now, not the one the lease claims.
+  //
+  // Adversarial-review finding P2-3: the lease's branch is a stored value that
+  // goes stale the moment anyone switches branches inside the worktree, and
+  // `adopt --all --apply` would freeze an adopt-time name into every lease on
+  // this station. Deleting by that name reached into the parent checkout — often
+  // a shared clone — and force-deleted an unrelated live branch, silently,
+  // because the delete runs with `allowFailure`.
+  const headBranch = gitOut(resolved, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
+  const branch = headBranch && headBranch !== "HEAD" ? headBranch : null;
 
   runGit(parentForGit, request.discardChanges
     ? ["worktree", "remove", "--force", resolved]
     : ["worktree", "remove", resolved]);
   runGit(parentForGit, ["worktree", "prune"], { allowFailure: true });
-  if (branch && branch !== "HEAD") {
+  if (branch && REF_ARGUMENT_PATTERN.test(branch)) {
     runGit(
       parentForGit,
       request.discardChanges ? ["branch", "-D", "--", branch] : ["branch", "-d", "--", branch],
@@ -1189,7 +1304,16 @@ export function listWorktrees(options: WorktreeListOptions = {}): WorktreeListRe
         if (deeper.length > 0) {
           entries.delete(worktreeDir);
           for (const nested of deeper) {
-            const nestedEntry = record(nested, { on_disk: true, is_worktree: true });
+            // The repo segment is carried down. Adversarial-review finding P2-5:
+            // leaving it null meant `worktree list <repo>` filtered out a
+            // violation sitting literally inside `<root>/<repo>/` — 218 nested
+            // entries invisible to exactly the query that should surface them.
+            const nestedEntry = record(nested, {
+              repo_name: repoName,
+              worktree_name: nested.slice(worktreeDir.length + 1),
+              on_disk: true,
+              is_worktree: true,
+            });
             nestedEntry.issues.push("nested-layout");
           }
           continue;
