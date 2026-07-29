@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -424,6 +424,49 @@ describe("ops producers", () => {
     expect(result.task_suggestions[0]!.tags).toContain("task-lifecycle");
     expect(result.task_suggestions[0]!.metadata["publish_path"]).toBe("separate-approved-protected-release-step");
     expect(result.task_suggestions[0]!.body).toContain("Do not create or push release tags");
+  });
+
+  test("does not fetch an ancestor repo through a stale release registry path", () => {
+    const ancestor = mkdtempSync(join(tmpdir(), "open-repos-stale-release-"));
+    tempDirs.push(ancestor);
+    execFileSync("git", ["init", "--quiet"], { cwd: ancestor, stdio: "pipe" });
+    const repoPath = join(ancestor, "non-repo-child");
+    mkdirSync(repoPath);
+    writeFileSync(join(repoPath, "package.json"), JSON.stringify({ name: "@hasna/stale-release", version: "0.2.0" }));
+    upsertRepo({ path: repoPath, name: "stale-release-registry" });
+
+    const fallback = releaseRunner({
+      headSha: "abcdef1234567890abcdef1234567890abcdef12",
+      headCommittedAt: "2026-06-26T00:00:00Z",
+      latestReachableTag: "v0.1.0",
+      commitsSinceTag: "1",
+      latestGithubRelease: "v0.1.0",
+      latestNpmVersion: "0.1.0",
+      openPrCount: 0,
+      latestReleaseAncestor: true,
+      intendedTagExists: false,
+      ciRuns: [{ status: "completed", conclusion: "success", workflowName: "ci" }],
+    });
+    let fetches = 0;
+    const runner: CommandRunner = (command, args, opts) => {
+      if (command === "git" && args.includes("--show-toplevel")) return runFilesystemGit(args);
+      if (command === "git" && args.includes("fetch")) {
+        fetches++;
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return fallback(command, args, opts);
+    };
+
+    const result = buildReleaseCandidates({
+      repo: "stale-release-registry",
+      githubRepo: "hasna/stale-release",
+      runner,
+    });
+
+    expect(result.repo.path).toBe(repoPath);
+    expect(fetches).toBe(0);
+    expect(result.gates.find((gate) => gate.id === "fetch")?.message).toContain("not the top level");
+    expect(result.summary.status).toBe("blocked");
   });
 
   test("emits a release blocker task when published release state is ahead of branch state", () => {
@@ -855,6 +898,46 @@ describe("ops producers", () => {
     expect(result.task_suggestions[0]!.body).toContain("CHANGELOG/README/docs");
   });
 
+  test("does not fetch an ancestor repo through a gutted docs registry path", () => {
+    const ancestor = mkdtempSync(join(tmpdir(), "open-repos-stale-docs-"));
+    tempDirs.push(ancestor);
+    execFileSync("git", ["init", "--quiet"], { cwd: ancestor, stdio: "pipe" });
+    const repoPath = join(ancestor, "gutted-child");
+    mkdirSync(join(repoPath, ".git"), { recursive: true });
+    mkdirSync(join(repoPath, "src"));
+    writeFileSync(join(repoPath, "README.md"), "# stale docs\n");
+    writeFileSync(join(repoPath, "src", "index.ts"), "export {};\n");
+    upsertRepo({ path: repoPath, name: "stale-docs-registry" });
+
+    let fetches = 0;
+    const runner: CommandRunner = (command, args) => {
+      if (command === "git" && args.includes("--show-toplevel")) return runFilesystemGit(args);
+      if (command === "git" && args.includes("fetch")) {
+        fetches++;
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (command === "git" && args.includes("rev-parse")) return { status: 0, stdout: "abcdef1234567890\n", stderr: "" };
+      if (command === "git" && args.includes("log")) return { status: 0, stdout: "1111111111111111\n", stderr: "" };
+      if (command === "git" && args.includes("rev-list")) return { status: 0, stdout: "2\n", stderr: "" };
+      if (command === "git" && args.includes("diff")) return { status: 0, stdout: "src/index.ts\n", stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+
+    const result = buildDocsRulesDrift({
+      repo: "stale-docs-registry",
+      githubRepo: "hasna/stale-docs",
+      runner,
+    });
+
+    expect(result.repo.path).toBe(repoPath);
+    expect(fetches).toBe(0);
+    expect(result.issues.find((issue) => issue.id === "fetch")).toMatchObject({
+      severity: "high",
+      message: expect.stringContaining("not the top level"),
+    });
+    expect(result.summary.status).toBe("blocked");
+  });
+
   test("detects dependency refresh needs with Bun outdated output", () => {
     const repoPath = writePackageJsonVersion("@hasna/codewith", "0.2.0");
     const runner: CommandRunner = (command) => {
@@ -1038,6 +1121,11 @@ function writeCargoVersion(version: string): string {
   mkdirSync(join(repoPath, "codex-rs"), { recursive: true });
   writeFileSync(join(repoPath, "codex-rs", "Cargo.toml"), `[package]\nname = "codewith"\nversion = "${version}"\n`);
   return repoPath;
+}
+
+function runFilesystemGit(args: string[]): ReturnType<CommandRunner> {
+  const result = spawnSync("git", args, { encoding: "utf8" });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
 function writePackageJsonVersion(name: string, version: string, extra: Record<string, unknown> = {}): string {

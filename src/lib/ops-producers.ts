@@ -632,9 +632,13 @@ export function buildReleaseCandidates(options: ReleaseCandidateOptions): Releas
 
   const gates: ReleaseCandidateResult["gates"] = [];
   if (options.fetch !== false) {
-    const fetched = runner("git", ["-C", repoPath, "fetch", "--tags", "origin", branch], { timeoutMs });
-    if (fetched.status !== 0) {
-      gates.push({ id: "fetch", status: "block", message: `git fetch failed: ${compactPreview(fetched.stderr || fetched.stdout)}` });
+    if (!isGitWorkTreeTop(repoPath, runner, timeoutMs)) {
+      gates.push({ id: "fetch", status: "block", message: `refusing git fetch: ${repoPath} is not the top level of a Git working tree` });
+    } else {
+      const fetched = runner("git", ["-C", repoPath, "fetch", "--tags", "origin", branch], { timeoutMs });
+      if (fetched.status !== 0) {
+        gates.push({ id: "fetch", status: "block", message: `git fetch failed: ${compactPreview(fetched.stderr || fetched.stdout)}` });
+      }
     }
   }
 
@@ -942,9 +946,13 @@ export function buildDocsRulesDrift(options: DocsRulesDriftOptions): DocsRulesDr
   const issues: DocsRulesDriftResult["issues"] = [];
 
   if (options.fetch !== false) {
-    const fetched = runner("git", ["-C", repoPath, "fetch", "origin", branch], { timeoutMs });
-    if (fetched.status !== 0) {
-      issues.push({ id: "fetch", severity: "high", message: `git fetch failed: ${compactPreview(fetched.stderr || fetched.stdout)}` });
+    if (!isGitWorkTreeTop(repoPath, runner, timeoutMs)) {
+      issues.push({ id: "fetch", severity: "high", message: `refusing git fetch: ${repoPath} is not the top level of a Git working tree` });
+    } else {
+      const fetched = runner("git", ["-C", repoPath, "fetch", "origin", branch], { timeoutMs });
+      if (fetched.status !== 0) {
+        issues.push({ id: "fetch", severity: "high", message: `git fetch failed: ${compactPreview(fetched.stderr || fetched.stdout)}` });
+      }
     }
   }
 
@@ -1413,6 +1421,22 @@ function resolveRepoPath(repoInput: string): string {
     // The producer must also work in fresh/temp contexts without an initialized repos DB.
   }
   return repoInput;
+}
+
+function isGitWorkTreeTop(repoPath: string, runner: CommandRunner, timeoutMs: number): boolean {
+  // `git -C` searches upwards, so success alone does not prove that repoPath is
+  // the repository being addressed. Registry rows can outlive a checkout or
+  // retain a gutted .git directory; never let a mutating fetch reach an ancestor.
+  const toplevel = gitOutput(repoPath, runner, timeoutMs, ["rev-parse", "--show-toplevel"]);
+  if (!toplevel) return false;
+  const canonical = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  return canonical(toplevel) === canonical(repoPath);
 }
 
 function inferGithubRepo(repoPath: string, runner: CommandRunner, timeoutMs: number): string | null {
