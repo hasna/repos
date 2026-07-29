@@ -101,9 +101,19 @@ export function writeStdout(text: string, writer: SyncWriter = fdWriter(1)): Std
   return writeAllSync(text, writer);
 }
 
+/** Write `text` to stderr, completing the write before returning. */
+export function writeStderr(text: string, writer: SyncWriter = fdWriter(2)): StdoutWriteOutcome {
+  return writeAllSync(text, writer);
+}
+
 /** Write `text` plus a newline to stdout, completing the write before returning. */
 export function printLine(text: string, writer: SyncWriter = fdWriter(1)): StdoutWriteOutcome {
   return writeStdout(`${text}\n`, writer);
+}
+
+/** Write one error line to stderr, completing the write before returning. */
+export function printError(text: string, writer: SyncWriter = fdWriter(2)): StdoutWriteOutcome {
+  return writeStderr(`${text}\n`, writer);
 }
 
 /**

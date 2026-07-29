@@ -204,6 +204,33 @@ describe("repos cd refuses rather than printing an unusable path", () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("git clone https://github.com/hasna/gutted");
   });
+
+  test("delivers the complete refusal to a stderr pipe before exiting", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "repos-guard-cd-stderr-pipe-"));
+    const tail = "stderr-refusal-tail";
+    const path = join(tempDir, `${"x".repeat(70_000)}-${tail}`);
+    const dbPath = seed([{ name: "large-refusal", path }]);
+
+    // A direct Bun.spawnSync stderr capture does not reproduce the truncation.
+    // Route fd 2 through a real shell pipe: on the unfixed console.error +
+    // process.exit path, the message stops at one pipe buffer and loses `tail`.
+    const result = Bun.spawnSync({
+      cmd: [
+        "bash",
+        "-c",
+        "set -o pipefail; bun run src/cli/index.tsx cd large-refusal 2>&1 >/dev/null | cat",
+      ],
+      cwd: repoRoot,
+      env: { ...process.env, HASNA_REPOS_AUTO_BOOTSTRAP: "0", HASNA_REPOS_DB_PATH: dbPath },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toBe("");
+    expect(result.stdout.byteLength).toBeGreaterThan(65_536);
+    expect(result.stdout.toString()).toContain(tail);
+  });
 });
 
 describe("--remote prefers a checkout that works", () => {

@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
-import { printJson, writeAllSync, writeStdout, type SyncWriter } from "./stdout.js";
+import { printError, printJson, writeAllSync, writeStdout, type SyncWriter } from "./stdout.js";
 
 /** Collect everything a writer is handed, with a scriptable accept policy. */
 function recordingWriter(policy: (chunk: Uint8Array, call: number) => number | Error) {
@@ -89,6 +89,14 @@ describe("writeAllSync", () => {
     const sink = recordingWriter(() => 0);
     expect(writeStdout("", sink.writer)).toBe("complete");
     expect(sink.calls).toBe(0);
+  });
+
+  test("printError completes an error line through the supplied writer", () => {
+    const sink = recordingWriter((chunk) => Math.min(chunk.length, 37));
+    const payload = "refusal ".repeat(100);
+    expect(printError(payload, sink.writer)).toBe("complete");
+    expect(sink.text()).toBe(`${payload}\n`);
+    expect(sink.calls).toBeGreaterThan(1);
   });
 });
 
