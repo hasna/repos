@@ -47,6 +47,38 @@ Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adop
   not point — and then checks the bundle actually contains `HEAD`, writing an `INCOMPLETE.txt`
   rather than reporting a successful archive it did not take.
 
+Adds the repository plane — `repos create | clone | archive` — with the credential behind
+the CLI (R5, owner directive 2026-07-28).
+
+- **The caller's token is never the operation's authority.** `GH_TOKEN`, `GITHUB_TOKEN` and
+  their enterprise forms are scrubbed from every child the CLI spawns; the CLI resolves its
+  own credential from station config (`github.credentialCommand`, an argv whose stdout is the
+  token) or, absent one, from the station `gh`'s credential store. Asserted against the real
+  CLI with positive controls: the same probe that finds no caller token in the child finds
+  the configured command's token when one is supposed to be there.
+- **Fail closed, typed.** A configured credential command that fails, is malformed, or prints
+  nothing is `CREDENTIAL_UNAVAILABLE` raised before any child is spawned — never a silent
+  fall-through to the gh store. An unauthenticated gh maps to the same code, so automation can
+  tell a credential-plane outage from an operation failure.
+- **The resolved token never reaches the caller.** Not in results, and redacted from error
+  diagnostics even when a hostile child echoes it back on stderr — tested with the echo.
+- **No delete verb, by construction.** Archive (reversible with `--restore`) is the terminal
+  state the CLI can express, so no delete-capable credential ever needs to exist behind these
+  verbs. `archive` accepts a registry name (exact-match semantics, ambiguity refuses) or an
+  explicit `<org>/<name>`.
+- **Acquire-and-register is one contract.** `clone` and `create --dir` refuse an occupied
+  destination with its contents intact — the destroy-then-create hazard stays unrepresentable
+  on this plane too — register the checkout in the index, and fail with
+  `CLONE_REGISTER_FAILED` when registration does not land, instead of leaving disk and
+  registry to drift apart silently.
+- **Argument grammar as the injection guard.** `<org>/<name>` must start alphanumeric in both
+  segments; a leading dash (gh flag injection), a `.`/`..` segment, whitespace, or extra
+  segments are unrepresentable in the verbs' argv.
+- **Existence preflight is fail-closed.** `create` treats anything other than a clean 404 as a
+  stop — an auth failure or outage never reads as "free to create".
+- The broker (design Phase 2 — hosted mint of short-lived repo-scoped tokens) slots in as one
+  more source behind the same choke point; verbs and refusals do not change.
+
 ## 0.1.36
 
 Makes `repos prs` usable as a source of truth for pull requests (#26).

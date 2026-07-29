@@ -39,6 +39,9 @@ repos-serve  # http://localhost:19450
 | `repos worktree remove <ref>` | Remove by lease id or `<repo>/<worktree>` — never by path |
 | `repos worktree adopt [path]` | Backfill leases for worktrees that exist without one (dry run by default) |
 | `repos worktree release <lease-id>` | Mark a lease done and apply its cleanup policy |
+| `repos create <org>/<name>` | Create a GitHub repository through the CLI's own credential — the caller holds no token |
+| `repos clone <org>/<name>` | Clone one repository to `<dir>/<name>` and register it |
+| `repos archive <repo>` | Archive on GitHub, reversible with `--restore`; there is no delete verb |
 | `repos registry prune` | Retire registry rows whose path no longer exists (dry run unless explicitly confirmed) |
 | `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
 | `repos commits` | List commits |
@@ -191,6 +194,46 @@ without a key still needs whatever ambient git credential that remote demands** 
 points the same code at a local endpoint returning 401 and asserts the hard failure. Public
 remotes, local remotes, and repos with no remote need nothing. Removing the remaining
 dependency is what the credential broker (design Phase 2) is for.
+
+### Repository lifecycle
+
+`repos create`, `repos clone` and `repos archive` are the repository plane: GitHub
+mutations as verbs, with the credential *behind* the CLI. The point is the boundary, not
+the convenience — an agent calls the verb and never holds a GitHub token:
+
+```bash
+repos create hasna/scratch --description "..."          # private by default
+repos create hasna/scratch --public --dir ~/checkouts   # create, clone, register
+repos clone hasna/repos --dir ~/checkouts               # single-repo acquisition + registration
+repos archive old-experiment                             # registry name or <org>/<name>
+repos archive old-experiment --restore                   # archive is reversible
+```
+
+**Whose credential runs the operation.** Never the caller's: `GH_TOKEN`, `GITHUB_TOKEN`
+and their enterprise forms are scrubbed from every child the CLI spawns, so a token in the
+calling agent's environment is inert. The CLI resolves its own credential from station
+configuration — `github.credentialCommand` in `~/.hasna/repos/config.json`, an argv (for
+example a vault read) whose stdout is the token — or, when none is configured, from the
+station `gh`'s own credential store. A configured command that fails, is malformed, or
+prints nothing is a hard `CREDENTIAL_UNAVAILABLE` before any child is spawned; there is no
+fallback between sources, no `--use-ambient` flag, and no env-var escape hatch.
+`src/cli/repo-lifecycle-cli.test.ts` asserts all of this against the real CLI with
+positive controls, including that a token echoed back by a hostile child is redacted from
+everything the caller can read.
+
+```json
+{ "github": { "credentialCommand": ["secrets", "get", "hasnaxyz/github/live/token"] } }
+```
+
+This is the station-side half of the R5 credential design. The broker — a hosted mint
+issuing short-lived repo-scoped tokens so stations hold no long-lived credential at all —
+is Phase 2 and becomes one more source behind the same choke point, changing no verb.
+
+**There is deliberately no `repos delete`.** Archive is the terminal state the CLI can
+express (standing archive-don't-delete rule), so no delete-capable token ever needs to
+exist behind these verbs. `clone` and `create --dir` refuse an occupied destination with
+its contents intact, register the checkout, and fail loudly if registration does not land
+— acquire-and-register is one contract, not a clone plus a hope.
 
 ### Registry prune
 

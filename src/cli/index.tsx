@@ -90,6 +90,15 @@ import {
   releaseWorktree,
   removeWorktree,
 } from "../lib/worktrees.js";
+import {
+  REPO_ARCHIVE_SCHEMA,
+  REPO_CLONE_SCHEMA,
+  REPO_CREATE_SCHEMA,
+  RepoLifecycleError,
+  archiveRepository,
+  cloneRepository,
+  createRepository,
+} from "../lib/repo-lifecycle.js";
 
 const ORG_ALIASES: Record<string, string> = {
   oss: "hasna",
@@ -121,6 +130,11 @@ const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set([
   // workspace scan first would make a `worktree add` mutate the index as a side
   // effect of creating a directory.
   "worktree",
+  // Repository-plane verbs register their own clone; a workspace scan first
+  // would be the same side-effect mutation, plus minutes of latency in front
+  // of a network operation.
+  "create",
+  "clone",
 ]);
 
 program
@@ -2394,6 +2408,101 @@ program
     if (opts.json) { printJsonLine(result); return; }
     console.log(chalk.green(`\n✓ Cloned ${result.cloned}, skipped ${result.skipped}`));
     if (result.errors.length > 0) console.log(chalk.yellow(`  ${result.errors.length} errors`));
+  });
+
+// ── Repository lifecycle ──
+/**
+ * The repository plane as top-level verbs: `create`, `clone`, `archive`.
+ *
+ * The design names these `repos repo create` etc., but `repo [name]` is an
+ * existing lookup command whose positional would swallow the subcommand — a
+ * repo literally named "create" is expressible today — so the verbs sit at the
+ * top level next to `import`, which set the precedent for acquisition verbs.
+ *
+ * The property that matters is inherited from `src/lib/repo-lifecycle.ts` and
+ * asserted in `repo-lifecycle-cli.test.ts`: the caller's token environment is
+ * never the operation's authority, and a missing station credential is a
+ * typed, fail-closed refusal. There is deliberately no `delete` verb.
+ */
+function printRepoLifecycleError(error: unknown, json: boolean, schema: string): void {
+  const code = error instanceof RepoLifecycleError ? error.code : "UNEXPECTED_ERROR";
+  const message = error instanceof Error ? error.message : "unknown repository lifecycle error";
+  if (json) {
+    const details = error instanceof RepoLifecycleError ? error.details : undefined;
+    printJson({ schema, ok: false, error: { code, message, details } });
+  } else {
+    console.error(chalk.red(`${code}: ${message}`));
+    const hint = error instanceof RepoLifecycleError ? error.details.hint : undefined;
+    if (hint) console.error(chalk.dim(`  ${hint}`));
+  }
+  process.exitCode = 1;
+}
+
+program
+  .command("create <org/name>")
+  .description("Create a GitHub repository through the CLI's own credential — the caller holds no token")
+  .option("--public", "Create public (default: private)")
+  .option("--description <text>", "Repository description")
+  .option("--dir <parent>", "Also clone into <parent>/<name> and register the checkout")
+  .option("--json", "Output the versioned JSON result")
+  .action(async (spec, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = await createRepository({
+        spec,
+        visibility: opts.public ? "public" : "private",
+        description: opts.description,
+        cloneParentDir: opts.dir,
+      });
+      if (json) {
+        printJson(result);
+        return;
+      }
+      console.log(chalk.green(`✓ created ${result.repo.url} (${result.repo.visibility})`));
+      if (result.clone) console.log(chalk.dim(`  cloned and registered ${result.clone.path}`));
+      else console.log(chalk.dim("  no local clone (pass --dir <parent> to clone and register)"));
+    } catch (error) {
+      printRepoLifecycleError(error, json, REPO_CREATE_SCHEMA);
+    }
+  });
+
+program
+  .command("clone <org/name>")
+  .description("Clone one repository to <dir>/<name> and register it — credential stays behind the CLI")
+  .option("--dir <parent>", "Parent directory for the clone (default: current directory)")
+  .option("--json", "Output the versioned JSON result")
+  .action(async (spec, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = await cloneRepository({ spec, parentDir: opts.dir });
+      if (json) {
+        printJson(result);
+        return;
+      }
+      console.log(chalk.green(`✓ cloned and registered ${result.clone.path}`));
+    } catch (error) {
+      printRepoLifecycleError(error, json, REPO_CLONE_SCHEMA);
+    }
+  });
+
+program
+  .command("archive <repo>")
+  .description("Archive a repository on GitHub (reversible with --restore); there is no delete verb")
+  .option("--restore", "Unarchive instead")
+  .option("--json", "Output the versioned JSON result")
+  .action((target, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = archiveRepository({ target, restore: Boolean(opts.restore) });
+      if (json) {
+        printJson(result);
+        return;
+      }
+      const verb = result.archived ? "archived" : "unarchived";
+      console.log(chalk.green(`✓ ${verb} ${result.repo.org}/${result.repo.name}`));
+    } catch (error) {
+      printRepoLifecycleError(error, json, REPO_ARCHIVE_SCHEMA);
+    }
   });
 
 // ── Agent Ops ──
