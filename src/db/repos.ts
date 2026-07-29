@@ -13,6 +13,7 @@ import type {
 } from "../types/index.js";
 import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
 import { resolvePullRequestOrigin } from "../lib/pr-identity.js";
+import { classifyCheckout } from "../lib/checkout-health.js";
 
 // ── Repos ──
 
@@ -151,7 +152,10 @@ export class AmbiguousRemoteError extends Error {
  * Returns null when nothing matches, and throws when a single remote has
  * multiple local checkouts and no primary can be distinguished.
  */
-export function getRepoByRemote(remote: string, opts: { allowAmbiguous?: boolean } = {}): Repo | null {
+export function getRepoByRemote(
+  remote: string,
+  opts: { allowAmbiguous?: boolean; isUsableCheckout?: (path: string) => boolean } = {},
+): Repo | null {
   const db = getDb();
   const normalized = sanitizeRemoteIdentity(remote)
     ?? sanitizeRemoteIdentity(`github.com/${remote.replace(/^\/+/, "")}`);
@@ -161,14 +165,28 @@ export function getRepoByRemote(remote: string, opts: { allowAmbiguous?: boolean
     .query("SELECT * FROM repos WHERE remote_url = ? COLLATE NOCASE ORDER BY id ASC")
     .all(normalized) as Repo[]).map(sanitizeRepoForOutput);
   if (rows.length === 0) return null;
-  if (rows.length === 1 || opts.allowAmbiguous) return rows[0]!;
+  if (opts.allowAmbiguous) return rows[0]!;
+
+  // A row whose path git cannot open is never the right answer while a working
+  // checkout of the same remote exists. On this machine 1056 of 1581 rows are in
+  // that state, and several remotes have both a gutted primary and a live
+  // worktree — resolving to the gutted one is what sent agents off to re-clone by
+  // hand. Narrow to what actually works FIRST, before preferring a primary
+  // clone over a derived copy: a live worktree beats a hollow primary.
+  const isUsable = opts.isUsableCheckout ?? ((path: string) => classifyCheckout(path).usable);
+  const usable = rows.filter((row) => isUsable(row.path));
+  // When nothing is usable, keep answering from the full set: the caller still
+  // needs the row to be told what is wrong with it, and the CLI reports the
+  // health verdict rather than pretending the path works.
+  const candidates = usable.length > 0 ? usable : rows;
+  if (candidates.length === 1) return candidates[0]!;
 
   // A worktree or throwaway build copy is never the answer when a real checkout
   // exists, so narrow before declaring the remote ambiguous.
-  const primary = rows.filter((row) => !isDerivedCheckoutPath(row.path));
+  const primary = candidates.filter((row) => !isDerivedCheckoutPath(row.path));
   if (primary.length === 1) return primary[0]!;
 
-  throw new AmbiguousRemoteError(normalized, rows.map((row) => row.path));
+  throw new AmbiguousRemoteError(normalized, candidates.map((row) => row.path));
 }
 
 /**

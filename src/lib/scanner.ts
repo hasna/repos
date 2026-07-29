@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import cliProgress from "cli-progress";
 import { getDb } from "../db/database.js";
 import { getConfig, getWorkspaceRoots } from "./config.js";
+import { classifyCheckout } from "./checkout-health.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 import {
   upsertRepo,
@@ -32,8 +33,23 @@ function git(repoPath: string, args: string[]): string {
   return gitWithStatus(repoPath, args).output;
 }
 
+/**
+ * Is this directory a repository the index should hold a row for?
+ *
+ * This used to be `existsSync(dir + "/.git")`, which is how 65 hollow `.git`
+ * skeletons — directories retaining only `hooks/` and `worktrees/`, with no
+ * HEAD, no objects and no refs — became registry rows and kept being refreshed
+ * as if they were checkouts. It is also why the walk stopped at them: a hollow
+ * directory was accepted as a repository and never descended into.
+ *
+ * A path that cannot be *read* still counts. Skipping an unreadable checkout
+ * would silently drop a real repository out of the index on a permissions blip,
+ * which is a worse failure than carrying a row that later reports `unreadable`.
+ */
 function isGitRepo(dir: string): boolean {
-  return existsSync(join(dir, ".git"));
+  if (!existsSync(join(dir, ".git"))) return false;
+  const health = classifyCheckout(dir);
+  return health.usable || health.state === "unreadable";
 }
 
 export function discoverRepos(rootDirs: string[], maxDepth?: number): string[] {
