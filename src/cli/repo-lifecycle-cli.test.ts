@@ -223,6 +223,44 @@ describe("repos create", () => {
     }
   });
 
+  /**
+   * Scrubbing the token variables is not sufficient on its own: `gh` resolves
+   * its credential store from `GH_CONFIG_DIR`, then `XDG_CONFIG_HOME/gh`, then
+   * `$HOME/.config/gh`. Either of the first two, set by the caller, substitutes
+   * the identity that performs the mutation while the result still reports
+   * `credential_source: "gh-store"`.
+   *
+   * Measured before the fix against the real CLI and a genuinely private
+   * repository: `GH_CONFIG_DIR` pointed at a caller-written `hosts.yml` made gh
+   * fail `HTTP 401: Bad credentials`, where the same call with the variable
+   * absent succeeded through the station store. So the caller's redirection was
+   * reaching the child, and this asserts it no longer does.
+   */
+  test("scrubs the caller's gh config-dir redirections, so the station store is the only one reachable", () => {
+    const fixture = seed();
+    const callerStore = join(tempDir, "caller-gh-store");
+    mkdirSync(callerStore, { recursive: true });
+    const result = runCli(fixture, ["create", "hasna/scratch-r5", "--json"], {
+      GH_CONFIG_DIR: callerStore,
+      XDG_CONFIG_HOME: callerStore,
+    });
+    expect(result.code).toBe(0);
+    const envs = ghChildEnvs(fixture);
+    expect(envs.length).toBeGreaterThan(0);
+    for (const env of envs) {
+      // Positive control: this recording does see caller-supplied variables —
+      // the canary is planted by exactly the same mechanism.
+      expect(env).toContain("REPOS_TEST_CANARY=canary-visible");
+      expect(env).not.toMatch(/^GH_CONFIG_DIR=/m);
+      expect(env).not.toMatch(/^XDG_CONFIG_HOME=/m);
+      expect(env).not.toContain(callerStore);
+      // HOME must survive: gh's default config path is $HOME/.config/gh, which
+      // is where the station's own credential lives. Scrubbing the
+      // redirections is what makes that default binding.
+      expect(env).toMatch(/^HOME=/m);
+    }
+  });
+
   test("a configured credential command supplies the child token — the same probe finds it", () => {
     const fixture = seed();
     const credPath = writeCredentialCommand(fixture, `echo "${COMMAND_TOKEN}"`);

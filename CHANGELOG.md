@@ -51,11 +51,15 @@ Adds the repository plane — `repos create | clone | archive` — with the cred
 the CLI (R5, owner directive 2026-07-28).
 
 - **The caller's token is never the operation's authority.** `GH_TOKEN`, `GITHUB_TOKEN` and
-  their enterprise forms are scrubbed from every child the CLI spawns; the CLI resolves its
-  own credential from station config (`github.credentialCommand`, an argv whose stdout is the
-  token) or, absent one, from the station `gh`'s credential store. Asserted against the real
-  CLI with positive controls: the same probe that finds no caller token in the child finds
-  the configured command's token when one is supposed to be there.
+  their enterprise forms are scrubbed from every child the CLI spawns, and so are the store
+  redirections `GH_CONFIG_DIR` and `XDG_CONFIG_HOME` — pointing `gh` at a caller-written
+  `hosts.yml` substituted the identity performing the mutation while the result still
+  reported `credential_source: "gh-store"`, measured against a private repository before it
+  was closed. `HOME` is kept, because `$HOME/.config/gh` is the station's own store. The CLI
+  resolves its credential from station config (`github.credentialCommand`, an argv whose
+  stdout is the token) or, absent one, from the station `gh`'s credential store. Asserted
+  against the real CLI with positive controls: the same probe that finds no caller token in
+  the child finds the configured command's token when one is supposed to be there.
 - **Fail closed, typed.** A configured credential command that fails, is malformed, or prints
   nothing is `CREDENTIAL_UNAVAILABLE` raised before any child is spawned — never a silent
   fall-through to the gh store. An unauthenticated gh maps to the same code, so automation can

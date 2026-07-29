@@ -210,14 +210,19 @@ repos archive old-experiment                             # registry name or <org
 repos archive old-experiment --restore                   # archive is reversible
 ```
 
-**Whose credential runs the operation.** Never the caller's: `GH_TOKEN`, `GITHUB_TOKEN`
-and their enterprise forms are scrubbed from every child the CLI spawns, so a token in the
-calling agent's environment is inert. The CLI resolves its own credential from station
-configuration — `github.credentialCommand` in `~/.hasna/repos/config.json`, an argv (for
-example a vault read) whose stdout is the token — or, when none is configured, from the
-station `gh`'s own credential store. A configured command that fails, is malformed, or
-prints nothing is a hard `CREDENTIAL_UNAVAILABLE` before any child is spawned; there is no
-fallback between sources, no `--use-ambient` flag, and no env-var escape hatch.
+**Whose credential runs the operation.** Never the caller's. Two families of variable are
+scrubbed from every child the CLI spawns: the token names `gh` treats as authority
+(`GH_TOKEN`, `GITHUB_TOKEN` and their enterprise forms), and the redirections that would
+point `gh` at a *different* credential store (`GH_CONFIG_DIR`, `XDG_CONFIG_HOME`) — the
+second family matters because substituting the store substitutes the identity just as
+effectively as supplying a token, and did so measurably before it was closed. `HOME` is
+deliberately kept, since `$HOME/.config/gh` is where the station's own credential lives.
+The CLI resolves its own credential from station configuration —
+`github.credentialCommand` in `~/.hasna/repos/config.json`, an argv (for example a vault
+read) whose stdout is the token — or, when none is configured, from the station `gh`'s own
+credential store. A configured command that fails, is malformed, or prints nothing is a
+hard `CREDENTIAL_UNAVAILABLE` before any child is spawned; there is no fallback between
+sources and no `--use-ambient` flag.
 `src/cli/repo-lifecycle-cli.test.ts` asserts all of this against the real CLI with
 positive controls, including that a token echoed back by a hostile child is redacted from
 everything the caller can read.

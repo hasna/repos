@@ -11,8 +11,11 @@
  * is concrete and tested, not aspirational:
  *
  *   - **Caller token variables are scrubbed** from every child this module
- *     spawns (`GH_TOKEN`, `GITHUB_TOKEN` and their enterprise forms). The
- *     operation's authority is never something the calling agent supplied.
+ *     spawns (`GH_TOKEN`, `GITHUB_TOKEN` and their enterprise forms), and so
+ *     are the store redirections `GH_CONFIG_DIR` and `XDG_CONFIG_HOME`, because
+ *     pointing `gh` at a caller-written credential store substitutes the
+ *     identity exactly as a caller-supplied token would. The operation's
+ *     authority is never something the calling agent supplied.
  *   - **The CLI resolves its own credential** from station configuration:
  *     either a configured `github.credentialCommand` (an argv — for example a
  *     vault read — whose stdout is the token, injected only into the child
@@ -72,6 +75,31 @@ const CALLER_TOKEN_ENV_NAMES = [
   "GITHUB_TOKEN",
   "GH_ENTERPRISE_TOKEN",
   "GITHUB_ENTERPRISE_TOKEN",
+] as const;
+
+/**
+ * Variables that carry no token themselves but redirect `gh` to a *different*
+ * credential store, which substitutes the authority just as effectively.
+ *
+ * Scrubbing the token variables alone left the boundary open, measured against
+ * the real CLI and a genuinely private repository: with all four token
+ * variables unset, `GH_CONFIG_DIR` (and equally `XDG_CONFIG_HOME`, which `gh`
+ * consults next) pointed at a caller-written `hosts.yml` made `gh` authenticate
+ * with the caller's token — `HTTP 401: Bad credentials` — where the identical
+ * call resolved through the station store and succeeded. So the caller, not the
+ * station, decided which identity performed the operation, while the result
+ * still reported `credential_source: "gh-store"`.
+ *
+ * `HOME` is deliberately *not* scrubbed: `gh`'s default config path is
+ * `$HOME/.config/gh`, which is precisely where the station's own credential
+ * lives. Removing these two redirections is what makes that default binding.
+ * A station that genuinely keeps its `gh` config somewhere else now fails
+ * closed and loudly with CREDENTIAL_UNAVAILABLE rather than silently borrowing
+ * whichever store the caller pointed at.
+ */
+const CALLER_CREDENTIAL_STORE_ENV_NAMES = [
+  "GH_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
 ] as const;
 
 export type RepoLifecycleErrorCode =
@@ -177,6 +205,7 @@ interface ResolvedCredential {
 function resolveCredential(): ResolvedCredential {
   const env: Record<string, string | undefined> = { ...process.env };
   for (const name of CALLER_TOKEN_ENV_NAMES) delete env[name];
+  for (const name of CALLER_CREDENTIAL_STORE_ENV_NAMES) delete env[name];
 
   const configured = getConfig().github?.credentialCommand;
   if (configured === undefined) {
