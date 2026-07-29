@@ -40,6 +40,7 @@ repos-serve  # http://localhost:19450
 | `repos worktree adopt [path]` | Backfill leases for worktrees that exist without one (dry run by default) |
 | `repos worktree release <lease-id>` | Mark a lease done and apply its cleanup policy |
 | `repos registry prune` | Retire registry rows whose path no longer exists (dry run unless explicitly confirmed) |
+| `repos registry health` | Report how many registry rows point at a usable git checkout |
 | `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
@@ -237,6 +238,51 @@ The dry run also reports what would cascade away, which is usually the number th
     cascades: 134010 branches row(s)
     cascades: 15760 pull_requests row(s)
 ```
+### Checkout health
+
+A registry row is only useful if its `path` is a checkout something can be done to.
+`repos repo <name>` is the lookup automation is told to use for exact targeting, so it
+**exits non-zero** when the row's path is not a usable git repository, and reports why:
+
+```
+$ repos repo repos --json ; echo "rc=$?"
+{ ... "checkout_health": { "state": "missing-path", "usable": false, ... } }
+rc=1
+
+# on stderr:
+Registry row 'repos' points at a path that is not a usable git checkout (missing-path).
+  /home/.../opensourcedev/open-repos/repos does not exist
+  The path is gone. Re-clone it with: git clone https://github.com/hasna/repos <path>
+```
+
+The record is still printed, because diagnosing the row needs the remote and the
+verdict — only the exit status changes. Pass `--allow-unusable-checkout` when you want
+the metadata and not the failure. `repos cd` / `repos open` refuse outright and print
+nothing, because their output is substituted straight into another command.
+
+`repos registry health` reports the whole picture, counting every row rather than a
+page of them:
+
+```
+$ repos registry health
+Registry checkout health — /home/you/.hasna/repos/repos.db
+  1581 rows: 525 usable, 1056 unusable (66.8%)
+    worktree-severed-common-dir      394
+    worktree-dangling-gitdir         299
+    missing-path                     291
+    hollow-git-dir                    65
+    no-git-dir                         7
+
+$ repos registry health --unusable -n 20     # list the rows that do not resolve
+$ repos registry health --state hollow-git-dir --json
+```
+
+`hollow-git-dir` means a `.git` directory stripped of `HEAD`, `objects` and `refs` —
+`git worktree add` against it is impossible. `unreadable` is deliberately distinct from
+all of these: a path that could not be inspected is not a path known to be broken, and
+must not be re-cloned over. Getting that distinction right needs the errno, not a
+boolean — only `ENOENT`/`ENOTDIR` count as absence, and a checkout you merely lack
+permission to read reports `unreadable` rather than being declared gutted.
 
 ### Primary registry relocation
 

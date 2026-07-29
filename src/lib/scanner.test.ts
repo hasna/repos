@@ -329,4 +329,36 @@ describe("scanner", () => {
     })]);
     expect(JSON.stringify({ repo, remotes: listRemotes(repo.id) })).not.toContain(unsafe);
   });
+
+  it("does not index a hollow .git as a repository", async () => {
+    // `existsSync(dir + "/.git")` accepted a directory stripped to hooks/ and
+    // worktrees/ as a checkout. That is how 65 gutted paths became registry rows
+    // and kept being refreshed as though they were repositories, which is the
+    // supply side of the "lookup returns an unusable path" defect.
+    const hollow = createTestRepo("hollow-skeleton", 1);
+    rmSync(join(hollow, ".git"), { recursive: true, force: true });
+    mkdirSync(join(hollow, ".git", "hooks"), { recursive: true });
+    mkdirSync(join(hollow, ".git", "worktrees"), { recursive: true });
+    createTestRepo("healthy-sibling", 1);
+
+    await scanRepos([TEST_DIR]);
+    const names = listRepos().map((repo) => repo.name);
+    expect(names).toContain("healthy-sibling");
+    expect(names).not.toContain("hollow-skeleton");
+  });
+
+  it("descends past a hollow .git instead of stopping at it", async () => {
+    // The old predicate also ended the walk: a gutted directory was treated as a
+    // repository and never entered, so anything checked out below it was invisible
+    // to every scan.
+    const shell = join(TEST_DIR, "gutted-parent");
+    mkdirSync(join(shell, ".git", "hooks"), { recursive: true });
+    mkdirSync(join(shell, ".git", "worktrees"), { recursive: true });
+    createTestRepo(join("gutted-parent", "nested-real"), 1);
+
+    await scanRepos([TEST_DIR]);
+    const names = listRepos().map((repo) => repo.name);
+    expect(names).toContain("nested-real");
+    expect(names).not.toContain("gutted-parent");
+  });
 });

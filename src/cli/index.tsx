@@ -8,6 +8,7 @@ import { parseIntOption } from "./args.js";
 import chalk from "chalk";
 import {
   listRepos,
+  listAllRepos,
   getRepo,
   listCommits,
   listBranches,
@@ -45,6 +46,12 @@ import { getFilterAlias } from "../lib/config.js";
 import { sanitizeRemoteIdentity } from "../lib/remote-identity.js";
 import { getReposStatus } from "../lib/status.js";
 import { formatRepoNotFoundMessage } from "./messages.js";
+import {
+  classifyCheckout,
+  describeCheckoutRemedy,
+  summarizeCheckoutStates,
+  type CheckoutHealth,
+} from "../lib/checkout-health.js";
 import { printJson, printJsonLine, printLine } from "./stdout.js";
 import { syncGithubPRs, syncAllGithubPRs, fetchRepoMetadata } from "../lib/github.js";
 import { enumerateGithubRepoCatalog } from "../lib/github-catalog.js";
@@ -151,6 +158,27 @@ function requireRepo(repoInput: string) {
     )
   );
   process.exit(1);
+}
+
+const ALLOW_UNUSABLE_OPTION = "--allow-unusable-checkout";
+const ALLOW_UNUSABLE_HELP = "Report an unusable checkout without failing (metadata-only use)";
+
+/**
+ * Compose the refusal a caller sees when a registry row's path is not a
+ * checkout.
+ *
+ * It names the row, the state, what was actually found, and the next action —
+ * because the whole failure this guards against is a caller receiving something
+ * that looks like an answer and having to work out for itself that it is not.
+ */
+function formatUnusableCheckout(repo: { name: string; path: string; remote_url?: string | null }, health: CheckoutHealth): string {
+  const remedy = describeCheckoutRemedy(health, { remoteUrl: repo.remote_url ?? null, repoName: repo.name });
+  return [
+    `Registry row '${repo.name}' points at a path that is not a usable git checkout (${health.state}).`,
+    `  ${health.detail}`,
+    remedy ? `  ${remedy}` : "",
+    `  Inspect the row with: repos repo ${repo.name} --json ${ALLOW_UNUSABLE_OPTION}`,
+  ].filter(Boolean).join("\n");
 }
 
 function intFlag(value: string, flagName: string, min = 0) {
@@ -536,14 +564,27 @@ function resolveTargetRepo(name: string | undefined, opts: any) {
   return requireRepo(name);
 }
 
+/**
+ * `repo`/`show`/`inspect` are the lookup every global rule points agents at for
+ * exact targeting, and their `path` is the field callers act on. Two rows in
+ * three on this machine carried a path git cannot open, and the command returned
+ * exit code 0 for all of them.
+ *
+ * So the record is still emitted — a caller diagnosing a broken row needs the
+ * remote and the health verdict, and withholding them would just move the dead
+ * end — but the command **exits non-zero**, so `repos repo x --json | jq -r
+ * .path` fails under `set -o pipefail` instead of yielding a path that cannot be
+ * used. `--allow-unusable-checkout` is the opt-out for metadata-only callers.
+ */
 function printRepoDetails(name: string | undefined, opts: any) {
     const repo = resolveTargetRepo(name, opts);
     const stats = getRepoStats(repo.id);
+    const health = classifyCheckout(repo.path);
     if (opts.json) {
-      printJson({ ...repo, ...stats });
+      printJson({ ...repo, ...stats, checkout_health: health });
     } else {
       console.log(chalk.bold(repo.name));
-      console.log(`  Path: ${repo.path}`);
+      console.log(`  Path: ${repo.path}${health.usable ? "" : chalk.red(`  [${health.state}]`)}`);
       if (repo.org) console.log(`  Org: ${chalk.blue(repo.org)}`);
       if (repo.remote_url) console.log(`  Remote: ${repo.remote_url}`);
       console.log(`  Branch: ${repo.default_branch}`);
@@ -564,34 +605,29 @@ function printRepoDetails(name: string | undefined, opts: any) {
         console.log(chalk.dim("\nUse --verbose for more authors and commits, or --json for the full record."));
       }
     }
+    if (!health.usable) {
+      console.error(chalk.red(formatUnusableCheckout(repo, health)));
+      if (!opts.allowUnusableCheckout) process.exitCode = 1;
+    }
 }
 
 const REMOTE_OPTION = "--remote <host/org/name>";
 const REMOTE_OPTION_HELP = "Resolve by exact GitHub remote, e.g. github.com/hasna/emails";
 
-program
-  .command("repo [name]")
-  .description("Get repo details")
-  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
-  .option("--verbose", "Show larger detail sections")
-  .option("--json", "Output as JSON")
-  .action(printRepoDetails);
-
-program
-  .command("show [name]")
-  .description("Show repo details")
-  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
-  .option("--verbose", "Show larger detail sections")
-  .option("--json", "Output as JSON")
-  .action(printRepoDetails);
-
-program
-  .command("inspect [name]")
-  .description("Inspect repo details")
-  .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
-  .option("--verbose", "Show larger detail sections")
-  .option("--json", "Output as JSON")
-  .action(printRepoDetails);
+for (const [verb, description] of [
+  ["repo", "Get repo details"],
+  ["show", "Show repo details"],
+  ["inspect", "Inspect repo details"],
+] as const) {
+  program
+    .command(`${verb} [name]`)
+    .description(description)
+    .option(REMOTE_OPTION, REMOTE_OPTION_HELP)
+    .option(ALLOW_UNUSABLE_OPTION, ALLOW_UNUSABLE_HELP)
+    .option("--verbose", "Show larger detail sections")
+    .option("--json", "Output as JSON")
+    .action(printRepoDetails);
+}
 
 // ── Registry safety operations ──
 const registry = program
@@ -853,6 +889,90 @@ registry
         console.error(chalk.red(`${code}: ${message}`));
       }
       process.exitCode = 1;
+    }
+  });
+
+/**
+ * How much of the registry actually points at a checkout.
+ *
+ * This exists because the answer had to be hand-rolled against the SQLite file
+ * to scope the defect at all, and `repos repos --json` could not be used to do
+ * it — it truncated at one pipe buffer. A registry whose own health cannot be
+ * measured with a supported command is a registry nobody will re-measure, so the
+ * next regression goes unnoticed.
+ *
+ * Reads every row by keyset pagination rather than a page of them, because a
+ * count taken from a capped listing is the wrong denominator.
+ */
+registry
+  .command("health")
+  .description("Report how many registry rows point at a usable git checkout")
+  .option("--org <org>", "Limit to one org")
+  .option("--state <state>", "List only rows in this checkout state")
+  .option("--unusable", "List only rows whose path is not a usable checkout")
+  .option("-n, --limit <n>", "Maximum rows to list (the summary always counts all of them)")
+  .option("--json", "Output as JSON")
+  .action((opts) => {
+    const limit = opts.limit === undefined ? 50 : intFlag(String(opts.limit), "--limit", 1);
+    const rows = listAllRepos({ org: opts.org });
+    const assessed = rows.map((repo) => ({
+      id: repo.id,
+      name: repo.name,
+      path: repo.path,
+      org: repo.org,
+      remote_url: repo.remote_url,
+      last_scanned: repo.last_scanned,
+      health: classifyCheckout(repo.path),
+    }));
+    const counts = summarizeCheckoutStates(assessed.map((row) => row.health.state));
+    const unusable = assessed.filter((row) => !row.health.usable);
+    const selected = opts.state
+      ? assessed.filter((row) => row.health.state === opts.state)
+      : opts.unusable
+        ? unusable
+        : assessed;
+
+    const summary = {
+      schema_version: "1.0",
+      database: getDbPath(),
+      total_rows: assessed.length,
+      usable_rows: assessed.length - unusable.length,
+      unusable_rows: unusable.length,
+      unusable_pct: assessed.length === 0 ? 0 : Number(((unusable.length / assessed.length) * 100).toFixed(1)),
+      states: counts,
+    };
+
+    if (opts.json) {
+      // printJson rather than a bare stdout write: this command's whole point
+      // is reporting every row, so it is the largest --json payload the CLI
+      // emits and exactly the shape that #36 found truncating at one pipe
+      // buffer. A health report that silently loses its tail is worse than none.
+      printJson({
+        ...summary,
+        listed: selected.length,
+        listed_truncated: selected.length > limit,
+        rows: selected.slice(0, limit),
+      });
+      return;
+    }
+
+    console.log(chalk.bold(`Registry checkout health — ${summary.database}`));
+    console.log(`  ${summary.total_rows} rows: ${chalk.green(`${summary.usable_rows} usable`)}, ${summary.unusable_rows > 0 ? chalk.red(`${summary.unusable_rows} unusable`) : "0 unusable"} (${summary.unusable_pct}%)`);
+    for (const [state, count] of Object.entries(counts).sort((a, b) => b[1] - a[1])) {
+      console.log(`    ${state.padEnd(30)} ${count}`);
+    }
+    const shown = selected.slice(0, limit);
+    if (shown.length > 0 && (opts.state || opts.unusable)) {
+      console.log(chalk.dim(`\n  Showing ${shown.length} of ${selected.length} matching row(s):`));
+      for (const row of shown) {
+        console.log(`    ${chalk.dim(`#${row.id}`)} ${row.name} ${chalk.dim(compactText(row.path, 100))}`);
+        console.log(`        ${chalk.yellow(row.health.state)}: ${compactText(row.health.detail, 140)}`);
+      }
+      if (selected.length > shown.length) {
+        console.log(chalk.dim(`  ... ${selected.length - shown.length} more; pass -n ${selected.length} to list them all.`));
+      }
+    } else if (!opts.state && !opts.unusable) {
+      console.log(chalk.dim("\n  Pass --unusable to list the rows that do not resolve, or --json for the full record."));
     }
   });
 
@@ -2269,12 +2389,30 @@ program
  * while `platform-todos` also exists. `--exact` and `--remote` opt into a
  * deterministic lookup that fails rather than guessing.
  */
+/**
+ * Unlike `repo`/`show`/`inspect`, this refuses outright and prints nothing on
+ * stdout.
+ *
+ * Its whole contract is `cd $(repos cd <name>)`. Emitting a path that git cannot
+ * open — 1056 of 1581 rows on this machine — puts the caller inside a directory
+ * that is not a checkout, which is how agents ended up re-cloning by hand and how
+ * two of them ended up committing into one worktree. There is no value in a
+ * "here it is, but it does not work" answer for a command whose output is
+ * substituted straight into another command.
+ */
+function requireUsableCheckout(repo: { name: string; path: string; remote_url?: string | null }): string {
+  const health = classifyCheckout(repo.path);
+  if (health.usable) return repo.path;
+  console.error(chalk.red(formatUnusableCheckout(repo, health)));
+  process.exit(1);
+}
+
 function resolveRepoPath(name: string | undefined, opts: any): string {
   if (opts.remote || opts.exact) {
     // `name` is passed through even alongside --remote so that supplying both
     // is rejected here exactly as it is for `repo`/`show`/`inspect`, rather
     // than the positional being silently ignored.
-    return resolveTargetRepo(name, opts).path;
+    return requireUsableCheckout(resolveTargetRepo(name, opts));
   }
   if (!name) {
     console.error("Repo not found");
@@ -2282,7 +2420,11 @@ function resolveRepoPath(name: string | undefined, opts: any): string {
   }
   const path = getRepoPath(name);
   if (!path) { console.error("Repo not found"); process.exit(1); }
-  return path;
+  // Look the row up by its resolved path so the refusal can name the remote to
+  // re-clone from. `getRepoPath` returns a path only, and a remedy that cannot
+  // name the remote is a worse remedy.
+  const row = getRepo(path);
+  return requireUsableCheckout(row ?? { name, path });
 }
 
 program
