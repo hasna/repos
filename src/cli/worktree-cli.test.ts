@@ -50,7 +50,7 @@ function errorOf(stdout: string): { code: string; message: string } {
 describe("repos worktree — argument surface", () => {
   test("the verb exists at all", () => {
     // The owner's premise, checked rather than assumed: `repos --help` on the
-    // published 0.1.36 lists no worktree verb. This asserts it now does.
+    // Published 0.1.37 lists no worktree verb. This asserts the next package does.
     const dbPath = seedDb();
     const help = runCli(dbPath, ["--help"]);
     expect(help.code).toBe(0);

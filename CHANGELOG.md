@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.38
 
 Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adopt | release`.
 
