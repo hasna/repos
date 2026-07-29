@@ -433,9 +433,11 @@ function repoIdentity(repo: Repo): string {
 function recordedBaseSource(lease: WorktreeLease): "origin" | "local" {
   try {
     const metadata = JSON.parse(lease.owner_metadata) as { base_source?: unknown };
-    return metadata.base_source === "local" ? "local" : "origin";
+    // Only claim an origin resolution when the lease explicitly recorded one.
+    // Missing or unreadable metadata cannot establish a remote relationship.
+    return metadata.base_source === "origin" ? "origin" : "local";
   } catch {
-    return "origin";
+    return "local";
   }
 }
 
