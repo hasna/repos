@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adopt | release`.
+
+- **The path is computed, never supplied.** `add` takes a repo and a name and places the
+  worktree at `~/.hasna/repos/worktrees/<repo-name>/<worktree-name>`. There is no `--path`,
+  `--dir` or `--root` option, and a name must be a single path segment, so a crafted
+  `--name ../../elsewhere` is refused before anything reaches the filesystem. The layout has
+  been ratified for weeks and has not held: `worktree list` reconciled 1468 directories under
+  that root on 2026-07-29, of which 303 sit flat at the root and 218 are buried under an extra
+  segment.
+- **Destructive verbs cannot be handed a path.** `remove` and `release` accept a lease id or
+  `<repo>/<worktree>` and nothing else, so the destroy-then-create hazard (a helper that
+  force-removed whatever path it was given) is unrepresentable rather than guarded. Containment
+  is re-checked after symlink resolution.
+- **Bases are pinned from origin, fail-closed.** A repo with an origin must fetch; the failure
+  is `BASE_REF_UNRESOLVABLE` rather than a silent branch off a stale local HEAD. A repo with no
+  remote resolves locally and reports `base.source: "local"`.
+- **Re-adding returns the existing lease.** An occupied path is refused with its contents
+  intact; nothing is removed to make room.
+- **Backup on reap.** `--discard-changes` archives the diff, the porcelain status, the
+  untracked-file list, and a `git bundle` of the branch when commits exist on no remote, under
+  `<root>/.evidence/`.
+- **A broken parent checkout is refused** with `PARENT_CHECKOUT_BROKEN` — the live shape being
+  a `.git` holding only `hooks/` and `worktrees/`.
+- **The lease table is now created by a migration.** `worktree_leases` existed on stations
+  from an out-of-tree build and had never been created by any shipped migration, so a fresh
+  install did not have it while an old station silently did. Migration 14 states the schema in
+  the tree and fails loudly on a divergent pre-existing shape.
+- **No GitHub credential is involved.** The whole plane runs on a station that holds none;
+  this is asserted in a child process built from an empty environment, with positive controls
+  proving the probes can detect a credential when one is present.
+
 ## 0.1.36
 
 Makes `repos prs` usable as a source of truth for pull requests (#26).

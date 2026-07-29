@@ -79,6 +79,17 @@ import {
   withTodos,
 } from "../lib/repo-ops.js";
 import { getNoCloudInventory } from "../lib/no-cloud-inventory.js";
+import {
+  WORKTREE_ADOPT_SCHEMA,
+  WORKTREE_LEASE_SCHEMA,
+  WORKTREE_LIST_SCHEMA,
+  WorktreeError,
+  addWorktree,
+  adoptWorktrees,
+  listWorktrees,
+  releaseWorktree,
+  removeWorktree,
+} from "../lib/worktrees.js";
 
 const ORG_ALIASES: Record<string, string> = {
   oss: "hasna",
@@ -106,6 +117,10 @@ const AUTO_BOOTSTRAP_SKIP_COMMANDS = new Set([
   "no-cloud",
   "release-health",
   "registry",
+  // Worktree verbs read and write the registry deliberately; triggering a
+  // workspace scan first would make a `worktree add` mutate the index as a side
+  // effect of creating a directory.
+  "worktree",
 ]);
 
 program
@@ -838,6 +853,189 @@ registry
         console.error(chalk.red(`${code}: ${message}`));
       }
       process.exitCode = 1;
+    }
+  });
+
+// ── Worktrees ──
+/**
+ * The worktree lifecycle as CLI verbs.
+ *
+ * Two properties are load-bearing and are asserted in `worktree-cli.test.ts`
+ * rather than left to review:
+ *
+ *   - **`add` has no path option.** The destination is computed from the repo
+ *     name and the worktree name. A caller cannot express a different location,
+ *     which is what finally holds the layout that prose has failed to hold —
+ *     444 entries at the root on this station on 2026-07-28, mixing flat,
+ *     machine-segmented and UUID-named directories.
+ *   - **`remove` and `release` have no path argument.** They take a lease id or
+ *     `<repo>/<worktree>`. `iapp-factory`'s worktree helper force-removed
+ *     whatever path it was handed; here there is no argument in which a victim
+ *     path can be passed.
+ *
+ * None of these verbs touch a GitHub credential. Base refs are fetched through
+ * the parent checkout's own remote configuration, so a station holding no
+ * GitHub credential at all still has the full worktree plane.
+ */
+const worktree = program
+  .command("worktree")
+  .description("Worktree lifecycle: canonical placement, leases, reconciliation");
+
+function printWorktreeError(error: unknown, json: boolean, schema: string): void {
+  const code = error instanceof WorktreeError ? error.code : "UNEXPECTED_ERROR";
+  const message = error instanceof Error ? error.message : "unknown worktree error";
+  if (json) {
+    const details = error instanceof WorktreeError ? error.details : undefined;
+    printJson({ schema, ok: false, error: { code, message, details } });
+  } else {
+    console.error(chalk.red(`${code}: ${message}`));
+    const hint = error instanceof WorktreeError ? error.details.hint : undefined;
+    if (hint) console.error(chalk.dim(`  ${hint}`));
+  }
+  process.exitCode = 1;
+}
+
+worktree
+  .command("add <repo>")
+  .description("Create a worktree at the computed canonical path and claim a lease")
+  .option("--task <id>", "Todos task id; the ratified worktree name when a task exists")
+  .option("--name <name>", "Worktree name when no task exists (single path segment)")
+  .option("--base <ref>", "Base ref, pinned from origin (default: the repo's default branch)")
+  .option("--branch <branch>", "Branch to create (default: the worktree name)")
+  .option("--run-id <id>", "Run identifier, part of the lease's uniqueness key")
+  .option("--cleanup-policy <policy>", "delete-if-clean | keep", "delete-if-clean")
+  .option("--json", "Output the versioned JSON result")
+  .action((repo, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = addWorktree({
+        repo,
+        task: opts.task,
+        name: opts.name,
+        base: opts.base,
+        branch: opts.branch,
+        runId: opts.runId,
+        cleanupPolicy: opts.cleanupPolicy,
+      });
+      if (json) {
+        printJson(result);
+        return;
+      }
+      const verb = result.created ? (result.reused ? "recreated" : "created") : "reused";
+      console.log(chalk.green(`✓ ${verb} ${result.path}`));
+      console.log(chalk.dim(`  lease ${result.lease.lease_id}  branch ${result.lease.branch}`));
+      console.log(chalk.dim(`  base ${result.base.ref} @ ${result.base.sha.slice(0, 12)} (${result.base.source})`));
+    } catch (error) {
+      printWorktreeError(error, json, WORKTREE_LEASE_SCHEMA);
+    }
+  });
+
+worktree
+  .command("list [repo]")
+  .description("Reconcile leases against disk and git, and name the layout violations")
+  .option("--stale", "Only leases past the staleness horizon")
+  .option("--stale-days <n>", "Staleness horizon in days", "7")
+  .option("--json", "Output the versioned JSON result")
+  .action((repo, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = listWorktrees({
+        onlyStale: Boolean(opts.stale),
+        staleDays: intFlag(String(opts.staleDays), "--stale-days", 0),
+      });
+      const entries = repo ? result.entries.filter((entry) => entry.repo_name === repo) : result.entries;
+      // Recomputed, not carried over: a summary describing the whole root next
+      // to a filtered listing reads as "this repo has 1468 problems".
+      const summary = {
+        ...result.summary,
+        entries: entries.length,
+        issue_count: entries.filter((entry) => entry.issues.length > 0).length,
+        on_disk: entries.filter((entry) => entry.on_disk).length,
+      };
+      if (json) {
+        printJson({ ...result, entries, summary });
+        return;
+      }
+      console.log(chalk.bold(`Worktrees under ${result.root}`));
+      for (const entry of entries.slice(0, resolveLimit(opts, 40))) {
+        const flags = entry.issues.length === 0 ? chalk.green("ok") : chalk.yellow(entry.issues.join(","));
+        console.log(`  ${flags} ${compactText(entry.path, 110)}`);
+      }
+      console.log(chalk.dim(`  ${entries.length} entr(ies), ${summary.issue_count} with issues.`));
+    } catch (error) {
+      printWorktreeError(error, json, WORKTREE_LIST_SCHEMA);
+    }
+  });
+
+worktree
+  .command("remove <ref>")
+  .description("Remove a worktree by lease id or <repo>/<worktree> — never by path")
+  .option("--discard-changes", "Archive the dirty state and branch, then force the teardown")
+  .option("--json", "Output the versioned JSON result")
+  .action((ref, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = removeWorktree({ ref, discardChanges: Boolean(opts.discardChanges) });
+      if (json) {
+        printJson(result);
+        return;
+      }
+      console.log(chalk.green(`✓ removed ${result.path}`));
+      if (result.evidence_path) console.log(chalk.dim(`  archived to ${result.evidence_path}`));
+    } catch (error) {
+      printWorktreeError(error, json, WORKTREE_LEASE_SCHEMA);
+    }
+  });
+
+worktree
+  .command("adopt [path]")
+  .description("Backfill leases for worktrees that exist without one (dry run by default)")
+  .option("--all", "Every stray worktree under the canonical root")
+  .option("--apply", "Write the leases (default: report only)")
+  .option("--json", "Output the versioned JSON result")
+  .action((path, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = adoptWorktrees({ path, all: Boolean(opts.all), apply: Boolean(opts.apply) });
+      if (json) {
+        printJson(result);
+        return;
+      }
+      const verb = result.applied ? "adopted" : "would adopt";
+      console.log(chalk.bold(`${verb} ${result.adopted.filter((row) => !row.already_leased).length} worktree(s)`));
+      for (const row of result.adopted.slice(0, 40)) {
+        const state = row.already_leased ? chalk.dim("leased") : chalk.yellow("stray");
+        console.log(`  ${state} ${compactText(row.path, 110)} ${chalk.dim(row.branch ?? "")}`);
+      }
+      if (!result.applied) console.log(chalk.dim("  Nothing was written. Re-run with --apply."));
+    } catch (error) {
+      printWorktreeError(error, json, WORKTREE_ADOPT_SCHEMA);
+    }
+  });
+
+worktree
+  .command("release <lease-id>")
+  .description("Mark a lease done and apply its cleanup policy")
+  .option("--keep", "Release the lease and leave the directory in place")
+  .option("--json", "Output the versioned JSON result")
+  .action((leaseId, opts) => {
+    const json = Boolean(opts.json);
+    try {
+      const result = releaseWorktree({ leaseId, keep: Boolean(opts.keep) });
+      if (json) {
+        printJson(result);
+        return;
+      }
+      if (result.removed) {
+        console.log(chalk.green(`✓ released and removed ${result.lease.worktree_path}`));
+      } else if (result.refusal) {
+        console.log(chalk.yellow(`lease kept: ${result.refusal}`));
+        process.exitCode = 1;
+      } else {
+        console.log(chalk.green(`✓ released ${result.lease.lease_id} (directory kept)`));
+      }
+    } catch (error) {
+      printWorktreeError(error, json, WORKTREE_LEASE_SCHEMA);
     }
   });
 
