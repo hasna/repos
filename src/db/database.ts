@@ -23,6 +23,14 @@ function rejectSqliteMemoryUri(path: string): string {
   return path;
 }
 
+function getHomeDirectory(): string {
+  const home = process.env["HOME"] || process.env["USERPROFILE"];
+  if (!home) {
+    throw new Error("cannot determine home directory; set HOME or USERPROFILE");
+  }
+  return home;
+}
+
 export function getDbPath(): string {
   if (process.env["HASNA_REPOS_DB_PATH"]) {
     return rejectSqliteMemoryUri(process.env["HASNA_REPOS_DB_PATH"]);
@@ -39,7 +47,7 @@ export function getDbPath(): string {
   const nearest = findNearestReposDb(cwd);
   if (nearest) return nearest;
 
-  const home = process.env["HOME"] || process.env["USERPROFILE"] || "~";
+  const home = getHomeDirectory();
   const newPath = join(home, ".hasna", "repos", "repos.db");
   const legacyPath = join(home, ".git-local", "repos.db");
 
@@ -111,7 +119,7 @@ function getExplicitNonDefaultDbPath(customPath?: string): string {
   const path = normalizeDbPath(configured);
   if (path === ":memory:") return path;
 
-  const home = process.env["HOME"] || process.env["USERPROFILE"] || "~";
+  const home = getHomeDirectory();
   const defaults = [
     normalizeDbPath(join(home, ".hasna", "repos", "repos.db")),
     normalizeDbPath(join(home, ".git-local", "repos.db")),

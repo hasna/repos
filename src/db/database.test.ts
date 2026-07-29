@@ -101,6 +101,50 @@ describe("database", () => {
     }
   });
 
+  it("fails without a home directory instead of creating a literal tilde directory", () => {
+    closeDb();
+    const dir = mkdtempSync(join(tmpdir(), "repos-missing-home-"));
+    const previousCwd = process.cwd();
+    const previousHome = process.env["HOME"];
+    const previousUserProfile = process.env["USERPROFILE"];
+    const previousPrimary = process.env["HASNA_REPOS_DB_PATH"];
+    const previousFallback = process.env["REPOS_DB_PATH"];
+    const previousRequirement = process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+    const explicitPath = join(dir, "explicit.db");
+
+    try {
+      process.chdir(dir);
+      delete process.env["HOME"];
+      delete process.env["USERPROFILE"];
+      delete process.env["HASNA_REPOS_DB_PATH"];
+      delete process.env["REPOS_DB_PATH"];
+      delete process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+
+      expect(() => getDb()).toThrow("cannot determine home directory; set HOME or USERPROFILE");
+      expect(existsSync(join(dir, "~"))).toBe(false);
+
+      expect(() => getDb(explicitPath, { migrate: false })).toThrow(
+        "cannot determine home directory; set HOME or USERPROFILE",
+      );
+      expect(existsSync(explicitPath)).toBe(false);
+    } finally {
+      closeDb();
+      process.chdir(previousCwd);
+      if (previousHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = previousHome;
+      if (previousUserProfile === undefined) delete process.env["USERPROFILE"];
+      else process.env["USERPROFILE"] = previousUserProfile;
+      if (previousPrimary === undefined) delete process.env["HASNA_REPOS_DB_PATH"];
+      else process.env["HASNA_REPOS_DB_PATH"] = previousPrimary;
+      if (previousFallback === undefined) delete process.env["REPOS_DB_PATH"];
+      else process.env["REPOS_DB_PATH"] = previousFallback;
+      if (previousRequirement === undefined) delete process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"];
+      else process.env["HASNA_REPOS_REQUIRE_EXPLICIT_DB_PATH"] = previousRequirement;
+      rmSync(dir, { recursive: true, force: true });
+      getDb(":memory:");
+    }
+  });
+
   it("migrates an explicitly opened unmigrated singleton exactly once on the first normal access", () => {
     closeDb();
     const dir = mkdtempSync(join(tmpdir(), "repos-deferred-migrate-"));
