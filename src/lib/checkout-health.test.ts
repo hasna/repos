@@ -89,6 +89,16 @@ describe("classifyCheckout against real git fixtures", () => {
     expect(git(path, ["rev-parse", "HEAD"]).code).not.toBe(0);
   });
 
+  test("an empty packed-refs does not make a fresh repository look populated", () => {
+    const path = makeRepo("unborn-empty-packed-refs", { commit: false });
+    writeFileSync(join(path, ".git", "packed-refs"), "");
+    expect(readdirSync(join(path, ".git", "refs", "heads"))).toEqual([]);
+
+    const result = classifyCheckout(path);
+    expect(result.state).toBe("no-commits");
+    expect(git(path, ["rev-parse", "HEAD"]).code).not.toBe(0);
+  });
+
   test("a live linked worktree is usable, and git agrees", () => {
     const parent = makeRepo("wt-parent");
     const wt = join(root, "wt-live");

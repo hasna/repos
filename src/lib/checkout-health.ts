@@ -107,6 +107,8 @@ export interface PathProbe {
   presence: PathPresence;
   /** The errno that blocked the probe, when one did. Named in the message so an operator can act. */
   code: string | null;
+  /** File size when the implementation could establish it. */
+  size?: number;
 }
 
 /** Injectable filesystem, so every branch is reachable in a test. */
@@ -144,8 +146,8 @@ export const nodeCheckoutFs: CheckoutFs = {
   probe: (path) => {
     try {
       // `statSync`, not `existsSync`: the same syscall, but the errno survives.
-      statSync(path);
-      return { presence: "present", code: null };
+      const stat = statSync(path);
+      return { presence: "present", code: null, size: stat.size };
     } catch (error) {
       const code = errnoOf(error);
       return code !== null && ABSENT_ERRNOS.has(code)
@@ -226,7 +228,11 @@ function hasAnyRef(fs: CheckoutFs, commonDir: string): boolean {
   // it would in fact succeed. (An unreadable common dir is normally already caught
   // by `scanGitDirEntries`; the direction is stated here because this is where it
   // is decided.)
-  if (probe(fs, join(commonDir, "packed-refs")).presence !== "absent") return true;
+  const packedRefs = probe(fs, join(commonDir, "packed-refs"));
+  if (packedRefs.presence === "unreadable") return true;
+  // A zero-byte packed-refs contains no refs. If an injected filesystem cannot
+  // report size, retain the conservative answer used before size was exposed.
+  if (packedRefs.presence === "present" && packedRefs.size !== 0) return true;
   const headsDir = join(commonDir, "refs", "heads");
   const heads = probe(fs, headsDir);
   if (heads.presence === "absent") return false;
