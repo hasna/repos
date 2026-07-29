@@ -8,6 +8,21 @@ export interface FilterAlias {
   query?: string;
 }
 
+/**
+ * How the repository-plane verbs obtain their GitHub credential. This is
+ * station configuration, deliberately: the *calling agent* has no say in it —
+ * caller token variables are scrubbed before any `gh` child is spawned — and
+ * the station operator picks the source once, here, rather than per call.
+ *
+ * `credentialCommand` is an argv whose stdout is the token (for example a
+ * vault read). No command configured means the station's own `gh` credential
+ * store answers. Neither branch ever falls back to the other: a configured
+ * command that fails is a hard, typed error, not a silent downgrade.
+ */
+export interface GithubCredentialConfig {
+  credentialCommand?: string[];
+}
+
 export interface ReposConfig {
   commitLimit?: number;
   incrementalCommitLimit?: number;
@@ -18,6 +33,7 @@ export interface ReposConfig {
   hookPollIntervalMs?: number;
   watchDebounceMs?: number;
   workspaceRescanIntervalMs?: number;
+  github?: GithubCredentialConfig;
 }
 
 const DEFAULT_CONFIG: ReposConfig = {

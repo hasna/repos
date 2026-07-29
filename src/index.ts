@@ -75,6 +75,31 @@ export type {
   WorktreeListOptions,
   WorktreeListResult,
 } from "./lib/worktrees.js";
+export {
+  REPO_ARCHIVE_SCHEMA,
+  REPO_CLONE_SCHEMA,
+  REPO_CREATE_SCHEMA,
+  RepoLifecycleError,
+  archiveRepository,
+  cloneRepository,
+  createRepository,
+  isRepoSpec,
+  parseRepoSpec,
+  redactRepoLifecycleText,
+} from "./lib/repo-lifecycle.js";
+export type {
+  ArchiveRepositoryRequest,
+  ArchiveRepositoryResult,
+  CloneRepositoryRequest,
+  CloneRepositoryResult,
+  CreateRepositoryRequest,
+  CreateRepositoryResult,
+  CredentialSource,
+  RepoLifecycleErrorCode,
+  RepoLifecycleErrorDetails,
+  RepoSpec,
+  RepoVisibility,
+} from "./lib/repo-lifecycle.js";
 export { resolveTrustedAccountHome } from "./lib/account-home.js";
 export { getSourceMachineId } from "./lib/machine-id.js";
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
