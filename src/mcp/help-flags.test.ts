@@ -19,6 +19,9 @@ describe("entrypoint help/version flags", () => {
 
     expect(result.exitCode).toBe(0);
     expect(out).toContain("--http");
+    expect(out).toContain("--stdio");
+    expect(out).toContain("default 8874");
+    expect(out).toContain("Streamable HTTP default");
   });
 
   test("server help exits cleanly without starting server", () => {
@@ -46,5 +49,15 @@ describe("entrypoint help/version flags", () => {
     expect(result.exitCode).toBe(0);
     expect(out).toMatch(/^\d+\.\d+\.\d+$/);
     expect(out).toBe(PACKAGE_VERSION);
+  });
+
+  test("release verifier exposes help and version without requiring verification options", () => {
+    const help = runScript("src/release/verify-provenance.ts", "--help");
+    const version = runScript("src/release/verify-provenance.ts", "--version");
+
+    expect(help.exitCode).toBe(0);
+    expect(new TextDecoder().decode(help.stdout)).toContain("Usage: repos-verify-release [options]");
+    expect(version.exitCode).toBe(0);
+    expect(new TextDecoder().decode(version.stdout).trim()).toBe(PACKAGE_VERSION);
   });
 });

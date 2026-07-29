@@ -7,17 +7,19 @@ function handleCliFlags(argv: string[]): boolean {
   if (argv.includes("--help") || argv.includes("-h")) {
     console.log("Usage: repos-mcp [options]");
     console.log("");
-    console.log("MCP server for @hasna/repos (stdio default, optional Streamable HTTP)");
+    console.log("MCP server for @hasna/repos (Streamable HTTP default, optional stdio)");
     console.log("");
     console.log("Options:");
-    console.log("  --http         Start Streamable HTTP transport on 127.0.0.1");
-    console.log("  --port <n>     HTTP port (default 8830, or MCP_HTTP_PORT env)");
+    console.log("  --http         Start Streamable HTTP transport on 127.0.0.1 (default)");
+    console.log("  --stdio        Use stdio transport instead of HTTP");
+    console.log("  --port <n>     HTTP port (default 8874, or MCP_HTTP_PORT env)");
     console.log("  -h, --help     display help");
     console.log("  -V, --version  display version");
     console.log("");
     console.log("Environment:");
-    console.log("  MCP_HTTP=1         Enable HTTP mode");
-    console.log("  MCP_HTTP_PORT      Override default HTTP port");
+    console.log("  MCP_HTTP=1         Select HTTP mode explicitly");
+    console.log("  MCP_STDIO=1        Select stdio mode");
+    console.log("  MCP_HTTP_PORT      Override the default HTTP port");
     return true;
   }
 
