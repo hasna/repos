@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+Adds the worktree lifecycle verbs — `repos worktree add | list | remove | adopt | release`.
+
+- **The path is computed, never supplied.** `add` takes a repo and a name and places the
+  worktree at `~/.hasna/repos/worktrees/<repo-name>/<worktree-name>`. There is no `--path`,
+  `--dir` or `--root` option, and a name must be a single path segment, so a crafted
+  `--name ../../elsewhere` is refused before anything reaches the filesystem. The layout has
+  been ratified for weeks and has not held: `worktree list` reconciled 1468 directories under
+  that root on 2026-07-29, of which 303 sit flat at the root and 218 are buried under an extra
+  segment.
+- **Destructive verbs cannot be handed a path.** `remove` and `release` accept a lease id or
+  `<repo>/<worktree>` and nothing else, so the destroy-then-create hazard (a helper that
+  force-removed whatever path it was given) is unrepresentable rather than guarded. Containment
+  is re-checked after symlink resolution.
+- **Ref arguments cannot smuggle a git option.** `--base` and `--branch` are validated before
+  they reach git: `git fetch origin <ref>` parses options anywhere on the line, and
+  `--upload-pack=<cmd>` names a program to execute. Measured before the guard existed, an `add`
+  with such a `--base` returned success and ran the command. `check-ref-format` alone does not
+  catch it, because it is handed `refs/heads/<value>` and `refs/heads/--upload-pack=x` is
+  well-formed; the leading-dash refusal and charset do, with `--` separators as a second gate.
+- **Bases are pinned from origin, fail-closed.** A repo with an origin must fetch; the failure
+  is `BASE_REF_UNRESOLVABLE` rather than a silent branch off a stale local HEAD. A repo with no
+  remote resolves locally and reports `base.source: "local"`.
+- **Re-adding returns the existing lease.** An occupied path is refused with its contents
+  intact; nothing is removed to make room.
+- **Backup on reap.** `--discard-changes` archives the diff, the porcelain status, the
+  untracked-file list, and a `git bundle` of the branch when commits exist on no remote, under
+  `<root>/.evidence/`.
+- **A broken parent checkout is refused** with `PARENT_CHECKOUT_BROKEN` — the live shape being
+  a `.git` holding only `hooks/` and `worktrees/`.
+- **The lease table is now created by a migration.** `worktree_leases` existed on stations
+  from an out-of-tree build and had never been created by any shipped migration, so a fresh
+  install did not have it while an old station silently did. Migration 14 states the schema in
+  the tree and fails loudly on a divergent pre-existing shape.
+- **These verbs read no credential of their own.** Nothing touches `gh`, a token environment
+  variable, or a vault — asserted in a child process built from an empty environment, with
+  positive controls proving the probes can detect a credential when one is present. The limit
+  is stated and measured rather than glossed: `add` fetches the base through the parent
+  checkout's own remote, so a private https or keyless ssh remote still needs an ambient git
+  credential and fails closed with `BASE_REF_UNRESOLVABLE` without one. A test points the same
+  code at a local endpoint returning 401 and asserts that failure.
+- **The teardown archive verifies its own output.** `--discard-changes` bundles `HEAD`, not the
+  lease's claimed branch — a detached HEAD (rebase, bisect) puts commits where that branch does
+  not point — and then checks the bundle actually contains `HEAD`, writing an `INCOMPLETE.txt`
+  rather than reporting a successful archive it did not take.
+
 ## 0.1.36
 
 Makes `repos prs` usable as a source of truth for pull requests (#26).

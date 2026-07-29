@@ -41,6 +41,42 @@ export type {
   RemoteIdentityCleanupOptions,
   RemoteIdentityCleanupSummary,
 } from "./lib/auto-index.js";
+export {
+  WORKTREE_ADOPT_SCHEMA,
+  WORKTREE_LEASE_SCHEMA,
+  WORKTREE_LIST_SCHEMA,
+  WorktreeError,
+  addWorktree,
+  adoptWorktrees,
+  assertWorktreeName,
+  computeWorktreePath,
+  listWorktrees,
+  parseWorktreeRef,
+  redactGitDiagnostics,
+  releaseWorktree,
+  removeWorktree,
+  worktreeRootDir,
+} from "./lib/worktrees.js";
+export type {
+  AddWorktreeRequest,
+  AddWorktreeResult,
+  AdoptWorktreeRequest,
+  AdoptWorktreeResult,
+  AdoptedWorktree,
+  ReleaseWorktreeRequest,
+  ReleaseWorktreeResult,
+  RemoveWorktreeRequest,
+  RemoveWorktreeResult,
+  WorktreeErrorCode,
+  WorktreeErrorDetails,
+  WorktreeIssue,
+  WorktreeLease,
+  WorktreeListEntry,
+  WorktreeListOptions,
+  WorktreeListResult,
+} from "./lib/worktrees.js";
+export { resolveTrustedAccountHome } from "./lib/account-home.js";
+export { getSourceMachineId } from "./lib/machine-id.js";
 export { drainHookQueue, installPostCommitHook, installPostCommitHooks } from "./lib/repo-hooks.js";
 export { discoverRepos, scanRepoPaths, scanRepos, watchRepos } from "./lib/scanner.js";
 export {

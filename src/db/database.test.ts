@@ -112,7 +112,7 @@ describe("database", () => {
       const migrated = getDb(path);
       expect(migrated).toBe(raw);
       expect(migrated.query("SELECT version FROM migrations ORDER BY version").all())
-        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13].map((version) => ({ version })));
+        .toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14].map((version) => ({ version })));
       expect(getDb(path)).toBe(migrated);
       expect(migrated.query("SELECT count(*) AS count FROM migrations WHERE version = 9").get())
         .toEqual({ count: 1 });
@@ -199,7 +199,7 @@ describe("database", () => {
     const db = getDb(":memory:");
     const migrations = db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[];
     expect(migrations.length).toBeGreaterThanOrEqual(5);
-    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(migrations.map((row) => row.version)).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
   });
 
   it("migrates existing branch uniqueness to include remote classification", () => {
@@ -259,6 +259,48 @@ describe("database", () => {
     }
   });
 
+  it("refuses to proceed when a pre-existing worktree_leases is missing a column the writers need", () => {
+    // The claim migration 14 makes is that it is safe against a station whose
+    // table came from an out-of-tree build. `CREATE TABLE IF NOT EXISTS` alone
+    // does not make that true — it silently accepts whatever is already there,
+    // and the divergence then surfaces as an INSERT failing on one machine and
+    // working on another. This asserts the loud failure.
+    const dir = mkdtempSync(join(tmpdir(), "repos-lease-shape-"));
+    const path = join(dir, "repos.db");
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE migrations (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO migrations (version) VALUES (1), (2), (3), (4), (6), (7), (8), (9), (10), (11), (12), (13);
+      CREATE TABLE worktree_leases (
+        lease_id TEXT PRIMARY KEY,
+        repo_path TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+    `);
+    seed.close();
+    closeDb();
+    try {
+      // The diagnostic, not SQLite's "no such column: repo_id" — the first
+      // version of this migration created the indexes in the same statement
+      // block and died on the index before the check could run, which left the
+      // migration marker unwritten and every later getDb() failing identically.
+      expect(() => getDb(path)).toThrow(/worktree_leases exists with an unexpected schema/);
+      closeDb();
+      // Still refuses on retry, and still refuses with the diagnostic rather
+      // than degrading into the raw SQLite error.
+      expect(() => getDb(path)).toThrow(/missing columns: repo_id/);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+      process.env["HASNA_REPOS_DB_PATH"] = ":memory:";
+      getDb(":memory:");
+    }
+  });
+
   it("upgrades the live migration-5 worktree schema without skipping relocation audit", () => {
     closeDb();
     const dir = mkdtempSync(join(tmpdir(), "repos-live-v5-upgrade-"));
@@ -303,7 +345,7 @@ describe("database", () => {
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='worktree_leases'").get()).toBeTruthy();
       expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_relocation_audit'").get()).toBeTruthy();
       expect((db.query("SELECT version FROM migrations ORDER BY version").all() as { version: number }[])
-        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        .map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       closeDb();
@@ -820,7 +862,7 @@ describe("database", () => {
       const results = await Promise.all(children.map(({ completed }) => completed));
       expect(results).toEqual(Array.from({ length: 8 }, () => ({
         code: 0,
-        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13].map((version) => ({ version }))),
+        stdout: JSON.stringify([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14].map((version) => ({ version }))),
         stderr: "",
       })));
     } finally {

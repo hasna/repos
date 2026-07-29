@@ -34,6 +34,11 @@ repos-serve  # http://localhost:19450
 | `repos scan` | Discover and index all git repos |
 | `repos repos` | List repositories |
 | `repos repo <name>` / `repos show <name>` / `repos inspect <name>` | Get repo details |
+| `repos worktree add <repo> --task <id>` | Create a worktree at the computed canonical path and claim a lease |
+| `repos worktree list [repo]` | Reconcile leases against disk and git, and name the layout violations |
+| `repos worktree remove <ref>` | Remove by lease id or `<repo>/<worktree>` — never by path |
+| `repos worktree adopt [path]` | Backfill leases for worktrees that exist without one (dry run by default) |
+| `repos worktree release <lease-id>` | Mark a lease done and apply its cleanup policy |
 | `repos registry prune` | Retire registry rows whose path no longer exists (dry run unless explicitly confirmed) |
 | `repos registry health` | Report how many registry rows point at a usable git checkout |
 | `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
@@ -114,6 +119,80 @@ still listed; `@hasna/deployment` a live 404), so there is no literal list to ed
 from local manifests alone was tried next and was worse: it silently dropped every package
 without a local checkout, including `@hasna/wallets`, which declares the retired
 `@hasna/cloud` today.
+### Worktrees
+
+`repos` owns the worktree lifecycle. The canonical layout —
+`~/.hasna/repos/worktrees/<repo-name>/<worktree-name>`, no machine segment, named after the
+todos task where one exists — has been ratified for weeks and has not held. Measured on this
+station on 2026-07-29, `repos worktree list` reconciled **1468** directories under that root:
+**303** checkouts sitting flat at the root, **218** buried under an extra segment (the
+forbidden `station01/` machine directory among them), **245** that are not worktrees at all,
+and **1465** with no lease of any kind.
+
+Prose did not hold the layout because every caller re-derived the path. So **`add` has no
+path option**:
+
+```bash
+repos worktree add open-repos --task a321ba13      # -> <root>/open-repos/a321ba13
+repos worktree add open-repos --name pr36-review   # the sanctioned fallback when no task exists
+```
+
+The destination is computed from the repo name and the worktree name. A name must be a
+single path segment, and the computed path is re-checked against the root after symlink
+resolution, so `--name ../../elsewhere` is refused before anything touches the filesystem.
+
+Caller-supplied refs (`--base`, `--branch`) are validated before they reach git. `git fetch
+origin <ref>` parses options anywhere on the line and `--upload-pack=<cmd>` names a program to
+run, so a ref beginning with `-` is not a ref — it is an argument to git. `check-ref-format`
+alone does not catch it (`refs/heads/--upload-pack=x` is a well-formed ref name); the leading-
+dash refusal and a conservative charset do, with `--` separators at the call sites as a second
+gate. The regression test keeps a positive control that fires the same payload at git directly,
+so "rejected" cannot quietly become "everything is rejected".
+
+The base ref is **fetched and pinned from origin**. A repo that has an origin must fetch;
+a fetch failure is `BASE_REF_UNRESOLVABLE` and the command stops, because branching off a
+stale local HEAD produces a PR carrying other people's reverts. A repo with no remote at all
+resolves locally and says so (`base.source: "local"`) — that is a different case, not a
+fallback.
+
+Re-running `add` for the same `(repo, task, base)` **returns the existing lease**. It does
+not destroy and recreate: an occupied path is `WORKTREE_PATH_OCCUPIED` and its contents are
+left exactly as they were.
+
+**The destructive verbs cannot be handed a path.** `remove` and `release` take a lease id or
+a `<repo>/<worktree>` pair; an absolute path, a relative path, a `..` component and a tilde
+are all rejected on argument shape, before resolution:
+
+```bash
+repos worktree remove wt_ebeae57c9eb805ae7f0e44ef
+repos worktree remove open-repos/a321ba13
+repos worktree remove open-repos/a321ba13 --discard-changes   # archives first, then forces
+```
+
+A dirty worktree is `WORKTREE_DIRTY` and a worktree carrying commits that exist on no remote
+is `WORKTREE_UNPUSHED`. `--discard-changes` is the only way past either, and it archives
+first: the working-tree diff, the porcelain status, the untracked file list, and a
+`git bundle` of the branch when there are unpushed commits, written under
+`<root>/.evidence/<lease-id>-<timestamp>/`. Untracked file *contents* are listed but not
+copied.
+
+`repos worktree adopt` is the only verb that accepts a raw path, it is read-only toward it,
+and it is a dry run unless `--apply` is given — 444 top-level entries is not a corpus anybody
+should mutate on the strength of a flag typed once.
+
+**These verbs read no credential of their own.** Nothing here touches `gh`, a token
+environment variable, or a vault, and `src/lib/worktrees-credential-isolation.test.ts` proves
+it in a child process built from an empty environment, with positive controls showing the
+probes can detect a credential when one is present.
+
+That is not the same as "works with no credential on the station". `add` fetches the base ref
+through the parent checkout's existing remote, so a **private https remote or an ssh remote
+without a key still needs whatever ambient git credential that remote demands** — without one,
+`add` fails closed with `BASE_REF_UNRESOLVABLE`. That limit is measured, not assumed: a test
+points the same code at a local endpoint returning 401 and asserts the hard failure. Public
+remotes, local remotes, and repos with no remote need nothing. Removing the remaining
+dependency is what the credential broker (design Phase 2) is for.
+
 ### Registry prune
 
 `repos registry prune` retires rows whose stored path no longer exists. There was

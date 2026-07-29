@@ -15,9 +15,9 @@ import {
   statSync,
 } from "node:fs";
 import type { Stats } from "node:fs";
-import { userInfo } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getDb, openNonMigratingDb } from "./database.js";
+import { resolveTrustedAccountHome } from "../lib/account-home.js";
 import { sanitizeGitRemoteUrl } from "../lib/remote-identity.js";
 import type { Repo } from "../types/index.js";
 
@@ -337,52 +337,14 @@ function validateBranchPreservationNamespace(value: string | undefined): string 
 }
 
 function trustedAccountHome(): string {
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  if (uid !== null && process.platform !== "win32") {
-    try {
-      const entry = readFileSync("/etc/passwd", "utf8")
-        .split("\n")
-        .map((line) => line.split(":"))
-        .find((fields) => Number(fields[2]) === uid);
-      const home = entry?.[5];
-      if (home && isAbsolute(home)) return resolve(home);
-    } catch {
-      // macOS commonly keeps directory-service users out of /etc/passwd.
-    }
-    if (process.platform === "darwin") {
-      try {
-        const output = execFileSync("dscacheutil", ["-q", "user", "-a", "uid", String(uid)], {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "ignore"],
-          timeout: 5_000,
-        });
-        const home = output.match(/^dir:\s*(\S.+)$/m)?.[1]?.trim();
-        if (home && isAbsolute(home)) return resolve(home);
-      } catch {
-        try {
-          const username = execFileSync("id", ["-nu", String(uid)], {
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "ignore"],
-            timeout: 5_000,
-          }).trim();
-          const output = execFileSync("dscl", [".", "-read", `/Users/${username}`, "NFSHomeDirectory"], {
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "ignore"],
-            timeout: 5_000,
-          });
-          const home = output.match(/^NFSHomeDirectory:\s*(\S.+)$/m)?.[1]?.trim();
-          if (home && isAbsolute(home)) return resolve(home);
-        } catch {
-          // Fail closed below rather than trusting process environment state.
-        }
-      }
-    }
+  const home = resolveTrustedAccountHome();
+  if (!home) {
     fail(
       "TRUSTED_HOME_UNAVAILABLE",
       "trusted account home could not be resolved from the operating system account database",
     );
   }
-  return resolve(userInfo().homedir);
+  return home;
 }
 
 function validateRequest(request: PrimaryRelocationRequest): ValidatedRequest {
