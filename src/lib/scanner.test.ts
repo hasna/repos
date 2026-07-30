@@ -1,12 +1,18 @@
 import { describe, it, expect, beforeEach, afterAll } from "bun:test";
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
 import { scanRepoPaths, scanRepos } from "./scanner";
 import { listRepos, listCommits, listBranches, listTags, listRemotes } from "../db/repos";
 
-const TEST_DIR = join(import.meta.dir, "../../.test-repos");
+// A temp dir, never a checkout-relative path: on the fleet this repo is developed
+// from checkouts under ~/.hasna/repos/worktrees/<repo>/<task>, and the derived-
+// checkout admission gate would refuse fixtures placed beneath that segment.
+// realpathSync so platforms where tmpdir() is a symlink (macOS /var -> /private/var)
+// compare equal to the realpaths the scanner records.
+const TEST_DIR = realpathSync(mkdtempSync(join(tmpdir(), "repos-scanner-test-")));
 
 function createTestRepo(name: string, commits = 1): string {
   const repoPath = join(TEST_DIR, name);

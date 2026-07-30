@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeEach, afterAll } from "bun:test";
 import { execSync } from "node:child_process";
-import { mkdirSync, rmSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database.js";
 import { readRemoteIdentity, scanRepos } from "./scanner.js";
 import { getRepo } from "../db/repos.js";
 
-const TEST_DIR = join(import.meta.dir, "../../.test-remote-preservation");
+// Temp dir, not checkout-relative — see scanner.test.ts: fixtures under a
+// worktrees path segment would be refused by the derived-checkout admission gate.
+const TEST_DIR = realpathSync(mkdtempSync(join(tmpdir(), "repos-remote-preservation-test-")));
 
 function createRepoWithOrigin(name: string, origin: string): string {
   const repoPath = join(TEST_DIR, name);
