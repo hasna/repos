@@ -109,6 +109,7 @@ export type WorktreeErrorCode =
   | "LEASE_CONFLICT"
   | "WORKTREE_DIRTY"
   | "WORKTREE_UNPUSHED"
+  | "WORKTREE_UNLANDED"
   | "TRUSTED_HOME_UNAVAILABLE"
   | "LAYOUT_INVARIANT_VIOLATED"
   | "GIT_FAILED";
@@ -123,6 +124,7 @@ export interface WorktreeErrorDetails {
   lease_id?: string;
   hint?: string;
   git_stderr?: string;
+  landing?: BranchLanding;
 }
 
 export class WorktreeError extends Error {
@@ -853,12 +855,213 @@ function upsertLease(db: Database, lease: WorktreeLease): void {
   );
 }
 
+// ── landing ──────────────────────────────────────────────────────────────────
+
+/**
+ * Has this branch's work actually landed?
+ *
+ * The owner directive of 2026-07-30 names one hazard by name: *"a worktree
+ * whose PR is almost landable — that is finished work one step from shipping,
+ * and deleting it throws the work away."* Neither existing guard sees it. A
+ * dirty check reads the working tree; `countUnpushedCommits` counts commits
+ * that exist on no remote, and the moment an agent pushes its branch and opens
+ * a PR that count is zero. So the exact worktree the directive is about was the
+ * one that removed without a word.
+ *
+ * Three signals, in this order, because each is authoritative over the ones
+ * below it:
+ *
+ *  1. **Unpushed commits.** Not a landing question at all — it is the more
+ *     severe and more actionable diagnosis, it already has its own refusal and
+ *     its own opt-in, and reporting it as "unlanded" would send an operator to
+ *     the wrong flag.
+ *  2. **The repos index's own pull-request rows.** When the index knows the PR,
+ *     its state is the answer and no git heuristic can improve on it. Read
+ *     locally: this module holds its no-credential property, so nothing here
+ *     calls `gh` or reaches the network.
+ *  3. **Containment in the remote base ref.** The fallback, because most repos
+ *     on this station carry no PR rows at all.
+ *
+ * Signal 3 is deliberately not ancestry alone. hasna merges by squash — every
+ * commit in this repo's own history is `<subject> (#<n>)` — so a landed branch
+ * tip is *never* an ancestor of `origin/main`, and an ancestry-only check would
+ * refuse every correctly-finished worktree on the station. Agents would pass
+ * the force flag by reflex and the guard would stop being read, which is worse
+ * than no guard. `git merge-tree --write-tree` answers the question that
+ * actually matters — would merging this branch into the base change anything —
+ * and returns the base's own tree when the content is already there.
+ *
+ * Everything here fails closed. An unresolvable base, a conflicting merge and a
+ * closed-but-unmerged PR all resolve to "not landed", because the cost of a
+ * false refusal is one explicit flag and the cost of a false pass is the work.
+ */
+export type BranchLandingReason =
+  | "unpushed"
+  | "detached-head"
+  | "no-remote"
+  | "pull-request-open"
+  | "pull-request-merged"
+  | "ancestor-of-base"
+  | "content-in-base"
+  | "not-in-base"
+  | "base-unresolvable";
+
+export interface LandingPullRequest {
+  number: number;
+  state: string;
+  url: string | null;
+  merged_at: string | null;
+}
+
+export interface BranchLanding {
+  landed: boolean;
+  reason: BranchLandingReason;
+  branch: string | null;
+  base_ref: string | null;
+  pull_request: LandingPullRequest | null;
+}
+
+/**
+ * The pull request this branch belongs to, as the repos index already knows it.
+ *
+ * Matched on the remote identity rather than on the local registry row where
+ * one is available: the same GitHub PR is indexed once per local checkout of
+ * that repository — the reason `upgradePullRequestGateColumns` treats `url` and
+ * not `(repo_id, number)` as a PR's identity — and this station registers
+ * worktrees as repos, so a branch's PR routinely sits under a different
+ * `repo_id` than the checkout the worktree hangs off.
+ */
+function pullRequestForBranch(
+  db: Database,
+  repo: Repo | null,
+  repoCatalogId: number | null,
+  branch: string,
+): LandingPullRequest | null {
+  let rows: LandingPullRequest[] = [];
+  try {
+    if (repo?.remote_url) {
+      rows = db
+        .query(
+          `SELECT p.number, p.state, p.url, p.merged_at
+             FROM pull_requests p JOIN repos r ON r.id = p.repo_id
+            WHERE r.remote_url = ? AND p.head_branch = ?`,
+        )
+        .all(repo.remote_url, branch) as LandingPullRequest[];
+    } else if (repoCatalogId !== null) {
+      rows = db
+        .query(
+          "SELECT number, state, url, merged_at FROM pull_requests WHERE repo_id = ? AND head_branch = ?",
+        )
+        .all(repoCatalogId, branch) as LandingPullRequest[];
+    }
+  } catch {
+    // An index predating the pull-request surface is a missing signal, not a
+    // failure: the git fallback below still answers the question.
+    return null;
+  }
+  if (rows.length === 0) return null;
+  // An open PR outranks a merged one. A branch can carry a merged PR and a
+  // newly opened one at the same time, and the open one is the work that would
+  // be lost.
+  return rows.find((row) => row.state === "open")
+    ?? rows.find((row) => row.state === "merged")
+    ?? rows[0]!;
+}
+
+function resolveRemoteBaseRef(path: string, baseRef: string | null): string | null {
+  const candidates: string[] = [];
+  // `base_ref` is a stored column, so it is validated before it is interpolated
+  // into a git argument — a lease row is not a trusted input.
+  if (baseRef && REF_ARGUMENT_PATTERN.test(baseRef)) {
+    candidates.push(`refs/remotes/origin/${baseRef}`);
+  }
+  candidates.push("refs/remotes/origin/HEAD");
+  for (const candidate of candidates) {
+    const resolved = runGit(path, ["rev-parse", "--verify", "--quiet", `${candidate}^{commit}`], {
+      allowFailure: true,
+    });
+    if (resolved.ok && resolved.stdout) return candidate;
+  }
+  return null;
+}
+
+function baseContainsBranch(path: string, remoteBase: string): "ancestor-of-base" | "content-in-base" | null {
+  if (runGit(path, ["merge-base", "--is-ancestor", "HEAD", remoteBase], { allowFailure: true }).ok) {
+    return "ancestor-of-base";
+  }
+  // The squash-merge case. Merging the branch into the base is a no-op exactly
+  // when the base already holds the content, and `merge-tree --write-tree`
+  // (git >= 2.38) computes that without a working tree or an index. A conflict
+  // exits non-zero, which is itself the answer: the content diverges.
+  const merged = runGit(path, ["merge-tree", "--write-tree", remoteBase, "HEAD"], { allowFailure: true });
+  if (!merged.ok) return null;
+  const mergedTree = merged.stdout.split("\n")[0]?.trim() ?? "";
+  const baseTree = gitOut(path, ["rev-parse", `${remoteBase}^{tree}`], { allowFailure: true });
+  return mergedTree && baseTree && mergedTree === baseTree ? "content-in-base" : null;
+}
+
+function evaluateLanding(
+  db: Database,
+  args: { path: string; unpushed: number; repo: Repo | null; repoCatalogId: number | null; baseRef: string | null },
+): BranchLanding {
+  const head = gitOut(args.path, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
+  const branch = head && head !== "HEAD" ? head : null;
+  const seed = { branch, base_ref: null as string | null, pull_request: null as LandingPullRequest | null };
+
+  if (args.unpushed > 0) return { landed: false, reason: "unpushed", ...seed };
+  // A detached HEAD has no branch to land. Signal 1 owns the only data at risk
+  // there, and it has already spoken.
+  if (!branch) return { landed: true, reason: "detached-head", ...seed };
+
+  const remotes = gitOut(args.path, ["remote"], { allowFailure: true }).split("\n").filter(Boolean);
+  if (remotes.length === 0) return { landed: true, reason: "no-remote", ...seed };
+
+  const pullRequest = pullRequestForBranch(db, args.repo, args.repoCatalogId, branch);
+  if (pullRequest?.state === "open") {
+    return { landed: false, reason: "pull-request-open", branch, base_ref: null, pull_request: pullRequest };
+  }
+  if (pullRequest?.state === "merged") {
+    return { landed: true, reason: "pull-request-merged", branch, base_ref: null, pull_request: pullRequest };
+  }
+  // A closed-but-unmerged PR is deliberately NOT treated as landed. It means the
+  // work was abandoned, which is a claim about intent that this code has no
+  // standing to make on the operator's behalf, so it falls through to git.
+
+  const remoteBase = resolveRemoteBaseRef(args.path, args.baseRef);
+  if (!remoteBase) {
+    return { landed: false, reason: "base-unresolvable", branch, base_ref: null, pull_request: pullRequest };
+  }
+  const contained = baseContainsBranch(args.path, remoteBase);
+  return contained
+    ? { landed: true, reason: contained, branch, base_ref: remoteBase, pull_request: pullRequest }
+    : { landed: false, reason: "not-in-base", branch, base_ref: remoteBase, pull_request: pullRequest };
+}
+
 // ── remove ───────────────────────────────────────────────────────────────────
 
 export interface RemoveWorktreeRequest {
   /** A lease id, or `<repo-name>/<worktree-name>`. Never a filesystem path. */
   ref: string;
   discardChanges?: boolean;
+  /**
+   * Override the unlanded-branch refusal.
+   *
+   * Deliberately NOT folded into `discardChanges`. "Throw away my uncommitted
+   * edits" and "destroy the worktree of an open pull request" are different
+   * decisions with different blast radii, and the directive's named hazard is
+   * the second one — so it gets an opt-in an operator has to type on purpose.
+   */
+  allowUnlanded?: boolean;
+  /**
+   * Report what would happen and change nothing.
+   *
+   * The shape a scheduled loop needs: a safety refusal comes back as a value on
+   * the result rather than as an exception, because enumerating 525 worktrees
+   * cannot drive control flow through a throw per entry. Argument-shape and
+   * containment failures still throw in every mode — a loop that can name a
+   * path is a loop that can be pointed at one.
+   */
+  dryRun?: boolean;
   db?: Database;
 }
 
@@ -869,6 +1072,12 @@ export interface RemoveWorktreeResult {
   branch: string | null;
   lease_id: string | null;
   evidence_path: string | null;
+  dry_run: boolean;
+  /** What a non-dry run would do right now, with the same flags. */
+  would_remove: boolean;
+  /** The refusal that stopped it, or would have. */
+  refusal: WorktreeErrorCode | null;
+  landing: BranchLanding;
 }
 
 type ParsedRef =
@@ -914,6 +1123,7 @@ interface ResolvedTarget {
   lease: WorktreeLease | null;
   branch: string | null;
   parentPath: string | null;
+  repoCatalogId: number | null;
 }
 
 function resolveRemovalTarget(db: Database, ref: string): ResolvedTarget {
@@ -921,17 +1131,48 @@ function resolveRemovalTarget(db: Database, ref: string): ResolvedTarget {
   if (parsed.kind === "lease") {
     const lease = leaseById(db, parsed.leaseId);
     if (!lease) fail("LEASE_NOT_FOUND", `no lease '${parsed.leaseId}'`, { lease_id: parsed.leaseId });
-    return { path: lease.worktree_path, lease, branch: lease.branch, parentPath: lease.repo_path };
+    return {
+      path: lease.worktree_path,
+      lease,
+      branch: lease.branch,
+      parentPath: lease.repo_path,
+      repoCatalogId: lease.repo_catalog_id,
+    };
   }
   const path = join(worktreeRootDir(), parsed.repoName, parsed.worktreeName);
   const lease = leaseByPath(db, path);
-  if (lease) return { path, lease, branch: lease.branch, parentPath: lease.repo_path };
+  if (lease) {
+    return {
+      path,
+      lease,
+      branch: lease.branch,
+      parentPath: lease.repo_path,
+      repoCatalogId: lease.repo_catalog_id,
+    };
+  }
   if (!existsSync(path)) {
     fail("LEASE_NOT_FOUND", `no lease and no directory for '${ref}'`, { path });
   }
   // An adopted stray: on disk and a real worktree, but never leased. It is
   // still removable, because refusing here would leave the corpus unmanageable.
-  return { path, lease: null, branch: null, parentPath: null };
+  return { path, lease: null, branch: null, parentPath: null, repoCatalogId: null };
+}
+
+/**
+ * The registry row a worktree hangs off, for a stray that carries no lease.
+ *
+ * Without it the pull-request signal would be blind for exactly the 1465
+ * leaseless directories measured under the live root — the population the
+ * cleanup loop is aimed at.
+ */
+function repoRowForTarget(db: Database, target: ResolvedTarget, path: string): Repo | null {
+  if (target.repoCatalogId !== null) {
+    return (db.query("SELECT * FROM repos WHERE id = ?").get(target.repoCatalogId) as Repo | null) ?? null;
+  }
+  const commonDir = realpathOrSelf(
+    gitOut(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { allowFailure: true }),
+  );
+  return commonDir ? repoRowForCommonDir(db, commonDir) : null;
 }
 
 /**
@@ -944,7 +1185,12 @@ function resolveRemovalTarget(db: Database, ref: string): ResolvedTarget {
  * stated here rather than implied, because an archive that silently omits
  * something is worse than one that says what it omits.
  */
-function archiveBeforeReap(target: ResolvedTarget, leaseId: string): string {
+function archiveBeforeReap(
+  target: ResolvedTarget,
+  leaseId: string,
+  landing: BranchLanding,
+  bundleBranch: boolean,
+): string {
   // The archive directory is named after the lease, and on the
   // `<repo>/<worktree>` path that id comes from the database row rather than
   // from the argument — so unlike a lease-id reference it has never been
@@ -976,8 +1222,14 @@ function archiveBeforeReap(target: ResolvedTarget, leaseId: string): string {
   capture("tracked-changes.patch", ["diff", "HEAD"]);
   capture("untracked-files.txt", ["ls-files", "--others", "--exclude-standard"]);
 
-  const unpushed = countUnpushedCommits(target.path);
-  if (unpushed > 0) {
+  // Why the removal was allowed to proceed, in the archive rather than only in
+  // the caller's return value. When an operator or a loop overrides the
+  // unlanded refusal, the pull request it overrode is the single most useful
+  // fact for whoever finds this directory later, and a channel post is not
+  // where they will be looking.
+  writeFileSync(join(evidenceDir, "landing.json"), `${JSON.stringify(landing, null, 2)}\n`);
+
+  if (bundleBranch) {
     // `HEAD` is always bundled, and it is what makes this archive honest.
     //
     // The first version bundled the *lease's* branch. A detached HEAD — rebase,
@@ -1048,24 +1300,87 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
 
   const dirty = gitOut(resolved, ["status", "--porcelain"], { allowFailure: true });
   const unpushed = countUnpushedCommits(resolved);
-  if (!request.discardChanges) {
-    if (dirty) {
-      fail("WORKTREE_DIRTY", "the worktree has uncommitted changes", {
-        path: resolved,
+  const landing = evaluateLanding(db, {
+    path: resolved,
+    unpushed,
+    repo: repoRowForTarget(db, target, resolved),
+    repoCatalogId: target.repoCatalogId,
+    baseRef: target.lease?.base_ref ?? null,
+  });
+
+  /**
+   * Every safety refusal, evaluated together rather than short-circuited.
+   *
+   * A loop classifying the corpus needs the first blocking reason and needs it
+   * without a mutation, so the checks are a pure function of the state and the
+   * flags; the mode decides only whether the answer is thrown or returned.
+   */
+  const refusal: { code: WorktreeErrorCode; message: string; hint: string } | null = (() => {
+    if (dirty && !request.discardChanges) {
+      return {
+        code: "WORKTREE_DIRTY" as const,
+        message: "the worktree has uncommitted changes",
         hint: "commit or pass --discard-changes; a forced teardown archives the diff first",
-      });
+      };
     }
-    if (unpushed > 0) {
-      fail("WORKTREE_UNPUSHED", `the worktree carries ${unpushed} commit(s) that exist on no remote`, {
-        path: resolved,
+    if (unpushed > 0 && !request.discardChanges) {
+      return {
+        code: "WORKTREE_UNPUSHED" as const,
+        message: `the worktree carries ${unpushed} commit(s) that exist on no remote`,
         hint: "push the branch or pass --discard-changes; a forced teardown bundles the branch first",
-      });
+      };
     }
+    // `unpushed` is excluded here on purpose: it is the same fact, already
+    // reported above with a more actionable remedy, and `--discard-changes` is
+    // the opt-in that governs it. Re-refusing it as "unlanded" would demand a
+    // second flag for one hazard.
+    if (!landing.landed && landing.reason !== "unpushed" && !request.allowUnlanded) {
+      const pr = landing.pull_request;
+      return {
+        code: "WORKTREE_UNLANDED" as const,
+        message: pr
+          ? `the branch has an open pull request (#${pr.number}); its work has not landed`
+          : `the branch is not contained in its base (${landing.reason})`,
+        hint: "land the pull request, or pass --allow-unlanded; the teardown bundles the branch first."
+          + " --discard-changes does NOT cover this: destroying an open PR's worktree is its own decision",
+      };
+    }
+    return null;
+  })();
+
+  if (request.dryRun) {
+    return {
+      schema: WORKTREE_LEASE_SCHEMA,
+      removed: false,
+      path: resolved,
+      branch: landing.branch,
+      lease_id: target.lease?.lease_id ?? null,
+      evidence_path: null,
+      dry_run: true,
+      would_remove: refusal === null,
+      refusal: refusal?.code ?? null,
+      landing,
+    };
+  }
+  if (refusal) {
+    fail(refusal.code, refusal.message, {
+      path: resolved,
+      hint: refusal.hint,
+      branch: landing.branch ?? undefined,
+      landing,
+    });
   }
 
   const leaseId = target.lease?.lease_id ?? `adopted-${Date.now()}`;
-  const evidencePath = request.discardChanges && (dirty || unpushed > 0)
-    ? archiveBeforeReap({ ...target, path: resolved }, leaseId)
+  // Archive whenever a refusal was overridden — that is what makes this
+  // delete-WITH-archive rather than a slower `rm -rf`. The branch is bundled
+  // when its commits are at risk (unpushed) or when an unlanded branch is being
+  // torn down anyway, in which case the remote copy can still disappear with
+  // the PR.
+  const overrodeUnlanded = Boolean(request.allowUnlanded) && !landing.landed && landing.reason !== "unpushed";
+  const archiving = (request.discardChanges && (dirty || unpushed > 0)) || overrodeUnlanded;
+  const evidencePath = archiving
+    ? archiveBeforeReap({ ...target, path: resolved }, leaseId, landing, unpushed > 0 || overrodeUnlanded)
     : null;
 
   const parentForGit = target.parentPath && existsSync(target.parentPath) ? target.parentPath : resolved;
@@ -1086,6 +1401,11 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
     : ["worktree", "remove", resolved]);
   runGit(parentForGit, ["worktree", "prune"], { allowFailure: true });
   if (branch && REF_ARGUMENT_PATTERN.test(branch)) {
+    // `-d` on the unlanded path is load-bearing, not incidental: git refuses to
+    // delete an unmerged branch, so overriding the refusal reclaims the
+    // directory while the commits stay reachable by name in the parent
+    // checkout. Only `--discard-changes`, whose whole meaning is "destroy this",
+    // escalates to `-D`.
     runGit(
       parentForGit,
       request.discardChanges ? ["branch", "-D", "--", branch] : ["branch", "-d", "--", branch],
@@ -1106,6 +1426,10 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
     branch,
     lease_id: target.lease?.lease_id ?? null,
     evidence_path: evidencePath,
+    dry_run: false,
+    would_remove: true,
+    refusal: null,
+    landing,
   };
 }
 

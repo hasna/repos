@@ -1120,13 +1120,39 @@ worktree
   .command("remove <ref>")
   .description("Remove a worktree by lease id or <repo>/<worktree> — never by path")
   .option("--discard-changes", "Archive the dirty state and branch, then force the teardown")
+  .option(
+    "--allow-unlanded",
+    "Tear down a worktree whose branch has not landed (open PR, or content not in the base)",
+  )
+  .option("--dry-run", "Report what would happen and change nothing")
   .option("--json", "Output the versioned JSON result")
   .action((ref, opts) => {
     const json = Boolean(opts.json);
     try {
-      const result = removeWorktree({ ref, discardChanges: Boolean(opts.discardChanges) });
+      const result = removeWorktree({
+        ref,
+        discardChanges: Boolean(opts.discardChanges),
+        allowUnlanded: Boolean(opts.allowUnlanded),
+        dryRun: Boolean(opts.dryRun),
+      });
       if (json) {
         printJson(result);
+        // A dry run that reports a refusal is a successful report, not a failed
+        // removal, so it exits 0 — a scheduled loop enumerating the corpus
+        // reads the payload and must not see every guarded worktree as an error.
+        return;
+      }
+      if (result.dry_run) {
+        const pr = result.landing.pull_request;
+        if (result.would_remove) {
+          console.log(chalk.green(`would remove ${result.path}`));
+        } else {
+          console.log(chalk.yellow(`would REFUSE ${result.path}: ${result.refusal}`));
+        }
+        console.log(chalk.dim(
+          `  landing: ${result.landing.reason}${pr ? ` (PR #${pr.number}, ${pr.state})` : ""}`,
+        ));
+        console.log(chalk.dim("  Nothing was changed."));
         return;
       }
       console.log(chalk.green(`✓ removed ${result.path}`));

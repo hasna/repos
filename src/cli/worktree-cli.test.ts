@@ -103,6 +103,19 @@ describe("repos worktree — argument surface", () => {
     expect(errorOf(result.stdout).code).toBe("REPO_NOT_FOUND");
   });
 
+  test("`worktree remove` is callable by a scheduled loop: a dry run and a JSON payload", () => {
+    // Requirement 3 of the owner directive — "built so a scheduled loop can call
+    // it later without reshaping it" — asserted at the surface a loop actually
+    // invokes, because a library-only capability is not one a cron line can use.
+    const dbPath = seedDb();
+    const help = runCli(dbPath, ["worktree", "remove", "--help"]);
+    expect(help.stdout).toContain("--dry-run");
+    expect(help.stdout).toContain("--json");
+    // The unlanded hazard gets its own opt-in, and the help says so rather than
+    // leaving an operator to discover it from a refusal.
+    expect(help.stdout).toContain("--allow-unlanded");
+  });
+
   test("`worktree adopt` is the only verb that accepts a path, and defaults to a dry run", () => {
     const dbPath = seedDb();
     const help = runCli(dbPath, ["worktree", "adopt", "--help"]);
