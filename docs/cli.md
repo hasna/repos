@@ -115,7 +115,7 @@ system account rather than caller-controlled `$HOME`.
 |---|---|
 | `repos worktree add <repo>` | Exactly one of `--task` or `--name`; optional `--base`, `--branch`, `--run-id`, `--cleanup-policy delete-if-clean\|keep`, `--json` |
 | `repos worktree list [repo]` | `--stale`, `--stale-days`, `--json` |
-| `repos worktree remove <ref>` | Reference is a lease ID or `<repo>/<worktree>`, never a path; `--discard-changes`, `--json` |
+| `repos worktree remove <ref>` | Reference is a lease ID or `<repo>/<worktree>`, never a path; `--discard-changes`, `--allow-unlanded`, `--dry-run`, `--json` |
 | `repos worktree adopt [path]` | The only raw-path worktree verb; dry run by default; `--all`, `--apply`, `--json` |
 | `repos worktree release <lease-id>` | Apply the lease cleanup policy; `--keep`, `--json` |
 
