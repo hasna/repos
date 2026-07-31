@@ -89,6 +89,33 @@ describe("classifyCheckout against real git fixtures", () => {
     expect(git(path, ["rev-parse", "HEAD"]).code).not.toBe(0);
   });
 
+  test("an empty packed-refs does not make a repository with no commits usable", () => {
+    const path = makeRepo("unborn-empty-packed-refs", { commit: false });
+    writeFileSync(join(path, ".git", "packed-refs"), "");
+    expect(readdirSync(join(path, ".git", "refs", "heads"))).toEqual([]);
+
+    const result = classifyCheckout(path);
+    expect(result.state).toBe("no-commits");
+  });
+
+  test("a header-only packed-refs does not make a repository with no commits usable", () => {
+    const path = makeRepo("unborn-header-only-packed-refs", { commit: false });
+    writeFileSync(join(path, ".git", "packed-refs"), "# pack-refs with: peeled fully-peeled sorted \n");
+    expect(readdirSync(join(path, ".git", "refs", "heads"))).toEqual([]);
+
+    const result = classifyCheckout(path);
+    expect(result.state).toBe("no-commits");
+  });
+
+  test("a packed ref still makes a repository usable when no loose heads remain", () => {
+    const path = makeRepo("packed-head");
+    expect(git(path, ["pack-refs", "--all"]).code).toBe(0);
+    expect(readdirSync(join(path, ".git", "refs", "heads"))).toEqual([]);
+
+    const result = classifyCheckout(path);
+    expect(result.state).toBe("usable");
+  });
+
   test("a live linked worktree is usable, and git agrees", () => {
     const parent = makeRepo("wt-parent");
     const wt = join(root, "wt-live");

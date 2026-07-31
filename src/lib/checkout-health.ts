@@ -107,6 +107,8 @@ export interface PathProbe {
   presence: PathPresence;
   /** The errno that blocked the probe, when one did. Named in the message so an operator can act. */
   code: string | null;
+  /** File size when the probe found the path. Omitted by implementations that cannot establish it. */
+  size?: number;
 }
 
 /** Injectable filesystem, so every branch is reachable in a test. */
@@ -144,8 +146,8 @@ export const nodeCheckoutFs: CheckoutFs = {
   probe: (path) => {
     try {
       // `statSync`, not `existsSync`: the same syscall, but the errno survives.
-      statSync(path);
-      return { presence: "present", code: null };
+      const stat = statSync(path);
+      return { presence: "present", code: null, size: stat.size };
     } catch (error) {
       const code = errnoOf(error);
       return code !== null && ABSENT_ERRNOS.has(code)
@@ -220,13 +222,34 @@ function scanGitDirEntries(fs: CheckoutFs, gitDir: string): GitDirScan {
  * a ref that exists nowhere in `refs/` or `packed-refs`.
  */
 function hasAnyRef(fs: CheckoutFs, commonDir: string): boolean {
-  // Only a probe that positively establishes absence counts as absence here.
-  // Unreadable ref storage must not downgrade a populated repository to
-  // "no commits", because that tells a caller `git worktree add` will refuse when
-  // it would in fact succeed. (An unreadable common dir is normally already caught
-  // by `scanGitDirEntries`; the direction is stated here because this is where it
-  // is decided.)
-  if (probe(fs, join(commonDir, "packed-refs")).presence !== "absent") return true;
+  // Only positive evidence that ref storage is empty counts here. Unreadable ref
+  // storage must not downgrade a populated repository to "no commits", because
+  // that tells a caller `git worktree add` will refuse when it would in fact
+  // succeed. (An unreadable common dir is normally already caught by
+  // `scanGitDirEntries`; the direction is stated here because this is where it is
+  // decided.)
+  const packedRefsPath = join(commonDir, "packed-refs");
+  const packedRefs = probe(fs, packedRefsPath);
+  if (packedRefs.presence === "unreadable") return true;
+  if (packedRefs.presence === "present") {
+    if (packedRefs.size === undefined) return true;
+    // Avoid reading an arbitrarily large ref index on every checkout lookup.
+    // Git's header-only representation is tiny; larger files conservatively
+    // count as possibly populated rather than being read wholesale.
+    const MAX_EMPTY_PACKED_REFS_BYTES = 4 * 1024;
+    if (packedRefs.size > MAX_EMPTY_PACKED_REFS_BYTES) return true;
+    try {
+      // packed-refs may contain only its `# pack-refs with:` header. File size
+      // therefore cannot establish that a ref exists; only a non-comment entry
+      // can. Any unrecognised non-comment content stays on the conservative side.
+      const hasPackedRef = fs.readText(packedRefsPath)
+        .split(/\r?\n/)
+        .some((line) => line.length > 0 && !line.startsWith("#"));
+      if (hasPackedRef) return true;
+    } catch {
+      return true;
+    }
+  }
   const headsDir = join(commonDir, "refs", "heads");
   const heads = probe(fs, headsDir);
   if (heads.presence === "absent") return false;
