@@ -23,6 +23,7 @@
   "files": [
     "dist",
     "dashboard/dist",
+    "docs",
     "LICENSE",
     "README.md"
   ],

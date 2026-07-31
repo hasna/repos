@@ -11,7 +11,7 @@ bun install -g @hasna/repos
 ## Quick Start
 
 ```bash
-# Scan all repos under ~/Workspace
+# Scan the configured workspace roots (defaults to existing ~/workspace or ~/Workspace)
 repos scan
 
 # List all tracked repos
@@ -27,11 +27,24 @@ repos stats
 repos-serve  # http://localhost:19450
 ```
 
-## CLI Commands
+## Documentation
+
+- [Complete CLI and executable reference](docs/cli.md)
+- [Configuration, database selection, and automatic indexing](docs/configuration.md)
+- [MCP transports and all 36 tools](docs/mcp.md)
+- [HTTP API and dashboard](docs/http-api.md)
+- [TypeScript SDK](docs/sdk.md)
+
+## Common CLI Commands
+
+This table highlights the main surfaces. The [CLI reference](docs/cli.md) tracks
+every command, option group, standalone executable, and the event commands
+registered by `@hasna/events`.
 
 | Command | Description |
 |---------|-------------|
 | `repos scan` | Discover and index all git repos |
+| `repos watch` | Continuously discover repos and process post-commit index events |
 | `repos repos` | List repositories |
 | `repos repo <name>` / `repos show <name>` / `repos inspect <name>` | Get repo details |
 | `repos worktree add <repo> --task <id>` | Create a worktree at the computed canonical path and claim a lease |
@@ -45,21 +58,25 @@ repos-serve  # http://localhost:19450
 | `repos registry prune` | Retire registry rows whose path no longer exists (dry run unless explicitly confirmed) |
 | `repos registry health` | Report how many registry rows point at a usable git checkout |
 | `repos registry relocate-primary` | Losslessly absorb a registered canonical target into a preserved legacy repo ID |
+| `repos registry adjudicate-branches` | Dry-run/apply exact audited branch-row reclassification specs |
 | `repos commits` | List commits |
 | `repos branches` | List branches |
 | `repos tags` | List tags |
 | `repos prs` | List pull requests |
 | `repos search <query>` | Unified search across all entities |
 | `repos stats` | Global statistics |
+| `repos status` | Stable metadata-only inventory status |
 | `repos activity` | Recent commit activity |
 | `repos contributors` | Top contributors |
 | `repos stale` | Stale repos with no recent commits |
 | `repos heatmap` | Commit activity heatmap |
+| `repos health` | Combined dirty, unpushed, behind, and stale report |
 | `repos sync-github` | Sync PRs from GitHub |
 | `repos gh-info <name>` | Fetch GitHub metadata |
 | `repos gh-catalog` | Enumerate/cache GitHub repository catalog JSON for OpenLoops |
 | `repos package health [path]` | Check package scripts, bins, lockfiles, and release metadata |
 | `repos package drift [path]` | Compare package.json against bun.lock |
+| `repos package dependents` | Confirm exact manifest dependency edges across candidate repos |
 | `repos package resolve-bin [name]` | Resolve package bins from package.json, node_modules, or PATH |
 | `repos ports scan [path]` | Scan listening ports and match package script port hints |
 | `repos triage branches [path]` | Summarize branch, dirty, stale, merged, ahead/behind state |
@@ -78,6 +95,9 @@ repos-serve  # http://localhost:19450
 | `repos ops workspace-worktree-hygiene` | Scan workspace repos for stale, dirty, detached, or missing loop worktrees |
 | `repos ops task-route-health` | Check that task-created lifecycle router loops are active and recently succeeding |
 | `repos ops protected-release` | Emit a protected release task only when release-candidate gates are green |
+| `repos graph ...` | Build and query the repository knowledge graph |
+| `repos events ...` / `repos webhooks ...` | Emit/replay events and manage event subscriptions |
+| `repos backup` / `repos restore` | Copy or restore the selected SQLite registry |
 
 CLI output is compact by default so it stays readable in agent terminals:
 
@@ -91,7 +111,8 @@ CLI output is compact by default so it stays readable in agent terminals:
 
 `repos no-cloud inventory --include-npm` checks published `@hasna` packages for a
 surviving dependency on the retired `@hasna/cloud`. The list of packages to check is the
-**union of two sources**, because neither is authoritative alone:
+**union of local manifests and two registry sources**, because none is
+authoritative alone:
 
 - **local manifests** under the scan root — correct for what this machine has checked out,
   but blind to any package whose repo is not cloned here, and keyed on the manifest `name`,
@@ -533,10 +554,11 @@ Actual publishing belongs in a separate approved/protected release step.
 ## MCP Server
 
 ```bash
-repos-mcp
+repos-mcp          # Streamable HTTP on 127.0.0.1:8874
+repos-mcp --stdio  # stdio transport for an owning MCP client
 ```
 
-34 tools available for AI agents:
+36 tools available for AI agents:
 
 - `list_repos`, `get_repo`, `search_repos`
 - `list_commits`, `search_commits`
@@ -550,10 +572,13 @@ repos-mcp
 - `graph_build`, `graph_query`, `graph_related`, `graph_path`, `graph_deps`, `graph_stats`
 - `package_health`, `package_drift`, `package_resolve_bin`
 - `ports_scan`, `triage_branches`, `triage_prs`
-- `docs_drift`, `release_health`
+- `docs_drift`, `release_health`, `release_pipeline_parity`, `manifest_dependents`
 - `register_agent`, `heartbeat`, `list_agents`
 
 MCP list/search/detail tools return compact JSON summaries by default to avoid dumping large records into agent context. Pass `verbose: true` to a tool call when you need the full records, and use `limit`/`offset` where available to page through large result sets.
+
+See the [MCP reference](docs/mcp.md) for transports, arguments, limits, and the
+complete categorized tool list.
 
 ## REST API
 
@@ -573,7 +598,11 @@ repos-serve  # Default port: 19450
 | `/api/prs` | GET | List PRs |
 | `/api/search` | GET | Unified search |
 | `/api/stats` | GET | Global stats |
+| `/api/health` | GET | Dirty, unpushed, behind, and stale checkout report |
 | `/api/scan` | POST | Trigger scan |
+
+Query parameters, defaults, MCP routes, CORS, and dashboard behavior are in the
+[HTTP API reference](docs/http-api.md).
 
 ## SDK
 
@@ -584,6 +613,9 @@ const result = await scanRepos(["/home/user/code"]);
 const repos = listRepos({ org: "myorg" });
 const results = searchAll("authentication");
 ```
+
+The [SDK reference](docs/sdk.md) lists every package-root value export and the
+database lifetime and guarded-mutation contracts.
 
 ## OpenLoops GitHub Catalog
 
@@ -627,22 +659,29 @@ The catalog is cacheable and resumable. By default `repos gh-catalog` reads the 
 
 ## HTTP mode
 
-Run a shared Streamable HTTP MCP server (stateless, `127.0.0.1` only):
+The standalone MCP executable defaults to a shared stateless Streamable HTTP
+server on `127.0.0.1`:
 
 ```bash
-repos-mcp --http              # default port 8830
-MCP_HTTP=1 repos-mcp          # via env
-repos-mcp --http --port 8830
+repos-mcp                     # default port 8874
+repos-mcp --http --port 9000  # explicit HTTP mode/port
+repos-mcp --stdio             # child-process stdio transport
+MCP_STDIO=1 repos-mcp         # stdio via env
 ```
 
-- Health: `GET http://127.0.0.1:8830/health`
-- MCP: `http://127.0.0.1:8830/mcp`
-- Stdio remains the default when `--http` / `MCP_HTTP=1` are not set.
+- Health: `GET http://127.0.0.1:8874/health`
+- MCP: `http://127.0.0.1:8874/mcp`
+- Override the HTTP port with `--port` or `MCP_HTTP_PORT`.
 - `repos-serve` also mounts `/health` and `/mcp` on its HTTP port.
 
 ## Data Storage
 
-SQLite database at `~/.hasna/repos/repos.db` with WAL mode and FTS5 full-text search.
+The local index is SQLite with WAL mode and FTS5. Explicit database environment
+variables win; otherwise the CLI uses the nearest `.repos/repos.db`, then
+`~/.hasna/repos/repos.db`, with a legacy fallback when appropriate. An optional
+Postgres mirror synchronizes repository catalog and automation state only. See
+[Configuration and storage](docs/configuration.md) for exact precedence and
+environment variables.
 
 ## License
 
