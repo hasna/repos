@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.38
 
 Adds fail-closed checkout health for repository lookups and a registry-wide health command
 (#33).
