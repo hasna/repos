@@ -682,15 +682,8 @@ export function addWorktree(request: AddWorktreeRequest): AddWorktreeResult {
     // lookup resolving `github.com/hasna/<x>` prefers the primary clone over
     // any worktree of it (`getRepoByRemote` narrows on exactly this predicate).
     //
-    // What this does NOT buy, measured 2026-07-29 and stated here so nobody
-    // reads more into it: `repos scan` still *registers* worktrees as repos.
-    // `repos scan --root <a fresh worktree under the canonical root>` took the
-    // index from 1669 rows to 1670 and added a row for the worktree. The
-    // derived-checkout predicate governs resolution ranking, not scan
-    // admission — which is why registry rows 981-985 are
-    // `~/.hasna/loops/worktrees/open-repos/*` registered as repositories.
-    // Fixing scan admission is filed separately; this assertion is only about
-    // the ranking property.
+    // The scanner uses this same predicate as its admission rule, while this
+    // assertion protects the complementary lookup-ranking invariant here.
     fail("LAYOUT_INVARIANT_VIOLATED", "the computed worktree path is not recognised as a derived checkout", {
       path: resolvedTarget,
       root,
