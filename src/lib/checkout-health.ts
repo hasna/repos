@@ -54,6 +54,7 @@
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
 export type CheckoutState =
   /** A repository git can open: real clone, or a linked worktree with a live common dir. */
@@ -456,8 +457,8 @@ export function describeCheckoutRemedy(
   reportedHealth: CheckoutHealth,
   opts: { remoteUrl?: string | null; repoName?: string | null } = {},
 ): string {
-  const remote = opts.remoteUrl?.trim();
-  const cloneTarget = remote ? `https://${remote.replace(/^https?:\/\//, "")}` : null;
+  const remote = sanitizeRemoteIdentity(opts.remoteUrl);
+  const cloneTarget = remote ? `https://${remote}` : null;
   const cloneHint = cloneTarget
     ? `Re-clone it with: git clone ${cloneTarget} <path>`
     : "This row records no remote, so there is nothing to re-clone from; remove the row instead.";
