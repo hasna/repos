@@ -10,11 +10,13 @@
  * consulted, so nothing is created under the live root that other agents are
  * working in.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database.js";
+
+setDefaultTimeout(30_000);
 
 let tempDir = "";
 

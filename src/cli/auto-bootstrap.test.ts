@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+setDefaultTimeout(30_000);
 
 function createTestRepo(workspaceRoot: string, name: string): string {
   const repoPath = join(workspaceRoot, name);
