@@ -209,8 +209,8 @@ describe("addWorktree", () => {
 
   test("refuses a broken parent checkout instead of wedging on it", () => {
     // The live instance: registry row 92's `.git` holds only `hooks/` and
-    // `worktrees/`, and `git rev-parse` there exits 128. Every verb that
-    // assumes a healthy parent turns that into a confusing git error.
+    // `worktrees/`, and the structural checkout classifier rejects it. Every
+    // verb that assumes a healthy parent turns that into a confusing git error.
     const { clonePath, repoName } = seed();
     rmSync(join(clonePath, ".git"), { recursive: true, force: true });
     mkdirSync(join(clonePath, ".git", "hooks"), { recursive: true });
@@ -218,6 +218,20 @@ describe("addWorktree", () => {
 
     expect(codeOf(() => addWorktree({ repo: repoName, task: "a321ba13" })))
       .toBe("PARENT_CHECKOUT_BROKEN");
+  });
+
+  test("uses the structural checkout verdict for a populated bare parent", () => {
+    // `classifyCheckout` deliberately accepts a populated bare repository.
+    // The former `rev-parse --is-inside-work-tree` judgement rejected it even
+    // though `git worktree add` supports it, which let the two owners drift.
+    const { root, originPath, repoName, db } = seed();
+    db.prepare("UPDATE repos SET path = ? WHERE name = ?").run(originPath, repoName);
+
+    const result = addWorktree({ repo: repoName, task: "a321ba13" });
+
+    expect(result.path).toBe(join(root, repoName, "a321ba13"));
+    expect(result.lease.git_common_dir).toBe(realpathSync(originPath));
+    expect(existsSync(join(result.path, "README.md"))).toBe(true);
   });
 
   test("refuses an occupied path and leaves its contents untouched", () => {

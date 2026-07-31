@@ -67,6 +67,7 @@ import { getDb } from "../db/database.js";
 import { AmbiguousRepoNameError, getRepo, isDerivedCheckoutPath } from "../db/repos.js";
 import type { Repo } from "../types/index.js";
 import { resolveTrustedAccountHome } from "./account-home.js";
+import { classifyCheckout, describeCheckoutRemedy } from "./checkout-health.js";
 import { getSourceMachineId } from "./machine-id.js";
 import { sanitizeRemoteIdentity } from "./remote-identity.js";
 
@@ -375,7 +376,8 @@ interface ParentCheckout {
 
 /**
  * Assert the parent checkout is a working repository before anything is built
- * on top of it.
+ * on top of it. Checkout health is classified structurally in one place; this
+ * lifecycle only translates that verdict into its own error contract.
  *
  * The live counter-example: registry row 92 points at
  * `/home/hasna/workspace/hasna/opensource/open-repos`, whose `.git` holds only
@@ -385,32 +387,25 @@ interface ParentCheckout {
  */
 function assertHealthyParent(repo: Repo): ParentCheckout {
   const path = repo.path;
-  if (!existsSync(path)) {
-    fail("PARENT_CHECKOUT_BROKEN", `the registered checkout for '${repo.name}' does not exist`, {
+  const health = classifyCheckout(path);
+  if (!health.usable) {
+    const remedy = describeCheckoutRemedy(health, {
+      remoteUrl: repo.remote_url,
+      repoName: repo.name,
+    });
+    fail("PARENT_CHECKOUT_BROKEN", `the registered checkout for '${repo.name}' is not usable`, {
       repo: repo.name,
       path,
-      hint: "the registry row is stale; re-clone the repo or prune the row",
+      hint: `${health.detail}. ${remedy}`,
     });
   }
-  const inside = runGit(path, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true });
-  if (!inside.ok || inside.stdout !== "true") {
-    fail("PARENT_CHECKOUT_BROKEN", `the registered checkout for '${repo.name}' is not a git repository`, {
-      repo: repo.name,
-      path,
-      git_stderr: inside.stderr,
-      hint: "the checkout is a husk (a .git holding only hooks/ and worktrees/ is the known shape); re-clone it",
-    });
-  }
-  const commonDir = gitOut(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-    allowFailure: true,
-  });
-  if (!commonDir) {
-    fail("PARENT_CHECKOUT_BROKEN", `the git directory for '${repo.name}' could not be resolved`, {
+  if (!health.common_dir) {
+    fail("PARENT_CHECKOUT_BROKEN", `the git directory for '${repo.name}' was not classified`, {
       repo: repo.name,
       path,
     });
   }
-  return { path: realpathOrSelf(path), commonDir: realpathOrSelf(commonDir) };
+  return { path: realpathOrSelf(path), commonDir: realpathOrSelf(health.common_dir) };
 }
 
 function repoIdentity(repo: Repo): string {
