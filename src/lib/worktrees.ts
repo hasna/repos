@@ -583,6 +583,14 @@ function resolveBase(parent: ParentCheckout, baseRef: string): ResolvedBase {
  */
 const REF_ARGUMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/@+-]{0,254}$/;
 
+/**
+ * The last-resort base branch, when neither `origin/HEAD` nor the indexed
+ * `default_branch` answers. It mirrors the registry's own column default
+ * (`repos.default_branch TEXT NOT NULL DEFAULT 'main'`, see `db/database.ts`)
+ * so the two surfaces cannot disagree about what "unset" means.
+ */
+const DEFAULT_BRANCH_FALLBACK = "main";
+
 function assertRefArgument(
   parent: ParentCheckout,
   value: string,
@@ -904,6 +912,7 @@ export type BranchLandingReason =
   | "ancestor-of-base"
   | "content-in-base"
   | "not-in-base"
+  | "base-is-branch"
   | "base-unresolvable";
 
 export interface LandingPullRequest {
@@ -1026,6 +1035,20 @@ function evaluateLanding(
   // A closed-but-unmerged PR is deliberately NOT treated as landed. It means the
   // work was abandoned, which is a claim about intent that this code has no
   // standing to make on the operator's behalf, so it falls through to git.
+
+  // A lease whose base ref IS the branch asks whether the branch contains
+  // itself, and the answer is yes by construction — for landed work and for
+  // work one commit from being lost alike. That is not a landing signal, it is
+  // the absence of one, so it fails closed rather than falling through to
+  // `origin/HEAD`: guessing a base for a row we know carries a corrupt one
+  // would answer a question nobody can attribute afterwards.
+  //
+  // `adopt --all --apply` wrote exactly this shape into every lease it created
+  // before the fix below, so this arm is what protects the already-adopted
+  // corpus — fixing `adopt` does not rewrite rows it has already written.
+  if (args.baseRef && args.baseRef === branch) {
+    return { landed: false, reason: "base-is-branch", branch, base_ref: null, pull_request: pullRequest };
+  }
 
   const remoteBase = resolveRemoteBaseRef(args.path, args.baseRef);
   if (!remoteBase) {
@@ -1340,7 +1363,9 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
         code: "WORKTREE_UNLANDED" as const,
         message: pr
           ? `the branch has an open pull request (#${pr.number}); its work has not landed`
-          : `the branch is not contained in its base (${landing.reason})`,
+          : landing.reason === "base-is-branch"
+            ? "the lease records the branch as its own base, so whether the work landed is unknown"
+            : `the branch is not contained in its base (${landing.reason})`,
         hint: "land the pull request, or pass --allow-unlanded; the teardown bundles the branch first."
           + " --discard-changes does NOT cover this: destroying an open PR's worktree is its own decision",
       };
@@ -1723,6 +1748,32 @@ export interface AdoptWorktreeResult {
   adopted: AdoptedWorktree[];
 }
 
+/**
+ * The base ref an adopted worktree should be judged against.
+ *
+ * NOT the worktree's own branch. Storing that made the landed check ask whether
+ * a branch contains itself — always true — so every adopted worktree read as
+ * landed and was deleted without an archive, which is precisely the corpus the
+ * refusal exists to protect.
+ *
+ * `refs/remotes/origin/HEAD` is asked first because it is what the remote
+ * itself calls default, and it is the same ref `resolveRemoteBaseRef` falls
+ * back to — so the stored value agrees with the guard's own fallback instead of
+ * quietly disagreeing with it. The indexed `default_branch` answers when the
+ * checkout has no `origin/HEAD` (a clone made with `--no-checkout`, a remote
+ * added by hand), and the registry's own column default is the last word.
+ */
+function adoptedBaseRef(path: string, repo: Repo | null): string {
+  const originHead = gitOut(path, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], {
+    allowFailure: true,
+  }).replace(/^origin\//, "").trim();
+  const indexed = (repo?.default_branch ?? "").trim();
+  const candidate = originHead || indexed || DEFAULT_BRANCH_FALLBACK;
+  // A base ref is interpolated into a git argument by `resolveRemoteBaseRef`,
+  // so an unusable one is discarded here rather than stored and rejected later.
+  return REF_ARGUMENT_PATTERN.test(candidate) ? candidate : DEFAULT_BRANCH_FALLBACK;
+}
+
 function repoRowForCommonDir(db: Database, commonDir: string): Repo | null {
   const checkout = commonDir.replace(/\/\.git\/?$/, "");
   const rows = db.query("SELECT * FROM repos").all() as Repo[];
@@ -1798,7 +1849,7 @@ export function adoptWorktrees(request: AdoptWorktreeRequest = {}): AdoptWorktre
         machine_id: machineId,
         worktree_path: path,
         branch: branch ?? "HEAD",
-        base_ref: branch ?? "HEAD",
+        base_ref: adoptedBaseRef(path, repo),
         base_sha: headSha,
         task_id: worktreeName,
         run_id: "",

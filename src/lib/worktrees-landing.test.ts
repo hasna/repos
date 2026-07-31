@@ -21,6 +21,7 @@ import { closeDb, getDb } from "../db/database.js";
 import {
   WorktreeError,
   addWorktree,
+  adoptWorktrees,
   removeWorktree,
   setWorktreeRootForTests,
 } from "./worktrees.js";
@@ -95,6 +96,25 @@ function pushedWorktree(repoName: string, task: string) {
   commit(created.path, `${task}.md`, `work for ${task}\n`);
   git(created.path, ["push", "-u", "origin", "HEAD"]);
   return created;
+}
+
+/**
+ * A worktree the way this station's ~444-entry corpus was actually made: by
+ * hand with `git worktree add`, carrying no lease, sitting under the worktree
+ * root for `adopt --all` to find.
+ *
+ * `addWorktree` cannot stand in for this and no `addWorktree` fixture can ever
+ * exercise the adopted path, because `addWorktree` writes the lease itself —
+ * with a base ref it was given. The whole defect lives in the base ref that
+ * `adoptWorktrees` synthesises for a worktree that arrived without one.
+ */
+function unleasedWorktree(clonePath: string, root: string, repoName: string, name: string): string {
+  const path = join(root, repoName, name);
+  mkdirSync(join(root, repoName), { recursive: true });
+  git(clonePath, ["worktree", "add", "-b", name, path, "origin/main"]);
+  commit(path, `${name}.md`, `work for ${name}\n`);
+  git(path, ["push", "-u", "origin", "HEAD"]);
+  return path;
 }
 
 function recordPullRequest(
@@ -301,5 +321,92 @@ describe("removeWorktree — the dry run a scheduled loop needs", () => {
     const { repoName } = seed();
     addWorktree({ repo: repoName, task: "loop-path" });
     expect(codeOf(() => removeWorktree({ ref: "/etc", dryRun: true }))).toBe("INVALID_REQUEST");
+  });
+});
+
+/**
+ * The adopted corpus — the population this guard exists to protect.
+ *
+ * Every test above builds its fixture with `addWorktree`, which is handed a
+ * base ref. That is structurally incapable of reaching the bug reproduced here:
+ * `adopt --all --apply` SYNTHESISES a base ref, and it was synthesising the
+ * worktree's own branch. The landed check then asked whether a branch contains
+ * itself, which is true by construction, so every adopted worktree read as
+ * landed and went down the delete-without-archive path — on the ~444 entries
+ * the refusal was written for.
+ */
+describe("adopt — the base ref an adopted worktree is judged against", () => {
+  test("adopt records the repository's default branch, never the worktree's own branch", () => {
+    const { repoName, clonePath, root, db } = seed();
+    const path = unleasedWorktree(clonePath, root, repoName, "adopted-open");
+
+    const adoption = adoptWorktrees({ all: true, apply: true, db });
+    const record = adoption.adopted.find((entry) => entry.path === path)!;
+    expect(record.lease_id).toBeTruthy();
+
+    const lease = db.query("SELECT branch, base_ref FROM worktree_leases WHERE lease_id = ?")
+      .get(record.lease_id!) as { branch: string; base_ref: string };
+    expect(lease.branch).toBe("adopted-open");
+    // The whole defect in one assertion: this used to read "adopted-open".
+    expect(lease.base_ref).toBe("main");
+
+    // And the guard consequently sees the adopted worktree for what it is.
+    const dry = removeWorktree({ ref: record.lease_id!, dryRun: true });
+    expect(dry.landing.landed).toBe(false);
+    expect(dry.landing.reason).toBe("not-in-base");
+    expect(dry.would_remove).toBe(false);
+    expect(dry.refusal).toBe("WORKTREE_UNLANDED");
+    expect(existsSync(path)).toBe(true);
+  });
+
+  test("a lease whose base ref IS its own branch fails closed instead of self-approving", () => {
+    // Fixing `adopt` does not rewrite the rows it already wrote. Every lease
+    // adopted before this change carries base_ref = branch, so the landed check
+    // itself has to refuse the self-referential question rather than answer
+    // "yes, the branch contains itself" and delete the work.
+    const { repoName, clonePath, root, db } = seed();
+    const path = unleasedWorktree(clonePath, root, repoName, "legacy-row");
+    const record = adoptWorktrees({ all: true, apply: true, db }).adopted
+      .find((entry) => entry.path === path)!;
+    db.query("UPDATE worktree_leases SET base_ref = branch WHERE lease_id = ?").run(record.lease_id!);
+
+    const dry = removeWorktree({ ref: record.lease_id!, dryRun: true });
+    expect(dry.landing.landed).toBe(false);
+    expect(dry.landing.reason).toBe("base-is-branch");
+    expect(dry.would_remove).toBe(false);
+    expect(dry.refusal).toBe("WORKTREE_UNLANDED");
+    expect(existsSync(path)).toBe(true);
+
+    // Failing closed has to reach the ARCHIVE path, not merely a slower delete:
+    // the reproduced defect was `removed=true evidence=null`.
+    const forced = removeWorktree({ ref: record.lease_id!, allowUnlanded: true });
+    expect(forced.removed).toBe(true);
+    expect(forced.evidence_path).toBeTruthy();
+    expect(existsSync(join(forced.evidence_path!, "branch.bundle"))).toBe(true);
+    expect(git(clonePath, ["bundle", "list-heads", join(forced.evidence_path!, "branch.bundle")]))
+      .toContain("legacy-row");
+  });
+
+  test("an adopted worktree whose work reached the default branch is still removable", () => {
+    // The positive control. Without it "adopted worktrees are refused" could be
+    // satisfied by a guard that refuses every adopted worktree, which is the
+    // failure mode that teaches operators to pass --allow-unlanded by reflex.
+    const { repoName, clonePath, seedPath, root, db } = seed();
+    const path = unleasedWorktree(clonePath, root, repoName, "adopted-landed");
+    const record = adoptWorktrees({ all: true, apply: true, db }).adopted
+      .find((entry) => entry.path === path)!;
+
+    git(seedPath, ["fetch", "origin"]);
+    git(seedPath, ["merge", "--squash", "origin/adopted-landed"]);
+    git(seedPath, ["commit", "-m", "feat: the adopted landing (#47)"]);
+    git(seedPath, ["push", "origin", "main"]);
+    git(clonePath, ["fetch", "origin"]);
+
+    const result = removeWorktree({ ref: record.lease_id! });
+    expect(result.removed).toBe(true);
+    // The reason is load-bearing: "ancestor-of-base" here would mean the branch
+    // was measured against itself again and passed for the old wrong reason.
+    expect(result.landing.reason).toBe("content-in-base");
+    expect(existsSync(path)).toBe(false);
   });
 });
