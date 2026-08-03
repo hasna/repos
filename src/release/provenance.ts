@@ -52,7 +52,7 @@ function releaseFailure(message: string): never {
   throw new Error("release provenance verification failed: " + message);
 }
 
-function parseProvenance(bytes: Buffer): ReleaseProvenance {
+export function parseReleaseProvenance(bytes: Buffer): ReleaseProvenance {
   let parsed: unknown;
   try {
     parsed = JSON.parse(bytes.toString("utf8"));
@@ -122,7 +122,7 @@ export function verifyReleaseProvenance(
     options.packagePath,
     "package/dist/release-provenance.json",
   );
-  const provenance = parseProvenance(provenanceBytes);
+  const provenance = parseReleaseProvenance(provenanceBytes);
   if (
     provenance.exact_commit !== options.expectedCommit
     || provenance.exact_tree !== options.expectedTree

@@ -143,4 +143,30 @@ describe("installed rung", () => {
       installRoot,
     }).status).toBe("UNKNOWN");
   });
+
+  it("never follows an unvalidated provenance path away from the installed CLI", () => {
+    const installRoot = mkdtempSync(join(tmpdir(), "rungs-redirect-"));
+    const packageDir = join(installRoot, "@hasna", "repos");
+    const reviewedExecutable = Buffer.from("reviewed-executable-bytes");
+    mkdirSync(join(packageDir, "dist", "cli"), { recursive: true });
+    writeFileSync(join(packageDir, "dist", "cli", "index.js"), Buffer.from("stale-installed-cli"));
+    writeFileSync(join(packageDir, "dist", "reviewed-copy.js"), reviewedExecutable);
+    writeFileSync(join(packageDir, "dist", "release-provenance.json"), JSON.stringify({
+      schema: RELEASE_PROVENANCE_SCHEMA,
+      exact_commit: commit,
+      exact_tree: tree,
+      source_clean: true,
+      package_name: "@hasna/repos",
+      package_version: "9.9.9",
+      executable_path: "dist/reviewed-copy.js",
+      executable_sha256: digest(reviewedExecutable),
+    }));
+
+    expect(evaluateInstalledRung({
+      packageName: "@hasna/repos",
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(reviewedExecutable),
+      installRoot,
+    }).status).not.toBe("PASS");
+  });
 });

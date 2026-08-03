@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ReleaseVerificationReceipt } from "./provenance.js";
+import {
+  parseReleaseProvenance,
+  type ReleaseVerificationReceipt,
+} from "./provenance.js";
 
 export const SHIP_CHAIN_SCHEMA = "open-repos.ship-chain-report.v1" as const;
 
@@ -69,13 +72,23 @@ export function evaluateInstalledRung(options: InstalledRungOptions): Rung {
   const provenancePath = join(packageDir, "dist", "release-provenance.json");
   if (existsSync(provenancePath)) {
     try {
-      const record = JSON.parse(readFileSync(provenancePath, "utf8")) as Record<string, unknown>;
-      if (typeof record["exact_commit"] === "string") installedCommit = record["exact_commit"];
-      if (typeof record["executable_path"] === "string") {
-        executablePath = join(packageDir, ...record["executable_path"].split("/"));
+      const record = parseReleaseProvenance(readFileSync(provenancePath));
+      installedCommit = record.exact_commit;
+      executablePath = join(packageDir, ...record.executable_path.split("/"));
+      if (record.package_name !== options.packageName) {
+        return rung(
+          "FAIL",
+          `installed provenance reports package ${record.package_name}, expected ${options.packageName}`,
+        );
+      }
+      if (record.executable_sha256 !== options.expectedExecutableSha256) {
+        return rung(
+          "FAIL",
+          `installed provenance reports executable sha256 ${record.executable_sha256}, expected ${options.expectedExecutableSha256}`,
+        );
       }
     } catch {
-      return rung("UNKNOWN", `not asked: ${provenancePath} is present but unreadable as JSON`);
+      return rung("UNKNOWN", `not asked: ${provenancePath} is present but is not a valid provenance record`);
     }
   }
 
