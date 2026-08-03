@@ -5,6 +5,14 @@ import { readFileSync } from "node:fs";
 export const RELEASE_PROVENANCE_SCHEMA = "open-repos.release-provenance.v1" as const;
 export const RELEASE_VERIFICATION_SCHEMA = "open-repos.release-verification.v1" as const;
 
+/**
+ * The one path inside a release artefact that is ever digested as "the
+ * executable". It is a pin, not a default: a provenance record never gets to
+ * name the bytes that will be compared against the expected digest, because
+ * then the artefact under test chooses what gets verified.
+ */
+export const RELEASE_EXECUTABLE_PATH = "dist/cli/index.js" as const;
+
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
@@ -85,7 +93,7 @@ export function parseReleaseProvenance(bytes: Buffer): ReleaseProvenance {
     || record["package_name"].length === 0
     || typeof record["package_version"] !== "string"
     || record["package_version"].length === 0
-    || record["executable_path"] !== "dist/cli/index.js"
+    || record["executable_path"] !== RELEASE_EXECUTABLE_PATH
     || !SHA256.test(String(record["executable_sha256"] ?? ""))
   ) releaseFailure("invalid provenance record");
   return record as unknown as ReleaseProvenance;

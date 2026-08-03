@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  RELEASE_EXECUTABLE_PATH,
   parseReleaseProvenance,
   type ReleaseVerificationReceipt,
 } from "./provenance.js";
@@ -67,14 +68,24 @@ export function evaluateInstalledRung(options: InstalledRungOptions): Rung {
     return rung("FAIL", `${options.packageName} is not installed under ${root}`);
   }
 
-  let executablePath = join(packageDir, "dist", "cli", "index.js");
+  // PINNED, and never re-derived from the record under test. The installed
+  // package does not get to name the bytes we digest: join() collapses "..", so
+  // a record naming "../../../pristine-copy.js" would point the digest at a
+  // clean file kept anywhere on disk while the file that actually runs is never
+  // opened -- satisfying the rung whose entire purpose is to detect exactly that.
+  const executablePath = join(packageDir, ...RELEASE_EXECUTABLE_PATH.split("/"));
   let installedCommit: string | null = null;
   const provenancePath = join(packageDir, "dist", "release-provenance.json");
   if (existsSync(provenancePath)) {
     try {
       const record = parseReleaseProvenance(readFileSync(provenancePath));
       installedCommit = record.exact_commit;
-      executablePath = join(packageDir, ...record.executable_path.split("/"));
+      if (record.executable_path !== RELEASE_EXECUTABLE_PATH) {
+        return rung(
+          "FAIL",
+          `installed provenance declares executable_path ${JSON.stringify(record.executable_path)}, expected ${JSON.stringify(RELEASE_EXECUTABLE_PATH)}`,
+        );
+      }
       if (record.package_name !== options.packageName) {
         return rung(
           "FAIL",
@@ -95,7 +106,17 @@ export function evaluateInstalledRung(options: InstalledRungOptions): Rung {
   if (!existsSync(executablePath)) {
     return rung("FAIL", `${options.packageName} is installed but ${executablePath} is missing`);
   }
-  const installedSha256 = createHash("sha256").update(readFileSync(executablePath)).digest("hex");
+  // An unreadable executable (EISDIR / EACCES / ELOOP) is a verification
+  // failure, not an exception. An exception here escapes buildShipChainReport
+  // past emit() and the process dies with ZERO RUNGS PRINTED -- which is the
+  // exact silence this command exists to end.
+  let installedSha256: string;
+  try {
+    installedSha256 = createHash("sha256").update(readFileSync(executablePath)).digest("hex");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code ?? "unknown I/O error";
+    return rung("FAIL", `installed executable ${executablePath} is unreadable (${code}), so its bytes are unverified`);
+  }
   if (installedSha256 !== options.expectedExecutableSha256) {
     return rung(
       "FAIL",
@@ -163,6 +184,20 @@ function classifyProvenanceFailure(message: string): { merged: Rung; published: 
   };
 }
 
+/**
+ * No filesystem surprise may cost the operator the report. Whatever happens
+ * under the INSTALLED rung, four rungs get printed; an exception that escaped
+ * here would print none at all.
+ */
+function safeInstalledRung(options: InstalledRungOptions): Rung {
+  try {
+    return evaluateInstalledRung(options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { rung: "INSTALLED", status: "FAIL", detail: `install could not be inspected: ${message}` };
+  }
+}
+
 export function unaskedReport(reason: string): ShipChainReport {
   return finish([
     { rung: "MERGED", status: "UNKNOWN", detail: "not asked: " + reason },
@@ -212,7 +247,7 @@ export function buildShipChainReport(
         status: "UNKNOWN",
         detail: "not asked: package name unknown (provenance failed before it was read; pass --installed-package)",
       }
-      : evaluateInstalledRung({
+      : safeInstalledRung({
         packageName,
         expectedCommit: installed.expectedCommit,
         expectedExecutableSha256: installed.expectedExecutableSha256,
