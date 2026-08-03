@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -168,5 +169,94 @@ describe("installed rung", () => {
       expectedExecutableSha256: digest(reviewedExecutable),
       installRoot,
     }).status).not.toBe("PASS");
+  });
+
+  it("never escapes the package directory when the record's executable_path traverses upward", () => {
+    // The attack: keep a pristine copy anywhere on disk, point executable_path
+    // at it with "..", and the tampered dist/cli/index.js is never opened.
+    const installRoot = mkdtempSync(join(tmpdir(), "rungs-traversal-"));
+    const packageDir = join(installRoot, "@hasna", "repos");
+    const pristine = Buffer.from("pristine-reviewed-bytes");
+    mkdirSync(join(packageDir, "dist", "cli"), { recursive: true });
+    writeFileSync(join(packageDir, "dist", "cli", "index.js"), Buffer.from("TAMPERED-CLI"));
+    writeFileSync(join(installRoot, "decoy.js"), pristine);
+    writeFileSync(join(packageDir, "dist", "release-provenance.json"), JSON.stringify({
+      schema: RELEASE_PROVENANCE_SCHEMA,
+      exact_commit: commit,
+      exact_tree: tree,
+      source_clean: true,
+      package_name: "@hasna/repos",
+      package_version: "9.9.9",
+      executable_path: "../../decoy.js",
+      executable_sha256: digest(pristine),
+    }));
+
+    const result = evaluateInstalledRung({
+      packageName: "@hasna/repos",
+      expectedCommit: commit,
+      // the digest of the file the ATTACKER wants compared, not of the real CLI
+      expectedExecutableSha256: digest(pristine),
+      installRoot,
+    });
+    expect(result.status).not.toBe("PASS");
+    expect(result.detail).not.toContain("decoy.js");
+  });
+
+  it("FAILs rather than throwing when the executable cannot be read (EISDIR)", () => {
+    // A directory where the executable should be: readFileSync throws EISDIR.
+    // Unguarded, that escapes the report and prints ZERO rungs.
+    const installRoot = mkdtempSync(join(tmpdir(), "rungs-eisdir-"));
+    const packageDir = join(installRoot, "@hasna", "repos");
+    mkdirSync(join(packageDir, "dist", "cli", "index.js"), { recursive: true });
+
+    const result = evaluateInstalledRung({
+      packageName: "@hasna/repos",
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(executable),
+      installRoot,
+    });
+    expect(result.status).toBe("FAIL");
+    expect(result.detail).toContain("unreadable");
+  });
+
+  it("still prints all four rungs when the install is unreadable", () => {
+    const installRoot = mkdtempSync(join(tmpdir(), "rungs-eisdir-report-"));
+    mkdirSync(join(installRoot, "@hasna", "repos", "dist", "cli", "index.js"), { recursive: true });
+
+    const report = buildShipChainReport(() => receipt, {
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(executable),
+      installRoot,
+    });
+    expect(report.rungs.map((entry) => entry.rung)).toEqual([...RUNG_NAMES]);
+    expect(rung(report, "INSTALLED").status).toBe("FAIL");
+    expect(report.verified).toBe(false);
+  });
+
+  it("FAILs promptly and still reports four rungs when the executable is a FIFO", () => {
+    const installRoot = mkdtempSync(join(tmpdir(), "rungs-fifo-report-"));
+    const executablePath = join(installRoot, "@hasna", "repos", "dist", "cli", "index.js");
+    mkdirSync(join(executablePath, ".."), { recursive: true });
+    execFileSync("mkfifo", [executablePath]);
+
+    // Run the blocking-risk path in a bounded child. Before the fix,
+    // readFileSync waits forever for a FIFO writer and this child times out.
+    const child = spawnSync(process.execPath, ["--eval", `
+      import { buildShipChainReport } from ${JSON.stringify(new URL("./rungs.ts", import.meta.url).href)};
+      const report = buildShipChainReport(() => (${JSON.stringify(receipt)}), {
+        expectedCommit: ${JSON.stringify(commit)},
+        expectedExecutableSha256: ${JSON.stringify(digest(executable))},
+        installRoot: ${JSON.stringify(installRoot)},
+      });
+      process.stdout.write(JSON.stringify(report));
+    `], { encoding: "utf8", timeout: 3_000 });
+
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    const report = JSON.parse(child.stdout) as ShipChainReport;
+    expect(report.rungs.map((entry) => entry.rung)).toEqual([...RUNG_NAMES]);
+    expect(rung(report, "INSTALLED").status).toBe("FAIL");
+    expect(rung(report, "INSTALLED").detail).toContain("not a regular file");
+    expect(report.verified).toBe(false);
   });
 });
