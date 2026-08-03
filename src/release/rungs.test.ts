@@ -32,6 +32,22 @@ const receipt: ReleaseVerificationReceipt = {
 const rung = (report: ShipChainReport, name: string): Rung =>
   report.rungs.find((entry) => entry.rung === name)!;
 
+/**
+ * Run the blocking-risk path in a bounded child so a hang shows up as a
+ * timeout with empty stdout rather than as a wedged test process.
+ */
+function runReportInChild(installRoot: string, expectedExecutableSha256: string) {
+  return spawnSync(process.execPath, ["--eval", `
+    import { buildShipChainReport } from ${JSON.stringify(new URL("./rungs.ts", import.meta.url).href)};
+    const report = buildShipChainReport(() => (${JSON.stringify(receipt)}), {
+      expectedCommit: ${JSON.stringify(commit)},
+      expectedExecutableSha256: ${JSON.stringify(expectedExecutableSha256)},
+      installRoot: ${JSON.stringify(installRoot)},
+    });
+    process.stdout.write(JSON.stringify(report));
+  `], { encoding: "utf8", timeout: 3_000 });
+}
+
 function installTree(options: { commit?: string; executable: Buffer; withProvenance?: boolean }): string {
   const root = mkdtempSync(join(tmpdir(), "rungs-"));
   const packageDir = join(root, "@hasna", "repos");
@@ -256,6 +272,42 @@ describe("installed rung", () => {
     const report = JSON.parse(child.stdout) as ShipChainReport;
     expect(report.rungs.map((entry) => entry.rung)).toEqual([...RUNG_NAMES]);
     expect(rung(report, "INSTALLED").status).toBe("FAIL");
+    expect(rung(report, "INSTALLED").detail).toContain("not a regular file");
+    expect(report.verified).toBe(false);
+  });
+
+  // POSITIVE CONTROL for the FIFO-provenance test below. Same bounded-child
+  // harness, same fixtures, but every file is a regular file. If this one does
+  // not reach real code and PASS, a green on the FIFO case proves nothing.
+  it("reports four rungs and PASSes through the bounded child on a regular provenance file", () => {
+    const installRoot = installTree({ executable });
+
+    const child = runReportInChild(installRoot, digest(executable));
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    const report = JSON.parse(child.stdout) as ShipChainReport;
+    expect(report.rungs.map((entry) => entry.rung)).toEqual([...RUNG_NAMES]);
+    expect(rung(report, "INSTALLED").status).toBe("PASS");
+  });
+
+  it("does not hang and still reports four rungs when the provenance record is a FIFO", () => {
+    // The executable is a perfectly good regular file here: the ONLY hostile
+    // object is the provenance record. Before the fix, the bare path-based
+    // readFileSync at the provenance read blocks forever waiting for a FIFO
+    // writer -- the surrounding try/catch cannot help, because a hang is not
+    // an exception -- and the child times out having printed ZERO rungs.
+    const installRoot = mkdtempSync(join(tmpdir(), "rungs-fifo-provenance-"));
+    const packageDir = join(installRoot, "@hasna", "repos");
+    mkdirSync(join(packageDir, "dist", "cli"), { recursive: true });
+    writeFileSync(join(packageDir, "dist", "cli", "index.js"), executable);
+    execFileSync("mkfifo", [join(packageDir, "dist", "release-provenance.json")]);
+
+    const child = runReportInChild(installRoot, digest(executable));
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    const report = JSON.parse(child.stdout) as ShipChainReport;
+    expect(report.rungs.map((entry) => entry.rung)).toEqual([...RUNG_NAMES]);
+    expect(rung(report, "INSTALLED").status).toBe("UNKNOWN");
     expect(rung(report, "INSTALLED").detail).toContain("not a regular file");
     expect(report.verified).toBe(false);
   });
