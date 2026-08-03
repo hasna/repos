@@ -14,7 +14,8 @@ Report the ship chain for a repos release from artefacts, one line per rung:
 
   MERGED     the packaged artefact descends from the reviewed commit and tree
   PUBLISHED  the published package and executable digests bind that source
-  INSTALLED  the artefact is present on a host (NOT IMPLEMENTED - reports UNKNOWN)
+  INSTALLED  the artefact is actually on this host's disk, digested from the
+             installed bytes - not read off a version string
   RUNNING    the artefact is the one actually running (NOT IMPLEMENTED - reports UNKNOWN)
 
 Every invocation prints all four rungs as PASS, FAIL or UNKNOWN. The command
@@ -32,6 +33,10 @@ Required options:
   --executable <path>                 Exact repos executable
 
 Options:
+  --installed-package <name>          Package to resolve for the INSTALLED rung
+                                      (defaults to the verified package name)
+  --install-root <path>               node_modules root for the INSTALLED rung
+                                      (defaults to the global bun install root)
   --json                              Emit the machine-readable report
   -h, --help                          display help
   -V, --version                       display version
@@ -93,4 +98,15 @@ try {
   emit(unaskedReport(message));
 }
 
-emit(buildShipChainReport(() => verifyReleaseProvenance(options)));
+function optionalOption(name: string): string | undefined {
+  const index = argv.indexOf(name);
+  const value = index >= 0 ? argv[index + 1] : undefined;
+  return !value || value.startsWith("--") ? undefined : value;
+}
+
+emit(buildShipChainReport(() => verifyReleaseProvenance(options), {
+  packageName: optionalOption("--installed-package"),
+  expectedCommit: options.expectedCommit,
+  expectedExecutableSha256: options.expectedExecutableSha256,
+  installRoot: optionalOption("--install-root"),
+}));
