@@ -223,6 +223,8 @@ describe("removeWorktree — the unlanded branch", () => {
     expect(dry.landing.reason).toBe("not-in-base");
     expect(dry.refusal).toBe("WORKTREE_UNLANDED");
     expect(dry.would_remove).toBe(false);
+    const error = errorOf(() => removeWorktree({ ref: created.lease.lease_id }));
+    expect(error.message).toBe("the branch would change its base, so its work is not proven landed");
     expect(existsSync(created.path)).toBe(true);
   });
 

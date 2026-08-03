@@ -1393,7 +1393,7 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
       const pr = landing.pull_request;
       return {
         code: "WORKTREE_UNLANDED" as const,
-        message: pr
+        message: pr?.state === "open"
           ? `the branch has an open pull request (#${pr.number}); its work has not landed`
           : landing.reason === "base-is-branch"
             ? "the lease records the branch as its own base, so whether the work landed is unknown"
