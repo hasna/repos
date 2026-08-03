@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   RELEASE_EXECUTABLE_PATH,
@@ -49,6 +56,37 @@ export function defaultInstallRoot(env: NodeJS.ProcessEnv = process.env): string
   const bunInstall = env["BUN_INSTALL"] ?? (env["HOME"] ? join(env["HOME"], ".bun") : undefined);
   if (!bunInstall) return "";
   return join(bunInstall, "install", "global", "node_modules");
+}
+
+function digestInstalledExecutable(path: string):
+  | { ok: true; sha256: string }
+  | { ok: false; reason: string } {
+  let descriptor: number | undefined;
+  try {
+    // O_NONBLOCK keeps a FIFO or device from turning verification into an
+    // indefinite wait. Inspect and read through the same descriptor so a path
+    // swap between validation and hashing cannot substitute another object.
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!fstatSync(descriptor).isFile()) {
+      return { ok: false, reason: "unreadable (not a regular file)" };
+    }
+    return {
+      ok: true,
+      sha256: createHash("sha256").update(readFileSync(descriptor)).digest("hex"),
+    };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code ?? "unknown I/O error";
+    return { ok: false, reason: `unreadable (${code})` };
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // Closing cannot change the bytes already read, and must not suppress
+        // the four-rung report.
+      }
+    }
+  }
 }
 
 /**
@@ -106,17 +144,13 @@ export function evaluateInstalledRung(options: InstalledRungOptions): Rung {
   if (!existsSync(executablePath)) {
     return rung("FAIL", `${options.packageName} is installed but ${executablePath} is missing`);
   }
-  // An unreadable executable (EISDIR / EACCES / ELOOP) is a verification
-  // failure, not an exception. An exception here escapes buildShipChainReport
-  // past emit() and the process dies with ZERO RUNGS PRINTED -- which is the
-  // exact silence this command exists to end.
-  let installedSha256: string;
-  try {
-    installedSha256 = createHash("sha256").update(readFileSync(executablePath)).digest("hex");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code ?? "unknown I/O error";
-    return rung("FAIL", `installed executable ${executablePath} is unreadable (${code}), so its bytes are unverified`);
+  // An unreadable or non-regular executable (EISDIR / EACCES / ELOOP / FIFO)
+  // is a verification failure, not an exception or an indefinite wait.
+  const installedExecutable = digestInstalledExecutable(executablePath);
+  if (!installedExecutable.ok) {
+    return rung("FAIL", `installed executable ${executablePath} is ${installedExecutable.reason}, so its bytes are unverified`);
   }
+  const installedSha256 = installedExecutable.sha256;
   if (installedSha256 !== options.expectedExecutableSha256) {
     return rung(
       "FAIL",

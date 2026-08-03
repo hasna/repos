@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -229,6 +230,33 @@ describe("installed rung", () => {
     });
     expect(report.rungs.map((entry) => entry.rung)).toEqual([...RUNG_NAMES]);
     expect(rung(report, "INSTALLED").status).toBe("FAIL");
+    expect(report.verified).toBe(false);
+  });
+
+  it("FAILs promptly and still reports four rungs when the executable is a FIFO", () => {
+    const installRoot = mkdtempSync(join(tmpdir(), "rungs-fifo-report-"));
+    const executablePath = join(installRoot, "@hasna", "repos", "dist", "cli", "index.js");
+    mkdirSync(join(executablePath, ".."), { recursive: true });
+    execFileSync("mkfifo", [executablePath]);
+
+    // Run the blocking-risk path in a bounded child. Before the fix,
+    // readFileSync waits forever for a FIFO writer and this child times out.
+    const child = spawnSync(process.execPath, ["--eval", `
+      import { buildShipChainReport } from ${JSON.stringify(new URL("./rungs.ts", import.meta.url).href)};
+      const report = buildShipChainReport(() => (${JSON.stringify(receipt)}), {
+        expectedCommit: ${JSON.stringify(commit)},
+        expectedExecutableSha256: ${JSON.stringify(digest(executable))},
+        installRoot: ${JSON.stringify(installRoot)},
+      });
+      process.stdout.write(JSON.stringify(report));
+    `], { encoding: "utf8", timeout: 3_000 });
+
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    const report = JSON.parse(child.stdout) as ShipChainReport;
+    expect(report.rungs.map((entry) => entry.rung)).toEqual([...RUNG_NAMES]);
+    expect(rung(report, "INSTALLED").status).toBe("FAIL");
+    expect(rung(report, "INSTALLED").detail).toContain("not a regular file");
     expect(report.verified).toBe(false);
   });
 });
