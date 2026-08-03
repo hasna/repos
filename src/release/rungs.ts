@@ -58,22 +58,26 @@ export function defaultInstallRoot(env: NodeJS.ProcessEnv = process.env): string
   return join(bunInstall, "install", "global", "node_modules");
 }
 
-function digestInstalledExecutable(path: string):
-  | { ok: true; sha256: string }
+/**
+ * The ONE way this file touches an installed file. Every read the INSTALLED
+ * rung performs goes through here, because the defect this guards against is
+ * exactly two reads in one function disagreeing about what is safe: a bare
+ * path-based readFileSync on a FIFO blocks forever, and the surrounding
+ * try/catch cannot rescue the report, because a hang is not an exception.
+ */
+function readInstalledFile(path: string):
+  | { ok: true; bytes: Buffer }
   | { ok: false; reason: string } {
   let descriptor: number | undefined;
   try {
     // O_NONBLOCK keeps a FIFO or device from turning verification into an
     // indefinite wait. Inspect and read through the same descriptor so a path
-    // swap between validation and hashing cannot substitute another object.
+    // swap between validation and reading cannot substitute another object.
     descriptor = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
     if (!fstatSync(descriptor).isFile()) {
       return { ok: false, reason: "unreadable (not a regular file)" };
     }
-    return {
-      ok: true,
-      sha256: createHash("sha256").update(readFileSync(descriptor)).digest("hex"),
-    };
+    return { ok: true, bytes: readFileSync(descriptor) };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | null)?.code ?? "unknown I/O error";
     return { ok: false, reason: `unreadable (${code})` };
@@ -87,6 +91,17 @@ function digestInstalledExecutable(path: string):
       }
     }
   }
+}
+
+function digestInstalledExecutable(path: string):
+  | { ok: true; sha256: string }
+  | { ok: false; reason: string } {
+  const read = readInstalledFile(path);
+  if (!read.ok) return read;
+  return {
+    ok: true,
+    sha256: createHash("sha256").update(read.bytes).digest("hex"),
+  };
 }
 
 /**
@@ -115,8 +130,21 @@ export function evaluateInstalledRung(options: InstalledRungOptions): Rung {
   let installedCommit: string | null = null;
   const provenancePath = join(packageDir, "dist", "release-provenance.json");
   if (existsSync(provenancePath)) {
+    // Same guard as the executable read below. existsSync() is true for a FIFO,
+    // so an unguarded read here hangs the whole report and prints ZERO rungs --
+    // verbatim the silence this command exists to end. A provenance record we
+    // cannot read is no more proven than one we cannot parse, so it lands on
+    // the same UNKNOWN as the malformed case, never on a hang and never on a
+    // throw.
+    const provenanceFile = readInstalledFile(provenancePath);
+    if (!provenanceFile.ok) {
+      return rung(
+        "UNKNOWN",
+        `not asked: ${provenancePath} is present but ${provenanceFile.reason}, so it is not a readable provenance record`,
+      );
+    }
     try {
-      const record = parseReleaseProvenance(readFileSync(provenancePath));
+      const record = parseReleaseProvenance(provenanceFile.bytes);
       installedCommit = record.exact_commit;
       if (record.executable_path !== RELEASE_EXECUTABLE_PATH) {
         return rung(
