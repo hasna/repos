@@ -869,10 +869,10 @@ function upsertLease(db: Database, lease: WorktreeLease): void {
  * Three signals, in this order, because each is authoritative over the ones
  * below it:
  *
- *  1. **Unpushed commits.** Not a landing question at all — it is the more
- *     severe and more actionable diagnosis, it already has its own refusal and
- *     its own opt-in, and reporting it as "unlanded" would send an operator to
- *     the wrong flag.
+ *  1. **Unpushed commit objects.** They are the more severe and more actionable
+ *     diagnosis unless the exact current HEAD contributes no content to the
+ *     base. Squash merge plus remote-branch deletion makes landed commit
+ *     objects look unpushed, but it does not put their content at risk.
  *  2. **The repos index's own pull-request rows.** When the index knows the PR,
  *     its state is the answer and no git heuristic can improve on it. Read
  *     locally: this module holds its no-credential property, so nothing here
@@ -912,6 +912,10 @@ export interface LandingPullRequest {
   merged_at: string | null;
 }
 
+interface IndexedLandingPullRequest extends LandingPullRequest {
+  head_sha: string | null;
+}
+
 export interface BranchLanding {
   landed: boolean;
   reason: BranchLandingReason;
@@ -935,23 +939,23 @@ function pullRequestForBranch(
   repo: Repo | null,
   repoCatalogId: number | null,
   branch: string,
-): LandingPullRequest | null {
-  let rows: LandingPullRequest[] = [];
+): IndexedLandingPullRequest | null {
+  let rows: IndexedLandingPullRequest[] = [];
   try {
     if (repo?.remote_url) {
       rows = db
         .query(
-          `SELECT p.number, p.state, p.url, p.merged_at
+          `SELECT p.number, p.state, p.url, p.merged_at, p.head_sha
              FROM pull_requests p JOIN repos r ON r.id = p.repo_id
             WHERE r.remote_url = ? AND p.head_branch = ?`,
         )
-        .all(repo.remote_url, branch) as LandingPullRequest[];
+        .all(repo.remote_url, branch) as IndexedLandingPullRequest[];
     } else if (repoCatalogId !== null) {
       rows = db
         .query(
-          "SELECT number, state, url, merged_at FROM pull_requests WHERE repo_id = ? AND head_branch = ?",
+          "SELECT number, state, url, merged_at, head_sha FROM pull_requests WHERE repo_id = ? AND head_branch = ?",
         )
-        .all(repoCatalogId, branch) as LandingPullRequest[];
+        .all(repoCatalogId, branch) as IndexedLandingPullRequest[];
     }
   } catch {
     // An index predating the pull-request surface is a missing signal, not a
@@ -1006,20 +1010,46 @@ function evaluateLanding(
   const head = gitOut(args.path, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
   const branch = head && head !== "HEAD" ? head : null;
   const seed = { branch, base_ref: null as string | null, pull_request: null as LandingPullRequest | null };
+  const hasUnpushed = args.unpushed > 0;
 
-  if (args.unpushed > 0) return { landed: false, reason: "unpushed", ...seed };
   // A detached HEAD has no branch to land. Signal 1 owns the only data at risk
   // there, and it has already spoken.
-  if (!branch) return { landed: true, reason: "detached-head", ...seed };
+  if (!branch) {
+    return hasUnpushed
+      ? { landed: false, reason: "unpushed", ...seed }
+      : { landed: true, reason: "detached-head", ...seed };
+  }
 
   const remotes = gitOut(args.path, ["remote"], { allowFailure: true }).split("\n").filter(Boolean);
-  if (remotes.length === 0) return { landed: true, reason: "no-remote", ...seed };
-
-  const pullRequest = pullRequestForBranch(db, args.repo, args.repoCatalogId, branch);
-  if (pullRequest?.state === "open") {
-    return { landed: false, reason: "pull-request-open", branch, base_ref: null, pull_request: pullRequest };
+  if (remotes.length === 0) {
+    return hasUnpushed
+      ? { landed: false, reason: "unpushed", ...seed }
+      : { landed: true, reason: "no-remote", ...seed };
   }
-  if (pullRequest?.state === "merged") {
+
+  const indexedPullRequest = pullRequestForBranch(db, args.repo, args.repoCatalogId, branch);
+  const pullRequest: LandingPullRequest | null = indexedPullRequest
+    ? {
+        number: indexedPullRequest.number,
+        state: indexedPullRequest.state,
+        url: indexedPullRequest.url,
+        merged_at: indexedPullRequest.merged_at,
+      }
+    : null;
+  // An open PR remains a stop while its current commit objects are on a remote.
+  // A merged row is authoritative only for the exact head SHA the forge
+  // reported; branch names are reusable, so state alone can be stale after a
+  // newer pushed commit. A missing or mismatched SHA falls through to exact
+  // content containment instead of authorizing removal.
+  if (!hasUnpushed && indexedPullRequest?.state === "open") {
+      return { landed: false, reason: "pull-request-open", branch, base_ref: null, pull_request: pullRequest };
+  }
+  const currentHead = gitOut(args.path, ["rev-parse", "HEAD"], { allowFailure: true });
+  if (
+    indexedPullRequest?.state === "merged"
+    && indexedPullRequest.head_sha
+    && indexedPullRequest.head_sha === currentHead
+  ) {
     return { landed: true, reason: "pull-request-merged", branch, base_ref: null, pull_request: pullRequest };
   }
   // A closed-but-unmerged PR is deliberately NOT treated as landed. It means the
@@ -1037,16 +1067,23 @@ function evaluateLanding(
   // before the fix below, so this arm is what protects the already-adopted
   // corpus — fixing `adopt` does not rewrite rows it has already written.
   if (args.baseRef && args.baseRef === branch) {
-    return { landed: false, reason: "base-is-branch", branch, base_ref: null, pull_request: pullRequest };
+    return hasUnpushed
+      ? { landed: false, reason: "unpushed", branch, base_ref: null, pull_request: pullRequest }
+      : { landed: false, reason: "base-is-branch", branch, base_ref: null, pull_request: pullRequest };
   }
 
   const remoteBase = resolveRemoteBaseRef(args.path, args.baseRef);
   if (!remoteBase) {
-    return { landed: false, reason: "base-unresolvable", branch, base_ref: null, pull_request: pullRequest };
+    return hasUnpushed
+      ? { landed: false, reason: "unpushed", branch, base_ref: null, pull_request: pullRequest }
+      : { landed: false, reason: "base-unresolvable", branch, base_ref: null, pull_request: pullRequest };
   }
   const contained = baseContainsBranch(args.path, remoteBase);
-  return contained
-    ? { landed: true, reason: contained, branch, base_ref: remoteBase, pull_request: pullRequest }
+  if (contained) {
+    return { landed: true, reason: contained, branch, base_ref: remoteBase, pull_request: pullRequest };
+  }
+  return hasUnpushed
+    ? { landed: false, reason: "unpushed", branch, base_ref: remoteBase, pull_request: pullRequest }
     : { landed: false, reason: "not-in-base", branch, base_ref: remoteBase, pull_request: pullRequest };
 }
 
@@ -1313,12 +1350,17 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
 
   const dirty = gitOut(resolved, ["status", "--porcelain"], { allowFailure: true });
   const unpushed = countUnpushedCommits(resolved);
+  const repo = repoRowForTarget(db, target, resolved);
   const landing = evaluateLanding(db, {
     path: resolved,
     unpushed,
-    repo: repoRowForTarget(db, target, resolved),
+    repo,
     repoCatalogId: target.repoCatalogId,
-    baseRef: target.lease?.base_ref ?? null,
+    // A stray created by plain `git worktree add` has no lease and therefore
+    // no recorded base. The indexed repository still has the authoritative
+    // default branch; use it before falling back to origin/HEAD, which is not
+    // guaranteed to exist in an otherwise healthy clone.
+    baseRef: target.lease?.base_ref ?? repo?.default_branch ?? null,
   });
 
   /**
@@ -1336,11 +1378,11 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
         hint: "commit or pass --discard-changes; a forced teardown archives the diff first",
       };
     }
-    if (unpushed > 0 && !request.discardChanges) {
+    if (landing.reason === "unpushed" && !request.discardChanges) {
       return {
         code: "WORKTREE_UNPUSHED" as const,
-        message: `the worktree carries ${unpushed} commit(s) that exist on no remote`,
-        hint: "push the branch or pass --discard-changes; a forced teardown bundles the branch first",
+        message: `the worktree carries ${unpushed} commit(s) whose content is not proven in its base and whose commit objects exist on no remote`,
+        hint: "push the commits, or pass --discard-changes to archive the branch before removing the worktree",
       };
     }
     // `unpushed` is excluded here on purpose: it is the same fact, already
@@ -1355,9 +1397,11 @@ export function removeWorktree(request: RemoveWorktreeRequest): RemoveWorktreeRe
           ? `the branch has an open pull request (#${pr.number}); its work has not landed`
           : landing.reason === "base-is-branch"
             ? "the lease records the branch as its own base, so whether the work landed is unknown"
-            : `the branch is not contained in its base (${landing.reason})`,
-        hint: "land the pull request, or pass --allow-unlanded; the teardown bundles the branch first."
-          + " --discard-changes does NOT cover this: destroying an open PR's worktree is its own decision",
+            : landing.reason === "base-unresolvable"
+              ? "the worktree's base could not be resolved, so whether its work landed is unknown"
+              : "the branch would change its base, so its work is not proven landed",
+        hint: "land or verify the work, or pass --allow-unlanded to archive the branch before removing the worktree;"
+          + " --discard-changes covers only dirty or unpushed work",
       };
     }
     return null;

@@ -119,12 +119,12 @@ function unleasedWorktree(clonePath: string, root: string, repoName: string, nam
 
 function recordPullRequest(
   repoId: number,
-  fields: { number: number; head_branch: string; state: string; merged_at?: string | null },
+  fields: { number: number; head_branch: string; head_sha?: string | null; state: string; merged_at?: string | null },
 ): void {
   getDb().prepare(
     `INSERT INTO pull_requests
-       (repo_id, number, title, state, author, created_at, updated_at, merged_at, url, base_branch, head_branch)
-     VALUES (?, ?, ?, ?, 'hermes', '2026-07-30T00:00:00Z', '2026-07-30T00:00:00Z', ?, ?, 'main', ?)`,
+       (repo_id, number, title, state, author, created_at, updated_at, merged_at, url, base_branch, head_branch, head_sha)
+     VALUES (?, ?, ?, ?, 'hermes', '2026-07-30T00:00:00Z', '2026-07-30T00:00:00Z', ?, ?, 'main', ?, ?)`,
   ).run(
     repoId,
     fields.number,
@@ -133,6 +133,7 @@ function recordPullRequest(
     fields.merged_at ?? null,
     `https://github.com/hasna/fixture/pull/${fields.number}`,
     fields.head_branch,
+    fields.head_sha ?? null,
   );
 }
 
@@ -144,6 +145,16 @@ function codeOf(run: () => unknown): string {
     return `UNEXPECTED:${(error as Error).message}`;
   }
   return "NO_ERROR";
+}
+
+function errorOf(run: () => unknown): WorktreeError {
+  try {
+    run();
+  } catch (error) {
+    if (error instanceof WorktreeError) return error;
+    throw error;
+  }
+  throw new Error("expected WorktreeError");
 }
 
 describe("removeWorktree — the unlanded branch", () => {
@@ -173,6 +184,7 @@ describe("removeWorktree — the unlanded branch", () => {
     recordPullRequest(repoId, {
       number: 42,
       head_branch: "merged-pr",
+      head_sha: git(created.path, ["rev-parse", "HEAD"]),
       state: "merged",
       merged_at: "2026-07-30T01:00:00Z",
     });
@@ -184,17 +196,65 @@ describe("removeWorktree — the unlanded branch", () => {
     expect(existsSync(created.path)).toBe(false);
   });
 
+  test("refuses a newer pushed commit when the cached merged pull request names an older head", () => {
+    const { repoName, repoId, seedPath, clonePath } = seed();
+    const created = pushedWorktree(repoName, "reused-after-merge");
+    const mergedHead = git(created.path, ["rev-parse", "HEAD"]);
+
+    git(seedPath, ["fetch", "origin"]);
+    git(seedPath, ["merge", "--squash", "origin/reused-after-merge"]);
+    git(seedPath, ["commit", "-m", "feat: the original landing (#42)"]);
+    git(seedPath, ["push", "origin", "main"]);
+    git(clonePath, ["fetch", "origin"]);
+    recordPullRequest(repoId, {
+      number: 42,
+      head_branch: "reused-after-merge",
+      head_sha: mergedHead,
+      state: "merged",
+      merged_at: "2026-07-30T01:00:00Z",
+    });
+
+    commit(created.path, "AFTER-MERGE.md", "new work that is not in main\n");
+    git(created.path, ["push", "origin", "HEAD"]);
+
+    const dry = removeWorktree({ ref: created.lease.lease_id, dryRun: true });
+    expect(dry.landing.pull_request?.state).toBe("merged");
+    expect(dry.landing.landed).toBe(false);
+    expect(dry.landing.reason).toBe("not-in-base");
+    expect(dry.refusal).toBe("WORKTREE_UNLANDED");
+    expect(dry.would_remove).toBe(false);
+    expect(existsSync(created.path)).toBe(true);
+  });
+
   test("refuses a pushed branch the base does not contain, with no pull request on record", () => {
     // The repos index carries no PR rows for most repos on this station, so the
     // fallback is what will actually run. It has to fail closed.
     const { repoName } = seed();
     const created = pushedWorktree(repoName, "no-pr-record");
 
-    expect(codeOf(() => removeWorktree({ ref: created.lease.lease_id }))).toBe("WORKTREE_UNLANDED");
+    const error = errorOf(() => removeWorktree({ ref: created.lease.lease_id }));
+    expect(error.code).toBe("WORKTREE_UNLANDED");
+    expect(error.message).toBe("the branch would change its base, so its work is not proven landed");
+    expect(error.details.hint).toContain("archive the branch before removing the worktree");
     expect(existsSync(created.path)).toBe(true);
   });
 
-  test("accepts a squash-merged branch whose content is already in the base", () => {
+  test("reports an unresolved base as unknown rather than claiming the work did not land", () => {
+    const { repoName, clonePath } = seed();
+    const created = pushedWorktree(repoName, "missing-base");
+    git(clonePath, ["update-ref", "-d", "refs/remotes/origin/main"]);
+
+    const error = errorOf(() => removeWorktree({ ref: created.lease.lease_id }));
+    expect(error.code).toBe("WORKTREE_UNLANDED");
+    expect(error.details.landing?.reason).toBe("base-unresolvable");
+    expect(error.message).toBe(
+      "the worktree's base could not be resolved, so whether its work landed is unknown",
+    );
+    expect(error.details.hint).toContain("archive the branch before removing the worktree");
+    expect(existsSync(created.path)).toBe(true);
+  });
+
+  test("accepts a squash-merged branch after the forge deletes its remote branch", () => {
     // Without this control the fallback is useless. hasna merges by squash, so a
     // landed branch tip is never an ancestor of origin/main; an ancestry-only
     // check would refuse every correctly-finished worktree, every agent would
@@ -206,14 +266,44 @@ describe("removeWorktree — the unlanded branch", () => {
     git(seedPath, ["merge", "--squash", "origin/squashed"]);
     git(seedPath, ["commit", "-m", "feat: the squashed landing (#43)"]);
     git(seedPath, ["push", "origin", "main"]);
-    git(clonePath, ["fetch", "origin"]);
+    git(seedPath, ["push", "origin", "--delete", "squashed"]);
+    git(clonePath, ["fetch", "--prune", "origin"]);
+
+    const dry = removeWorktree({ ref: created.lease.lease_id, dryRun: true });
+    expect(dry.landing.base_ref).toBe("refs/remotes/origin/main");
+    expect(dry.landing.reason).toBe("content-in-base");
+    expect(dry.refusal).toBeNull();
+    expect(dry.would_remove).toBe(true);
 
     const result = removeWorktree({ ref: created.lease.lease_id });
     expect(result.removed).toBe(true);
     expect(result.landing.reason).toBe("content-in-base");
   });
 
-  test("commits that exist on no remote are still reported as unpushed, not as unlanded", () => {
+  test("uses the indexed default branch for a squash-merged worktree with no lease", () => {
+    // A worktree made with plain `git worktree add` has no recorded base. The
+    // repository row still knows the default branch, so a missing origin/HEAD
+    // must not turn an otherwise resolvable origin/main into "unknown".
+    const { repoName, clonePath, seedPath, root } = seed();
+    const path = unleasedWorktree(clonePath, root, repoName, "stray-squashed");
+
+    git(seedPath, ["fetch", "origin"]);
+    git(seedPath, ["merge", "--squash", "origin/stray-squashed"]);
+    git(seedPath, ["commit", "-m", "feat: the stray landing (#44)"]);
+    git(seedPath, ["push", "origin", "main"]);
+    git(seedPath, ["push", "origin", "--delete", "stray-squashed"]);
+    git(clonePath, ["fetch", "--prune", "origin"]);
+    git(clonePath, ["update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD"]);
+
+    expect(git(path, ["rev-parse", "--verify", "origin/main"])).toBeTruthy();
+    const result = removeWorktree({ ref: `${repoName}/stray-squashed` });
+    expect(result.removed).toBe(true);
+    expect(result.lease_id).toBeNull();
+    expect(result.landing.base_ref).toBe("refs/remotes/origin/main");
+    expect(result.landing.reason).toBe("content-in-base");
+  });
+
+  test("genuinely unlanded commits that exist on no remote are still refused as unpushed", () => {
     // Ordering matters for the operator: "these commits exist nowhere else" is
     // the more severe and more actionable diagnosis, and --discard-changes
     // already governs it. Reporting it as UNLANDED would send the operator to
@@ -222,7 +312,17 @@ describe("removeWorktree — the unlanded branch", () => {
     const created = addWorktree({ repo: repoName, task: "never-pushed" });
     commit(created.path, "LOCAL.md", "only here\n");
 
-    expect(codeOf(() => removeWorktree({ ref: created.lease.lease_id }))).toBe("WORKTREE_UNPUSHED");
+    const dry = removeWorktree({ ref: created.lease.lease_id, dryRun: true });
+    expect(dry.landing.landed).toBe(false);
+    expect(dry.landing.reason).toBe("unpushed");
+    expect(dry.would_remove).toBe(false);
+    expect(dry.refusal).toBe("WORKTREE_UNPUSHED");
+    const error = errorOf(() => removeWorktree({ ref: created.lease.lease_id }));
+    expect(error.code).toBe("WORKTREE_UNPUSHED");
+    expect(error.message).toBe(
+      "the worktree carries 1 commit(s) whose content is not proven in its base and whose commit objects exist on no remote",
+    );
+    expect(error.details.hint).toContain("archive the branch before removing the worktree");
     const forced = removeWorktree({ ref: created.lease.lease_id, discardChanges: true });
     expect(forced.removed).toBe(true);
     expect(existsSync(join(forced.evidence_path!, "branch.bundle"))).toBe(true);
