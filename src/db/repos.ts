@@ -151,12 +151,9 @@ export function getRepo(idOrPath: string | number): Repo | null {
   const byPath = db.query("SELECT * FROM repos WHERE path = ?").get(idOrPath) as Repo | null;
   if (byPath) return sanitizeRepoForOutput(byPath);
 
-  const byName = db
-    .query("SELECT * FROM repos WHERE name = ? ORDER BY id LIMIT 2")
+  const primary = db
+    .query(`SELECT * FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")} ORDER BY id LIMIT 2`)
     .all(idOrPath) as Repo[];
-  if (byName.length === 0) return null;
-
-  const primary = byName.filter((row) => !isDerivedCheckoutPath(row.path));
   if (primary.length > 1) {
     throw new AmbiguousRepoNameError(idOrPath);
   }

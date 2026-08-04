@@ -143,6 +143,46 @@ describe("repos", () => {
       expect(resolved).toBeTruthy();
       expect(resolved!.id).toBe(canonical.id);
     });
+
+    it("still fails closed when a derived row precedes two real exact-name matches", () => {
+      upsertRepo({
+        path: "/home/u/workspace/_factory_src/duplicate",
+        name: "duplicate",
+        org: "hasna",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/primary-a",
+        name: "duplicate",
+        org: "hasna",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/primary-b",
+        name: "duplicate",
+        org: "hasna",
+      });
+
+      expect(() => getRepo("duplicate")).toThrow("Multiple repos have the exact name");
+    });
+
+    it("still resolves the real checkout when two derived rows precede it", () => {
+      upsertRepo({
+        path: "/home/u/workspace/_factory_src/shared",
+        name: "shared-three-row",
+        org: "hasna",
+      });
+      upsertRepo({
+        path: "/home/u/worktrees/repos/shared",
+        name: "shared-three-row",
+        org: "hasna",
+      });
+      const canonical = upsertRepo({
+        path: "/home/u/workspace/shared",
+        name: "shared-three-row",
+        org: "hasna",
+      });
+
+      expect(getRepo("shared-three-row")?.id).toBe(canonical.id);
+    });
   });
 
   it("should get repo by ID", () => {
