@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { getDb } from "../db/database.js";
-import { getRepo, listPullRequestsWithRepo } from "../db/repos.js";
+import { getRepo, listPullRequestsWithRepo, nonDerivedCheckoutSql } from "../db/repos.js";
 import { syncAllGithubPRs, syncGithubPRs } from "./github.js";
 import { getReleasePipelineParity, type OpsCommandRunner } from "./repo-ops.js";
 import type { PullRequest } from "../types/index.js";
@@ -1398,13 +1398,42 @@ function spawnCommand(command: string, args: string[], opts: { timeoutMs: number
   };
 }
 
-function resolveRepoPath(repoInput: string): string {
+/**
+ * Resolve `--repo <path-or-name>` on the release-candidates, docs-rules-drift
+ * and dependency-refresh producers below.
+ *
+ * The registry lookup used to match `name`/`path`/`org+name` with no regard
+ * for whether the matching row was a derived checkout (see
+ * `isDerivedCheckoutPath` in db/repos.ts) -- the same class of bug fixed for
+ * `getRepo()` by todos c357a1f3 / PR #59, left open here because #59 only
+ * routed getRepo/getRepoByRemote/fuzzyFindRepo through the fix (todos
+ * f3c7ecb6). A bare name that exact-matches only a shallow `_factory_src`
+ * scratch clone must refuse to resolve there, exactly as `getRepo()` now
+ * does, rather than silently handing back scratch-clone data to a release or
+ * dependency check that has no way to know it is looking at the wrong tree.
+ *
+ * The non-derived filter is ANDed across the WHOLE three-way OR (note the
+ * parens) rather than appended bare after it -- SQL's `AND` binds tighter
+ * than `OR`, so an unparenthesized append would silently narrow only the
+ * `org || '/' || name` branch and leave the far more common `name = ?` match
+ * completely unfiltered.
+ *
+ * This does not regress an explicit, currently-existing path input -- even
+ * one that itself looks like a derived checkout (a worktree, a factory scratch
+ * clone) -- because `existsSync(repoInput)` above already returns before this
+ * query ever runs. The `path = ?` branch below is reachable only for a path
+ * string that no longer exists on disk, where returning nothing changes
+ * nothing observable: the exact same string falls through to the `return
+ * repoInput` below either way.
+ */
+export function resolveRepoPath(repoInput: string): string {
   if (existsSync(repoInput)) return repoInput;
   try {
     const row = getDb().query<{ path: string }, [string, string, string]>(`
       SELECT path
       FROM repos
-      WHERE name = ? OR path = ? OR (org || '/' || name) = ?
+      WHERE (name = ? OR path = ? OR (org || '/' || name) = ?)
+        AND ${nonDerivedCheckoutSql("path")}
       ORDER BY updated_at DESC
       LIMIT 1
     `).get(repoInput, repoInput, repoInput);

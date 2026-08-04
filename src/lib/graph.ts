@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getDb } from "../db/database.js";
+import { nonDerivedCheckoutSql } from "../db/repos.js";
 
 export interface Edge {
   id: number;
@@ -108,8 +109,16 @@ export function buildGraph(opts: { onProgress?: (msg: string) => void } = {}): {
     try {
       const deps = extractDeps(repo.path);
       for (const dep of deps) {
-        // Find if dep is a local repo
-        const localRepo = db.query("SELECT id FROM repos WHERE name = ?").get(dep) as { id: number } | null;
+        // Find if dep is a local repo. Excludes derived checkouts (todos
+        // f3c7ecb6, same class as getRepo()'s c357a1f3 fix): a raw dependency
+        // name is passed through unchanged, so a package literally depending
+        // on e.g. "loops" would otherwise attribute the edge to a
+        // `_factory_src/loops` scratch clone -- the exact bare name it is
+        // indexed under -- while the canonical checkout ("open-loops") never
+        // matches at all.
+        const localRepo = db
+          .query(`SELECT id FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")}`)
+          .get(dep) as { id: number } | null;
         if (localRepo) {
           upsertEdge("repo", String(repo.id), "depends_on", "repo", String(localRepo.id));
           edges_created++;
@@ -219,9 +228,15 @@ export function queryRelated(repoIdOrName: string, limit = 10): Array<{
 }> {
   const db = getDb();
 
-  // Resolve repo ID
+  // Resolve repo ID. Excludes derived checkouts (todos f3c7ecb6, same class
+  // as getRepo()'s c357a1f3 fix) so a bare name whose only exact match is a
+  // `_factory_src` scratch clone falls through to the `else` below (treated
+  // as an unresolved id) instead of silently attributing results to the
+  // wrong repo.
   let repoId: string;
-  const byName = db.query("SELECT id FROM repos WHERE name = ?").get(repoIdOrName) as any;
+  const byName = db
+    .query(`SELECT id FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")}`)
+    .get(repoIdOrName) as any;
   if (byName) repoId = String(byName.id);
   else repoId = repoIdOrName;
 
@@ -303,7 +318,10 @@ export function getDeps(repoIdOrName: string, depth = 3): Array<{
 }> {
   const db = getDb();
   let repoId: string;
-  const byName = db.query("SELECT id FROM repos WHERE name = ?").get(repoIdOrName) as any;
+  // Same derived-checkout exclusion as queryRelated() above (todos f3c7ecb6).
+  const byName = db
+    .query(`SELECT id FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")}`)
+    .get(repoIdOrName) as any;
   if (byName) repoId = String(byName.id);
   else repoId = repoIdOrName;
 
