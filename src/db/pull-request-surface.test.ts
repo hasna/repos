@@ -499,4 +499,39 @@ describe("derived-checkout marker safety", () => {
     expect(() => assertLikeSafeMarker("wörktrees")).toThrow(/ASCII/);
     expect(() => assertLikeSafeMarker("")).toThrow();
   });
+
+  it("documents every derived-checkout marker in nonDerivedCheckoutSql's docstring (todos 03502ac2)", async () => {
+    // Drift guard. The predicate excludes four markers but its docstring named
+    // only `_factory_src`, so both PR #59 and PR #60 described the change as
+    // purely the factory-mirror case and an operator debugging "why does this
+    // name resolve to nothing" had no pointer to the other three. Adding a
+    // marker to either constant without documenting it must fail here.
+    const source = await Bun.file(new URL("./repos.ts", import.meta.url)).text();
+
+    // Read the markers from their DECLARATIONS rather than restating them, so
+    // this guard cannot drift out of step with the constants it guards.
+    const declaredMarkers = (constName: string): string[] => {
+      const decl = source.match(new RegExp(`const ${constName} = \\[([^\\]]*)\\]`));
+      if (!decl) throw new Error(`could not locate ${constName} in repos.ts`);
+      return [...decl[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
+    };
+    const markers = [
+      ...declaredMarkers("DERIVED_CHECKOUT_SEGMENTS"),
+      ...declaredMarkers("DERIVED_CHECKOUT_PREFIXES"),
+    ];
+    // Control: the parse above must actually find markers, or every
+    // expectation below would pass vacuously over an empty list.
+    expect(markers.length).toBeGreaterThanOrEqual(4);
+    expect(markers).toContain("worktrees");
+
+    const doc = source.match(
+      /\/\*\*((?:(?!\*\/)[\s\S])*)\*\/\s*export function nonDerivedCheckoutSql/,
+    );
+    expect(doc).not.toBeNull();
+    const docstring = doc![1]!;
+
+    for (const marker of markers) {
+      expect(docstring).toContain(marker);
+    }
+  });
 });
