@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, getDb } from "../db/database";
 import { upsertRepo } from "../db/repos";
-import { findFile } from "./utils";
+import { findFile, fuzzyFindRepo } from "./utils";
 
 let testDir = "";
 
@@ -74,6 +74,65 @@ describe("utils", () => {
       } finally {
         rmSync(markerPath, { force: true });
       }
+    });
+  });
+
+  // Regression for todos c357a1f3: getRepo() now refuses to resolve a bare
+  // name to a factory scratch clone (see db/repos.test.ts), which routes the
+  // CLI through requireRepo()'s "not found" + fuzzy-suggestion path. Without
+  // this exclusion, fuzzyFindRepo's own "exact match" query re-finds the very
+  // row getRepo just refused and suggests it right back.
+  describe("fuzzyFindRepo", () => {
+    it("does not suggest a factory scratch clone when a canonical checkout exists under a different name", () => {
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/open-loops",
+        name: "open-loops",
+        org: "hasna",
+        remote_url: "github.com/hasna/loops",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/_factory_src/loops",
+        name: "loops",
+        org: "hasna",
+        remote_url: "github.com/hasna/loops",
+      });
+
+      const match = fuzzyFindRepo("loops");
+      expect(match).toBeTruthy();
+      expect(match!.name).toBe("open-loops");
+      expect(match!.path).not.toContain("_factory_src");
+    });
+
+    it("still finds a real checkout by substring even when a same-substring scratch clone is shorter", () => {
+      // Substring match orders by LENGTH(name) ASC, so the (excluded) mirror
+      // being the shortest name containing "loops" must not win by default.
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/open-loops",
+        name: "open-loops",
+        org: "hasna",
+        remote_url: "github.com/hasna/loops",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/_factory_src/loops",
+        name: "loops",
+        org: "hasna",
+        remote_url: "github.com/hasna/loops",
+      });
+
+      const match = fuzzyFindRepo("loop");
+      expect(match).toBeTruthy();
+      expect(match!.name).toBe("open-loops");
+    });
+
+    it("returns null rather than a scratch clone when nothing else matches", () => {
+      // No canonical sibling exists here — confirms the exclusion degrades to
+      // "no suggestion" instead of falling back to the excluded row.
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/_factory_src/onlymirror",
+        name: "onlymirror",
+        org: "hasna",
+      });
+      expect(fuzzyFindRepo("onlymirror")).toBeNull();
     });
   });
 });

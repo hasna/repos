@@ -111,6 +111,37 @@ export function listAllRepos(
   }
 }
 
+/**
+ * Resolve by row id (numeric) or exact path/name (string).
+ *
+ * The by-name branch used to match the `name` column with no regard for
+ * whether the matching row was a derived checkout. A canonical checkout of
+ * `github.com/hasna/loops` is indexed as `open-loops`, while a shallow,
+ * single-commit `_factory_src/loops` scratch clone of the SAME remote is
+ * indexed under the bare name `loops`. Those are two DIFFERENT `name` values,
+ * so `getRepo("loops")` had exactly one exact match — the scratch clone — and
+ * returned it: deterministic, unambiguous, and wrong. This is not the
+ * tie-break `AmbiguousRepoNameError` exists for; it is a single match that
+ * should never have been treated as authoritative.
+ *
+ * A derived checkout is therefore filtered out of the by-name candidate set
+ * before deciding what to return:
+ *   - one non-derived match remains → return it (the common case, and also
+ *     what now happens when a derived row happens to share an exact `name`
+ *     with a real checkout — previously an accidental `AmbiguousRepoNameError`
+ *     for a "conflict" that was never real);
+ *   - more than one non-derived match remains → genuinely ambiguous, throw as
+ *     before;
+ *   - none remains (every exact-name match was derived) → refuse (return
+ *     null) rather than silently handing back scratch-clone data. Silently
+ *     substituting a canonical row under a DIFFERENT name would be fuzzy
+ *     matching wearing an exact-match's clothes, which this lookup's whole
+ *     contract (see `getRepoByRemote`'s docstring) exists to avoid. The
+ *     caller's existing "not found" + fuzzy-suggestion path is where a hint
+ *     toward the canonical name belongs — see `fuzzyFindRepo` in lib/utils.ts,
+ *     which excludes derived checkouts from its own suggestions for the same
+ *     reason.
+ */
 export function getRepo(idOrPath: string | number): Repo | null {
   const db = getDb();
   if (typeof idOrPath === "number") {
@@ -120,13 +151,13 @@ export function getRepo(idOrPath: string | number): Repo | null {
   const byPath = db.query("SELECT * FROM repos WHERE path = ?").get(idOrPath) as Repo | null;
   if (byPath) return sanitizeRepoForOutput(byPath);
 
-  const byName = db
-    .query("SELECT * FROM repos WHERE name = ? ORDER BY id LIMIT 2")
+  const primary = db
+    .query(`SELECT * FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")} ORDER BY id LIMIT 2`)
     .all(idOrPath) as Repo[];
-  if (byName.length > 1) {
+  if (primary.length > 1) {
     throw new AmbiguousRepoNameError(idOrPath);
   }
-  return byName[0] ? sanitizeRepoForOutput(byName[0]) : null;
+  return primary[0] ? sanitizeRepoForOutput(primary[0]) : null;
 }
 
 export class AmbiguousRemoteError extends Error {
@@ -193,19 +224,26 @@ export function getRepoByRemote(
  * Path markers that identify a copy of a checkout rather than the checkout
  * itself. Kept as data so the TypeScript predicate and the SQL rank term below
  * cannot drift apart into two different definitions of "derived".
+ *
+ * `_factory_src` is a shallow, single-commit factory scratch clone (see
+ * `getRepo()` below) — never a checkout anything should be routed to, and
+ * never the primary copy of a remote when a real checkout also exists.
  */
-const DERIVED_CHECKOUT_SEGMENTS = ["worktrees", ".worktrees"] as const;
+const DERIVED_CHECKOUT_SEGMENTS = ["worktrees", ".worktrees", "_factory_src"] as const;
 const DERIVED_CHECKOUT_PREFIXES = ["/dev/shm/"] as const;
 
 /**
  * SQLite's LIKE is ASCII case-insensitive and treats `%` and `_` as wildcards.
- * The TypeScript predicate has to match that exactly, so the markers are
- * required to be plain ASCII with no LIKE metacharacters and both sides compare
- * case-insensitively. `node_modules` is the obvious future marker, and its `_`
- * would silently become a wildcard — so this fails loudly at load instead.
+ * Every marker embedded in a LIKE pattern below is run through
+ * `escapeLikeMarker()` first (with a matching `ESCAPE '\'` clause), so a
+ * literal underscore in a marker — `_factory_src`'s leading character — no
+ * longer needs to be rejected here to stay safe. What still cannot be made
+ * safe by escaping is a marker containing `%` (nothing in this module escapes
+ * a literal percent sign it did not put there itself) or anything outside
+ * plain ASCII, so those remain rejected at load.
  */
 export function assertLikeSafeMarker(marker: string): string {
-  if (!/^[A-Za-z0-9./-]+$/.test(marker)) {
+  if (!/^[A-Za-z0-9._/-]+$/.test(marker)) {
     throw new Error(`derived-checkout marker '${marker}' must be ASCII and free of LIKE metacharacters`);
   }
   return marker;
@@ -226,19 +264,56 @@ export function isDerivedCheckoutPath(path: string): boolean {
 }
 
 /**
+ * Escape a marker for safe embedding in a SQL `LIKE ... ESCAPE '\'` pattern
+ * built by string interpolation (these markers are compile-time constants,
+ * never user input, so this is about LIKE semantics, not injection). SQLite's
+ * LIKE treats `%` and `_` as wildcards; this is what lets `assertLikeSafeMarker`
+ * accept `_factory_src` instead of rejecting every marker with an underscore.
+ * `PR_RANK_ORDER` further below already relies on the identical convention for
+ * `owner_remote`.
+ */
+function escapeLikeMarker(marker: string): string {
+  return marker.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
+/**
+ * The raw LIKE conditions that classify `column` as a derived checkout.
+ * Shared by `derivedCheckoutRankSql` (rank a derived copy last) and
+ * `nonDerivedCheckoutSql` (exclude a derived copy outright) so the two never
+ * drift into different definitions of "derived".
+ */
+function derivedCheckoutTests(column: string): string[] {
+  return [
+    ...DERIVED_CHECKOUT_SEGMENTS.flatMap((segment) => {
+      const escaped = escapeLikeMarker(segment);
+      return [
+        `${column} LIKE '%/${escaped}/%' ESCAPE '\\'`,
+        `${column} LIKE '${escaped}/%' ESCAPE '\\'`,
+      ];
+    }),
+    ...DERIVED_CHECKOUT_PREFIXES.map((prefix) => `${column} LIKE '${escapeLikeMarker(prefix)}%' ESCAPE '\\'`),
+  ];
+}
+
+/**
  * SQL ordering term that sorts primary clones (0) ahead of derived copies (1).
  * Kept in lockstep with isDerivedCheckoutPath by construction: same markers,
  * same case-insensitive comparison, metacharacters rejected at load.
  */
 function derivedCheckoutRankSql(column: string): string {
-  const tests = [
-    ...DERIVED_CHECKOUT_SEGMENTS.flatMap((segment) => [
-      `${column} LIKE '%/${segment}/%'`,
-      `${column} LIKE '${segment}/%'`,
-    ]),
-    ...DERIVED_CHECKOUT_PREFIXES.map((prefix) => `${column} LIKE '${prefix}%'`),
-  ];
-  return `CASE WHEN ${column} IS NOT NULL AND (${tests.join(" OR ")}) THEN 1 ELSE 0 END`;
+  return `CASE WHEN ${column} IS NOT NULL AND (${derivedCheckoutTests(column).join(" OR ")}) THEN 1 ELSE 0 END`;
+}
+
+/**
+ * SQL WHERE-clause fragment that is true only for rows that are NOT a derived
+ * checkout — the exclusion counterpart of `derivedCheckoutRankSql`, for
+ * callers that must never SUGGEST a derived checkout rather than merely rank
+ * it last. `fuzzyFindRepo` (lib/utils.ts) is the reason this exists: pointing
+ * an agent at `_factory_src/loops` after `getRepo()` correctly refused to
+ * resolve `loops` there directly would undo the refusal one step later.
+ */
+export function nonDerivedCheckoutSql(column: string): string {
+  return `(${column} IS NULL OR NOT (${derivedCheckoutTests(column).join(" OR ")}))`;
 }
 
 /** Every local checkout of a remote, in index order. */

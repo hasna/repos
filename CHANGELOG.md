@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+Fixes `repos repo <name>` — the exact lookup non-overridable rule 5 mandates for locating a
+repository — resolving a bare name to a stale `_factory_src` factory scratch clone instead of
+the canonical checkout (todos c357a1f3).
+
+- **`getRepo()`'s exact by-name branch now excludes derived checkouts** (worktrees, tmpfs build
+  copies, and factory scratch clones under `_factory_src`) from its candidate set before
+  deciding whether a name resolves, is ambiguous, or is not found. A canonical checkout of
+  `github.com/hasna/loops` is indexed as `open-loops`, while a shallow `_factory_src/loops`
+  scratch clone of the same remote is indexed under the bare name `loops` — a DIFFERENT `name`
+  value, so it was the ONLY exact match for `loops` and was returned: deterministic and wrong,
+  not a tie for `AmbiguousRepoNameError` to catch. A bare name whose only exact match is now a
+  derived checkout refuses (returns not-found) instead of silently substituting it; the
+  canonical checkout still resolves normally by its own name. If a derived and a non-derived row
+  happen to share an exact name, the non-derived one now wins instead of throwing
+  `AmbiguousRepoNameError` on a conflict that was never real.
+- **`assertLikeSafeMarker` now accepts markers containing an underscore** (`_factory_src`,
+  `node_modules`) — every LIKE pattern built from a marker is escaped with a matching
+  `ESCAPE '\'` clause instead of relying on the marker never containing a wildcard character.
+- **`fuzzyFindRepo`'s "did you mean" suggestions now exclude derived checkouts too**, so
+  refusing to resolve a bare name to a factory scratch clone is not immediately undone by the
+  not-found path suggesting that same clone back.
+
 ## 0.1.39
 
 Ships the 15 commits that had accumulated on `main` unreleased since 0.1.38 (2026-07-31),

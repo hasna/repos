@@ -78,6 +78,113 @@ describe("repos", () => {
     expect(() => getRepo("duplicate-name")).toThrow("Multiple repos have the exact name");
   });
 
+  // Regression for todos c357a1f3: `repos repo <name> --json` — the exact
+  // lookup non-overridable rule 5 mandates for locating a repository —
+  // resolved to a stale `_factory_src` scratch clone instead of the canonical
+  // checkout, because the clone is indexed under a DIFFERENT `name` value
+  // (the bare "loops") than the canonical checkout ("open-loops"), so the
+  // clone was the ONLY exact match for the bare name. This is not the
+  // multi-row tie the test above covers — a single, deterministic, wrong
+  // match — and it reproduced identically on 5 of 5 packages tested live on
+  // station01, on @hasna/repos 0.1.38 and still on 0.1.39.
+  describe("factory scratch clones never win a bare-name lookup", () => {
+    it("refuses a bare name whose only exact match is a factory scratch clone, even though the canonical checkout is indexed under a different name", () => {
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/open-loops",
+        name: "open-loops",
+        org: "hasna",
+        remote_url: "github.com/hasna/loops",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/_factory_src/loops",
+        name: "loops",
+        org: "hasna",
+        remote_url: "github.com/hasna/loops",
+      });
+
+      // The bug: this used to return the _factory_src row.
+      expect(getRepo("loops")).toBeNull();
+      // The canonical name still resolves normally — this lookup refuses the
+      // derived-only match, it does not become unable to find real checkouts.
+      const canonical = getRepo("open-loops");
+      expect(canonical).toBeTruthy();
+      expect(canonical!.path).toBe("/home/u/workspace/hasna/opensource/open-loops");
+    });
+
+    it("refuses a bare name whose only match is a factory scratch clone with no canonical sibling at all", () => {
+      upsertRepo({
+        path: "/home/u/workspace/hasna/opensource/_factory_src/onlymirror",
+        name: "onlymirror",
+        org: "hasna",
+      });
+      expect(getRepo("onlymirror")).toBeNull();
+    });
+
+    it("resolves to the real checkout, not AmbiguousRepoNameError, when a factory scratch clone happens to share an exact name with it", () => {
+      // Distinct from the "duplicate-name" test above: there TWO real
+      // checkouts share a name, which is a genuine conflict. Here only ONE of
+      // the two same-named rows is a real checkout, so it is not a conflict —
+      // narrowing to the non-derived row is what getRepoByRemote already does
+      // for the equivalent situation on the --remote lookup path.
+      const canonical = upsertRepo({
+        path: "/home/u/workspace/open-shared",
+        name: "shared",
+        org: "hasna",
+        remote_url: "github.com/hasna/shared",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/_factory_src/shared",
+        name: "shared",
+        org: "hasna",
+        remote_url: "github.com/hasna/shared-scratch",
+      });
+
+      const resolved = getRepo("shared");
+      expect(resolved).toBeTruthy();
+      expect(resolved!.id).toBe(canonical.id);
+    });
+
+    it("still fails closed when a derived row precedes two real exact-name matches", () => {
+      upsertRepo({
+        path: "/home/u/workspace/_factory_src/duplicate",
+        name: "duplicate",
+        org: "hasna",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/primary-a",
+        name: "duplicate",
+        org: "hasna",
+      });
+      upsertRepo({
+        path: "/home/u/workspace/primary-b",
+        name: "duplicate",
+        org: "hasna",
+      });
+
+      expect(() => getRepo("duplicate")).toThrow("Multiple repos have the exact name");
+    });
+
+    it("still resolves the real checkout when two derived rows precede it", () => {
+      upsertRepo({
+        path: "/home/u/workspace/_factory_src/shared",
+        name: "shared-three-row",
+        org: "hasna",
+      });
+      upsertRepo({
+        path: "/home/u/worktrees/repos/shared",
+        name: "shared-three-row",
+        org: "hasna",
+      });
+      const canonical = upsertRepo({
+        path: "/home/u/workspace/shared",
+        name: "shared-three-row",
+        org: "hasna",
+      });
+
+      expect(getRepo("shared-three-row")?.id).toBe(canonical.id);
+    });
+  });
+
   it("should get repo by ID", () => {
     const created = upsertRepo({ path: "/tmp/test-repo", name: "test-repo" });
     const repo = getRepo(created.id);
