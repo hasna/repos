@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.40
 
 Fixes `repos repo <name>` — the exact lookup non-overridable rule 5 mandates for locating a
 repository — resolving a bare name to a stale `_factory_src` factory scratch clone instead of
@@ -23,6 +23,17 @@ the canonical checkout (todos c357a1f3).
 - **`fuzzyFindRepo`'s "did you mean" suggestions now exclude derived checkouts too**, so
   refusing to resolve a bare name to a factory scratch clone is not immediately undone by the
   not-found path suggesting that same clone back.
+- **The four remaining by-name resolvers now apply the same exclusion** (todos f3c7ecb6), which
+  `getRepo()`'s fix alone did not reach. `resolveRepoPath()` in `lib/ops-producers.ts` backs the
+  `--repo <path-or-name>` option on the release-candidates, docs-rules-drift and
+  dependency-refresh producers; `queryRelated()`, `getDeps()` and the dependency-edge builder in
+  `lib/graph.ts` each resolved a bare name straight to a row id. A release check or a dependency
+  graph pointed at a week-stale scratch clone has no way to know it is reading the wrong tree.
+  In `resolveRepoPath()` the filter is ANDed across the whole parenthesised three-way
+  `name`/`path`/`org || '/' || name` OR — SQL's `AND` binds tighter than `OR`, so appending it
+  bare would have narrowed only the last branch and left the common `name = ?` match unfiltered.
+  An explicit path that exists on disk still short-circuits before the query, so passing a
+  worktree or scratch-clone path directly is unaffected.
 
 ## 0.1.39
 
