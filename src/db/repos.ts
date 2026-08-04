@@ -311,6 +311,33 @@ function derivedCheckoutRankSql(column: string): string {
  * it last. `fuzzyFindRepo` (lib/utils.ts) is the reason this exists: pointing
  * an agent at `_factory_src/loops` after `getRepo()` correctly refused to
  * resolve `loops` there directly would undo the refusal one step later.
+ *
+ * SCOPE — this excludes FOUR markers, not just the factory mirror that
+ * motivated it, because it is built from `derivedCheckoutTests`:
+ *   - path SEGMENTS: `worktrees`, `.worktrees`, `_factory_src`
+ *   - path PREFIX:   `/dev/shm/`
+ * A row is derived when a marker appears as a whole path segment (or, for the
+ * prefix, at the start of the path) — `…/my-worktrees` and `…/worktrees-scratch`
+ * are NOT derived, and the `_` in `_factory_src` is LIKE-escaped so it matches
+ * literally rather than as a single-character wildcard. A NULL path counts as
+ * non-derived, which is what lets rows with no path survive the filter.
+ *
+ * POPULATION EFFECT, so that "why does this name resolve to nothing" has a
+ * pointer (measured read-only on the station01 registry, 2026-08-04: 1,968
+ * rows / 1,882 distinct names): 1,520 of those 1,882 names have NO surviving
+ * row and therefore resolve to nothing here rather than to a derived row. That
+ * headline is dominated by ephemera — 1,475 of the 1,520 are loop/task
+ * worktree LEAF DIRECTORY names (task ids and uuids under `…/worktrees/<repo>/`)
+ * that were never a lookup target. The operator-visible remainder is 45 names
+ * whose only checkout is a `_factory_src` mirror, which is precisely the case
+ * this exclusion exists to refuse (todos c357a1f3). All 45 remain reachable
+ * through a non-derived checkout of the same remote — measured, 0 names lose
+ * their last non-derived row — so the exclusion hides no repository, it only
+ * refuses to answer with a scratch copy.
+ *
+ * The four markers above are drift-guarded by a test in
+ * `pull-request-surface.test.ts` that fails if a marker is added to either
+ * constant without being named here.
  */
 export function nonDerivedCheckoutSql(column: string): string {
   return `(${column} IS NULL OR NOT (${derivedCheckoutTests(column).join(" OR ")}))`;
