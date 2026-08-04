@@ -98,6 +98,13 @@ describe("cross-checkout de-duplication", () => {
     expect(isDerivedCheckoutPath("/home/u/workspace/open-codewith")).toBe(false);
     // Not a path segment, so not derived.
     expect(isDerivedCheckoutPath("/home/u/workspace/my-worktrees-notes")).toBe(false);
+    // _factory_src (todos c357a1f3): a shallow factory scratch clone, not a
+    // checkout anything should be routed to.
+    expect(isDerivedCheckoutPath("/home/u/workspace/hasna/opensource/_factory_src/loops")).toBe(true);
+    expect(isDerivedCheckoutPath("/HOME/U/WORKSPACE/_FACTORY_SRC/loops")).toBe(true);
+    // Not a full path segment, so not derived — same rule that already
+    // applies to "my-worktrees-notes" above.
+    expect(isDerivedCheckoutPath("/home/u/workspace/_factory_srcish/loops")).toBe(false);
 
     const primary = upsertRepo({ path: "/home/u/workspace/open-codewith", name: "open-codewith", org: "hasna", remote_url: "github.com/hasna/codewith" });
     const cased = upsertRepo({ path: "/home/u/WorkTrees/codewith/a", name: "a", org: "hasna", remote_url: "github.com/hasna/codewith" });
@@ -106,6 +113,24 @@ describe("cross-checkout de-duplication", () => {
     }
     // The SQL term must agree, or the case-variant worktree wins the tiebreak.
     expect(listPullRequestsWithRepo({ state: "open" })[0]!.repo_path).toBe("/home/u/workspace/open-codewith");
+  });
+
+  it("ranks a _factory_src scratch clone behind the real checkout, and its underscore does not become a LIKE wildcard", () => {
+    // Drift guard for todos c357a1f3: assertLikeSafeMarker must admit
+    // "_factory_src" AND the SQL rank term must still rank it derived — the
+    // two definitions must not drift apart. A naive (unescaped) LIKE would
+    // also match a path with ANY character standing in for the underscore
+    // (e.g. ".factoryAsrc"), which the second assertion below rules out.
+    const primary = upsertRepo({ path: "/home/u/workspace/open-loops", name: "open-loops", org: "hasna", remote_url: "github.com/hasna/loops" });
+    const mirror = upsertRepo({ path: "/home/u/workspace/_factory_src/loops", name: "loops", org: "hasna", remote_url: "github.com/hasna/loops" });
+    for (const id of [mirror.id, primary.id]) {
+      bulkInsertPullRequests([pr({ repo_id: id, number: 91, updated_at: "2026-07-26T01:00:00Z" })]);
+    }
+    expect(listPullRequestsWithRepo({ state: "open" })[0]!.repo_path).toBe("/home/u/workspace/open-loops");
+
+    // A path that only LOOKS like the marker if `_` were a wildcard must not
+    // be classified as derived.
+    expect(isDerivedCheckoutPath("/home/u/workspace/XfactoryXsrc/loops")).toBe(false);
   });
 
   it("falls back to a worktree only when no primary clone holds the PR", () => {
@@ -456,12 +481,20 @@ describe("derived-checkout marker safety", () => {
     expect(assertLikeSafeMarker("worktrees")).toBe("worktrees");
     expect(assertLikeSafeMarker(".worktrees")).toBe(".worktrees");
     expect(assertLikeSafeMarker("/dev/shm/")).toBe("/dev/shm/");
+    expect(assertLikeSafeMarker("_factory_src")).toBe("_factory_src");
   });
 
-  it("rejects a marker whose LIKE metacharacters would become wildcards", () => {
-    // node_modules is the plausible next marker and its underscore would match
-    // any character, silently classifying unrelated paths as derived.
-    expect(() => assertLikeSafeMarker("node_modules")).toThrow(/LIKE metacharacters/);
+  it("accepts a marker containing underscores, now that LIKE escaping protects them (todos c357a1f3)", () => {
+    // Every LIKE pattern built from a marker now runs it through
+    // escapeLikeMarker() with a matching ESCAPE '\' clause, so a literal `_`
+    // in the marker text itself no longer needs to be rejected here to stay
+    // safe. node_modules — named in the original comment as the plausible
+    // next marker this guard was written to catch — is exactly the case that
+    // flips from rejected to accepted.
+    expect(assertLikeSafeMarker("node_modules")).toBe("node_modules");
+  });
+
+  it("still rejects what escaping does not make safe: '%' and non-ASCII", () => {
     expect(() => assertLikeSafeMarker("build%")).toThrow(/LIKE metacharacters/);
     expect(() => assertLikeSafeMarker("wörktrees")).toThrow(/ASCII/);
     expect(() => assertLikeSafeMarker("")).toThrow();

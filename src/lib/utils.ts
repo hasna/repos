@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getDb } from "../db/database.js";
-import { listAllRepos } from "../db/repos.js";
+import { listAllRepos, nonDerivedCheckoutSql } from "../db/repos.js";
 
 function git(repoPath: string, args: string[], timeout = 10_000): string {
   try {
@@ -89,27 +89,50 @@ export function diffStats(days = 1): Array<{
 
 // ── Fuzzy repo matching ──
 
+/**
+ * Suggest a repo for a name that failed exact resolution.
+ *
+ * Every query here excludes derived checkouts (worktrees, tmpfs build copies,
+ * `_factory_src` factory scratch clones — see `nonDerivedCheckoutSql` in
+ * db/repos.ts). Without that exclusion, this function undoes the point of
+ * `getRepo()` refusing to resolve a bare name to a derived checkout: `getRepo`
+ * says "not found", the CLI's `requireRepo()` calls this for a "did you mean"
+ * hint, and the "exact match" query below — run against the SAME name that
+ * was just refused — would find the very derived row `getRepo` excluded and
+ * suggest it right back, e.g. "Repo not found: loops. Did you mean 'loops'
+ * (.../_factory_src/loops)?". A derived checkout always has a real, more
+ * useful sibling to suggest instead (see the diagnosis on todos c357a1f3: 45
+ * of 45 factory scratch clones have a canonical sibling under a different
+ * name), so excluding it here loses nothing.
+ */
 export function fuzzyFindRepo(query: string): { id: number; name: string; path: string } | null {
   const db = getDb();
+  const nonDerived = nonDerivedCheckoutSql("path");
 
   // Exact match first
-  const exact = db.query("SELECT id, name, path FROM repos WHERE name = ? OR path = ?").get(query, query) as any;
+  const exact = db
+    .query(`SELECT id, name, path FROM repos WHERE (name = ? OR path = ?) AND ${nonDerived}`)
+    .get(query, query) as any;
   if (exact) return exact;
 
   // Substring match
-  const sub = db.query("SELECT id, name, path FROM repos WHERE name LIKE ? ORDER BY LENGTH(name) ASC LIMIT 1").get(`%${query}%`) as any;
+  const sub = db
+    .query(`SELECT id, name, path FROM repos WHERE name LIKE ? AND ${nonDerived} ORDER BY LENGTH(name) ASC LIMIT 1`)
+    .get(`%${query}%`) as any;
   if (sub) return sub;
 
   // Abbreviated match (plat-alum → platform-alumia)
   const parts = query.split(/[-_]/);
   if (parts.length >= 2) {
     const pattern = parts.map(p => `%${p}%`).join("");
-    const abbrev = db.query("SELECT id, name, path FROM repos WHERE name LIKE ? ORDER BY LENGTH(name) ASC LIMIT 1").get(pattern) as any;
+    const abbrev = db
+      .query(`SELECT id, name, path FROM repos WHERE name LIKE ? AND ${nonDerived} ORDER BY LENGTH(name) ASC LIMIT 1`)
+      .get(pattern) as any;
     if (abbrev) return abbrev;
   }
 
   // Levenshtein-ish: find closest by sorting all repos and picking best substring overlap
-  const allRepos = db.query("SELECT id, name, path FROM repos").all() as any[];
+  const allRepos = db.query(`SELECT id, name, path FROM repos WHERE ${nonDerived}`).all() as any[];
   let bestMatch: any = null;
   let bestScore = 0;
 
