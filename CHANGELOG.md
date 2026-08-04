@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.39
+
+Ships the 15 commits that had accumulated on `main` unreleased since 0.1.38 (2026-07-31),
+including one correctness fix and the ship-chain reporting work.
+
+- **`repos scan` no longer registers worktrees as their own repository rows** (#49). The
+  derived-checkout exclusion previously governed only ambiguity ranking between multiple
+  checkouts of the same remote — it did not stop `repos scan` from admitting a worktree path
+  as a new row in the first place. `discoverRepos` and `scanRepoPaths` now both apply the same
+  `isDerivedCheckoutPath` predicate at admission time, so a worktree scanned directly or found
+  during directory discovery is skipped rather than indexed. This does not retroactively clean
+  existing worktree rows already in the registry.
+- Release-readiness reporting now covers all four ship-chain rungs (merged / published /
+  installed / running) and fails on `UNKNOWN` instead of reporting a false pass (#53, #54, #55).
+- `repos worktree` recognizes a squash-landed branch as landed, so `remove` no longer refuses a
+  merged PR's worktree with a false "unlanded" verdict (#56).
+- CI: `ci.yml` and `publish.yml` third-party actions (`actions/checkout`, `oven-sh/setup-bun`)
+  are pinned to commit shas instead of floating major tags (#57).
+- `recordedBaseSource` no longer falls back to `origin` when `owner_metadata` is absent (#50).
+- Checkout-usability judgement hardening: `describeCheckoutRemedy` no longer builds an invalid
+  clone URL for an ssh-form remote (#42); `requireUsableCheckout` no longer calls
+  `process.exit(1)` immediately after logging, which was dropping consolidated output (#44);
+  `hasAnyRef` no longer treats a present-but-empty `packed-refs` as proof refs exist (#46);
+  checkout-usability judgement consolidated behind `assertHealthyParent` (#45); the published
+  CLI was missing the `worktrees lease` command (#41).
+- Docs and test-budget maintenance: CHANGELOG unreleased-entry and README fenced-block spacing
+  conventions (#43); a subprocess-heavy test suite fixed to fit the 5s bun-test budget (#47); a
+  full docs deep-scan across src/bins/README/docs (#48).
+
 ## 0.1.38
 
 Adds fail-closed checkout health for repository lookups and a registry-wide health command
