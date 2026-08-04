@@ -15,6 +15,7 @@ import {
   buildTaskRouteHealth,
   buildWorkspaceWorktreeHygiene,
   inspectPackageHygiene,
+  resolveRepoPath,
   runGlobalCliSmoke,
   type CommandRunner,
 } from "./ops-producers.js";
@@ -1029,6 +1030,72 @@ describe("ops producers", () => {
     // The seed, if any, must not be the high-priority "publish bypassed the tag
     // pipeline" task that the collision used to produce.
     expect(result.task_suggestions.filter((seed) => seed.priority === "high")).toEqual([]);
+  });
+});
+
+// Regression for todos f3c7ecb6: resolveRepoPath() backs `--repo` on
+// buildReleaseCandidates/buildDocsRulesDrift/buildDependencyRefresh, and
+// unlike getRepo() (fixed by todos c357a1f3 / PR #59) it ran its bare-name
+// lookup with no derived-checkout awareness at all -- so `--repo loops` could
+// resolve to a stale `_factory_src/loops` scratch clone even after #59
+// shipped, because #59 only routed getRepo/getRepoByRemote/fuzzyFindRepo
+// through the fix, not this resolver.
+describe("resolveRepoPath", () => {
+  test("refuses a bare name whose only exact match is a factory scratch clone, even though the canonical checkout is indexed under a different name", () => {
+    upsertRepo({
+      path: "/home/u/workspace/hasna/opensource/open-loops",
+      name: "open-loops",
+      org: "hasna",
+      remote_url: "github.com/hasna/loops",
+    });
+    upsertRepo({
+      path: "/home/u/workspace/hasna/opensource/_factory_src/loops",
+      name: "loops",
+      org: "hasna",
+      remote_url: "github.com/hasna/loops",
+    });
+
+    // The bug: this used to return the _factory_src row's path.
+    expect(resolveRepoPath("loops")).toBe("loops");
+    // The canonical name still resolves normally -- the fix refuses the
+    // derived-only match, it does not become unable to find real checkouts.
+    expect(resolveRepoPath("open-loops")).toBe("/home/u/workspace/hasna/opensource/open-loops");
+  });
+
+  test("refuses the org/name form the same way when the only exact match there is a factory scratch clone", () => {
+    upsertRepo({
+      path: "/home/u/workspace/_factory_src/orgname-fixture",
+      name: "orgname-fixture",
+      org: "acme",
+    });
+    // The bug: `(org || '/' || name) = ?` matched the mirror directly.
+    expect(resolveRepoPath("acme/orgname-fixture")).toBe("acme/orgname-fixture");
+  });
+
+  test("still resolves the org/name form to a real checkout when one exists", () => {
+    upsertRepo({
+      path: "/home/u/workspace/hasna/opensource/open-repos-fixture",
+      name: "open-repos-fixture",
+      org: "hasna",
+      remote_url: "github.com/hasna/repos-fixture",
+    });
+    expect(resolveRepoPath("hasna/open-repos-fixture")).toBe(
+      "/home/u/workspace/hasna/opensource/open-repos-fixture"
+    );
+  });
+
+  test("returns an on-disk path unchanged even if it looks like a derived checkout, without the registry filter ever applying to it", () => {
+    // This is the composition question the fix has to get right: adding a
+    // derived-checkout exclusion must not regress a caller who explicitly
+    // names a real, currently-existing worktree/factory path on purpose --
+    // one of the three commands' documented supported inputs is an exact
+    // path, not only a bare name. It doesn't, because `existsSync` on the
+    // literal input short-circuits before the registry is ever queried.
+    const dir = mkdtempSync(join(tmpdir(), "resolve-repo-path-worktree-"));
+    tempDirs.push(dir);
+    const fakeWorktreePath = join(dir, "worktrees", "some-repo", "some-branch");
+    mkdirSync(fakeWorktreePath, { recursive: true });
+    expect(resolveRepoPath(fakeWorktreePath)).toBe(fakeWorktreePath);
   });
 });
 
