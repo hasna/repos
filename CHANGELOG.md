@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.41
+
+Fixes `repos search <query>` crashing when user input contains hyphens or embedded double
+quotes (todos 2b54e97f-49ca-4940-ac97-a2c490076906).
+
+- Repository, commit, and pull-request full-text searches now quote and escape
+  whitespace-delimited terms before passing them to SQLite FTS5, so punctuation is treated as
+  literal search input instead of FTS syntax or a column reference.
+- Focused regressions cover the original `repo-project-familiarization` failure and embedded
+  double quotes across all three search surfaces.
+
 ## 0.1.40
 
 Fixes `repos repo <name>` — the exact lookup non-overridable rule 5 mandates for locating a
