@@ -40,12 +40,16 @@ function git(cwd: string, args: string[]): number {
 }
 
 /** A working checkout under the fixture. */
-function makeCheckout(name: string): string {
-  const path = join(tempDir, name);
+function makeCheckoutAt(relativePath: string): string {
+  const path = join(tempDir, relativePath);
   mkdirSync(path, { recursive: true });
   expect(git(path, ["init", "-q", "-b", "main", "."])).toBe(0);
   expect(git(path, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"])).toBe(0);
   return path;
+}
+
+function makeCheckout(name: string): string {
+  return makeCheckoutAt(name);
 }
 
 /** A `.git` stripped down to what the real gutted checkouts retain. */
@@ -156,6 +160,45 @@ describe("repo lookup refuses an unusable checkout", () => {
       expect(result.code).toBe(1);
       expect(result.stderr).toContain("hollow-git-dir");
     }
+  });
+});
+
+describe("repo lookup validates managed path identity", () => {
+  test("refuses a managed checkout whose name and path disagree with its remote", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "repos-guard-identity-mismatch-"));
+    const path = makeCheckoutAt(join("workspace", "hasnaxyz", "internalapp", "iapp-fixture"));
+    const dbPath = seed([{
+      name: "iapp-fixture",
+      path,
+      remote: "github.com/hasna/fixture",
+    }]);
+
+    const result = runCli(dbPath, ["repo", "iapp-fixture", "--json"]);
+    expect(result.code).toBe(1);
+    expect(result.stdout.trim()).toBe("");
+    expect(result.stderr).toContain("identity mismatch");
+    expect(result.stderr).toContain("github.com/hasnaxyz/iapp-fixture");
+    expect(result.stderr).toContain("github.com/hasna/fixture");
+
+    const byPath = runCli(dbPath, ["repo", path, "--json"]);
+    expect(byPath.code).toBe(1);
+    expect(byPath.stdout.trim()).toBe("");
+    expect(byPath.stderr).toContain("identity mismatch");
+  });
+
+  test("still resolves a managed checkout whose path and remote identities agree", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "repos-guard-identity-match-"));
+    const path = makeCheckoutAt(join("workspace", "hasnaxyz", "internalapp", "iapp-fixture"));
+    const dbPath = seed([{
+      name: "iapp-fixture",
+      path,
+      remote: "github.com/hasnaxyz/iapp-fixture",
+    }]);
+
+    const result = runCli(dbPath, ["repo", "iapp-fixture", "--json"]);
+    expect(result.code).toBe(0);
+    expect((JSON.parse(result.stdout) as { path: string }).path).toBe(path);
+    expect(result.stderr).not.toContain("identity mismatch");
   });
 });
 

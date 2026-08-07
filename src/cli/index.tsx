@@ -20,8 +20,10 @@ import {
   searchAll,
   getGlobalStats,
   getRepoStats,
+  getManagedRepoIdentityMismatch,
   AmbiguousRepoNameError,
   AmbiguousRemoteError,
+  RepoIdentityMismatchError,
 } from "../db/repos.js";
 import {
   BranchAdjudicationError,
@@ -154,7 +156,7 @@ function requireRepo(repoInput: string) {
   try {
     repo = getRepo(repoInput);
   } catch (error) {
-    if (error instanceof AmbiguousRepoNameError) {
+    if (error instanceof AmbiguousRepoNameError || error instanceof RepoIdentityMismatchError) {
       console.error(chalk.red(error.message));
       process.exit(1);
     }
@@ -172,6 +174,17 @@ function requireRepo(repoInput: string) {
     )
   );
   process.exit(1);
+}
+
+function requireConsistentRepoIdentity(
+  repo: NonNullable<ReturnType<typeof getRepo>>,
+) {
+  const mismatch = getManagedRepoIdentityMismatch(repo);
+  if (mismatch) {
+    console.error(chalk.red(new RepoIdentityMismatchError(mismatch).message));
+    process.exit(1);
+  }
+  return repo;
 }
 
 const ALLOW_UNUSABLE_OPTION = "--allow-unusable-checkout";
@@ -569,13 +582,13 @@ function resolveTargetRepo(name: string | undefined, opts: any) {
         : "No indexed repo matched --remote (value was not a usable host/org/name identity)"));
       process.exit(1);
     }
-    return repo;
+    return requireConsistentRepoIdentity(repo);
   }
   if (!name) {
     console.error(chalk.red("Error: provide a repo name or --remote <host/org/name>"));
     process.exit(1);
   }
-  return requireRepo(name);
+  return requireConsistentRepoIdentity(requireRepo(name));
 }
 
 /**
