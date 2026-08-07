@@ -19,11 +19,15 @@ const packageRecord = JSON.parse(readFileSync(resolve("package.json"), "utf8")) 
 };
 const executablePath = resolve("dist/cli/index.js");
 const executable = readFileSync(executablePath);
+const sourceStatus = git("status", "--porcelain", "--untracked-files=all");
+if (sourceStatus !== "") {
+  throw new Error("refusing to write release provenance from a dirty source tree");
+}
 const provenance = {
   schema: RELEASE_PROVENANCE_SCHEMA,
   exact_commit: git("rev-parse", "HEAD"),
   exact_tree: git("rev-parse", "HEAD^{tree}"),
-  source_clean: git("status", "--porcelain", "--untracked-files=all") === "",
+  source_clean: true,
   package_name: packageRecord.name,
   package_version: packageRecord.version,
   executable_path: "dist/cli/index.js",

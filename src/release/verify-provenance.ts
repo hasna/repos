@@ -16,7 +16,8 @@ Report the ship chain for a repos release from artefacts, one line per rung:
   PUBLISHED  the published package and executable digests bind that source
   INSTALLED  the artefact is actually on this host's disk, digested from the
              installed bytes - not read off a version string
-  RUNNING    the artefact is the one actually running (NOT IMPLEMENTED - reports UNKNOWN)
+  RUNNING    this host freshly launched that exact installed CLI with --version,
+             and its digest matched before and after execution
 
 Every invocation prints all four rungs as PASS, FAIL or UNKNOWN. The command
 exits non-zero if ANY rung is FAIL *or* UNKNOWN: merged is not published,
@@ -33,9 +34,9 @@ Required options:
   --executable <path>                 Exact repos executable
 
 Options:
-  --installed-package <name>          Package to resolve for the INSTALLED rung
+  --installed-package <name>          Package to resolve for INSTALLED/RUNNING
                                       (defaults to the verified package name)
-  --install-root <path>               node_modules root for the INSTALLED rung
+  --install-root <path>               node_modules root for INSTALLED/RUNNING
                                       (defaults to the global bun install root)
   --json                              Emit the machine-readable report
   -h, --help                          display help
