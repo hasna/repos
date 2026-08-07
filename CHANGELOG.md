@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.44
+
+Fixes `repos repo <name>` and exact-path lookup returning an indexed managed
+internal-app checkout whose path identity disagrees with its recorded remote
+(#68, closes #67).
+
+- Managed `<workspace>/<owner>/internalapp/<repo>` paths now require the
+  indexed row name and credential-free remote identity to match the owner and
+  repository encoded by that path.
+- An identity mismatch fails closed with both expected and indexed remote
+  identities plus a repair instruction, instead of returning the wrong
+  checkout at exit code 0.
+- Other layouts remain unopinionated, preserving legitimate OSS checkout names
+  that differ from their GitHub repository names.
+- Focused CLI regressions exercise both the mismatch refusal and the matching
+  managed-checkout success path.
+
 ## 0.1.42
 
 Fixes `repos repo --remote <org>/<name>` resolving to a stale `_factory_src` scratch clone at
