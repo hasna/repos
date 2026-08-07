@@ -24,6 +24,29 @@ export class AmbiguousRepoNameError extends Error {
   }
 }
 
+export interface RepoIdentityMismatch {
+  path: string;
+  actualName: string;
+  expectedName: string;
+  actualRemote: string | null;
+  expectedRemote: string;
+}
+
+export class RepoIdentityMismatchError extends Error {
+  constructor(public readonly mismatch: RepoIdentityMismatch) {
+    const actualRemote = mismatch.actualRemote ?? "(missing or invalid)";
+    const nameDetail = mismatch.actualName === mismatch.expectedName
+      ? ""
+      : `; row name '${mismatch.actualName}' disagrees with path name '${mismatch.expectedName}'`;
+    super(
+      `Repository identity mismatch at '${mismatch.path}': managed path requires remote `
+      + `'${mismatch.expectedRemote}', but the index reports '${actualRemote}'${nameDetail}. `
+      + "Repair or replace the checkout, then run repos scan."
+    );
+    this.name = "RepoIdentityMismatchError";
+  }
+}
+
 export function sanitizeRepoForOutput(repo: Repo): Repo {
   return { ...repo, remote_url: sanitizeRemoteIdentity(repo.remote_url) };
 }
@@ -142,6 +165,49 @@ export function listAllRepos(
  *     which excludes derived checkouts from its own suggestions for the same
  *     reason.
  */
+/**
+ * Canonical managed internal-app paths encode both repository owner and name:
+ * `<workspace>/<owner>/internalapp/<repo>`. That identity is stronger than a
+ * row's `name` column because the scanner derives `name` from the directory
+ * basename even when the checkout was copied from another repository.
+ *
+ * Other layouts deliberately remain unopinionated. In particular, OSS
+ * checkouts such as `hasna/opensource/open-emails` legitimately use a local
+ * directory name that differs from the GitHub repository name.
+ */
+export function getManagedRepoIdentityMismatch(repo: Repo): RepoIdentityMismatch | null {
+  const segments = repo.path.replace(/\\/g, "/").split("/").filter(Boolean);
+  let internalAppIndex = -1;
+  for (let index = segments.length - 1; index >= 0; index--) {
+    if (segments[index]!.toLowerCase() === "internalapp") {
+      internalAppIndex = index;
+      break;
+    }
+  }
+  if (internalAppIndex < 1 || internalAppIndex !== segments.length - 2) return null;
+
+  const expectedOwner = segments[internalAppIndex - 1]!;
+  const expectedName = segments[internalAppIndex + 1]!;
+  const expectedRemote = sanitizeRemoteIdentity(`github.com/${expectedOwner}/${expectedName}`);
+  if (!expectedRemote) return null;
+
+  const actualRemote = sanitizeRemoteIdentity(repo.remote_url);
+  if (
+    repo.name.toLowerCase() === expectedName.toLowerCase()
+    && actualRemote?.toLowerCase() === expectedRemote.toLowerCase()
+  ) {
+    return null;
+  }
+
+  return {
+    path: repo.path,
+    actualName: repo.name,
+    expectedName,
+    actualRemote,
+    expectedRemote,
+  };
+}
+
 export function getRepo(idOrPath: string | number): Repo | null {
   const db = getDb();
   if (typeof idOrPath === "number") {
@@ -151,13 +217,21 @@ export function getRepo(idOrPath: string | number): Repo | null {
   const byPath = db.query("SELECT * FROM repos WHERE path = ?").get(idOrPath) as Repo | null;
   if (byPath) return sanitizeRepoForOutput(byPath);
 
-  const primary = db
-    .query(`SELECT * FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")} ORDER BY id LIMIT 2`)
-    .all(idOrPath) as Repo[];
-  if (primary.length > 1) {
+  const primary = (db
+    .query(`SELECT * FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")} ORDER BY id`)
+    .all(idOrPath) as Repo[]).map(sanitizeRepoForOutput);
+  const mismatches: RepoIdentityMismatch[] = [];
+  const valid = primary.filter((repo) => {
+    const mismatch = getManagedRepoIdentityMismatch(repo);
+    if (mismatch) mismatches.push(mismatch);
+    return mismatch === null;
+  });
+  if (valid.length > 1) {
     throw new AmbiguousRepoNameError(idOrPath);
   }
-  return primary[0] ? sanitizeRepoForOutput(primary[0]) : null;
+  if (valid[0]) return valid[0];
+  if (mismatches[0]) throw new RepoIdentityMismatchError(mismatches[0]);
+  return null;
 }
 
 export class AmbiguousRemoteError extends Error {
