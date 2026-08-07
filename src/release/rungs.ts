@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -6,8 +7,11 @@ import {
   fstatSync,
   openSync,
   readFileSync,
+  readSync,
+  realpathSync,
 } from "node:fs";
 import { join } from "node:path";
+import { hostname } from "node:os";
 import {
   RELEASE_EXECUTABLE_PATH,
   parseReleaseProvenance,
@@ -41,7 +45,8 @@ export interface ShipChainReport {
 }
 
 const UNASKED_RUNNING =
-  "not asked: no process probe mechanism is defined, so no running artefact was checked";
+  "not asked: no install context was supplied, so no running artefact was checked";
+const RELEASE_CLI_BIN_NAME = "repos";
 
 export interface InstalledRungOptions {
   /** Package name to resolve on disk, e.g. "@hasna/repos". */
@@ -50,6 +55,11 @@ export interface InstalledRungOptions {
   expectedExecutableSha256: string;
   /** node_modules root to resolve in. Defaults to the global bun install root. */
   installRoot?: string;
+}
+
+export interface RunningRungOptions extends InstalledRungOptions {
+  /** Version the exact installed CLI must report from a fresh --version probe. */
+  expectedPackageVersion?: string;
 }
 
 export function defaultInstallRoot(env: NodeJS.ProcessEnv = process.env): string {
@@ -102,6 +112,40 @@ function digestInstalledExecutable(path: string):
     ok: true,
     sha256: createHash("sha256").update(read.bytes).digest("hex"),
   };
+}
+
+function digestOpenedExecutable(descriptor: number):
+  | { ok: true; sha256: string }
+  | { ok: false; reason: string } {
+  try {
+    const before = fstatSync(descriptor);
+    if (!before.isFile()) return { ok: false, reason: "unreadable (not a regular file)" };
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < before.size) {
+      const count = readSync(
+        descriptor,
+        chunk,
+        0,
+        Math.min(chunk.length, before.size - position),
+        position,
+      );
+      if (count === 0) {
+        return { ok: false, reason: "changed while its opened descriptor was being digested" };
+      }
+      hash.update(chunk.subarray(0, count));
+      position += count;
+    }
+    const after = fstatSync(descriptor);
+    if (after.size !== before.size) {
+      return { ok: false, reason: "changed size while its opened descriptor was being digested" };
+    }
+    return { ok: true, sha256: hash.digest("hex") };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code ?? "unknown I/O error";
+    return { ok: false, reason: `unreadable (${code})` };
+  }
 }
 
 /**
@@ -203,6 +247,173 @@ export function evaluateInstalledRung(options: InstalledRungOptions): Rung {
   );
 }
 
+function runningProbeEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  // A version probe needs no credentials. Pass only the runtime/config values
+  // Bun needs instead of giving an installed executable every secret inherited
+  // by the verifier process.
+  const result: NodeJS.ProcessEnv = {
+    HASNA_REPOS_AUTO_BOOTSTRAP: "0",
+    NO_COLOR: "1",
+  };
+  for (const name of ["HOME", "PATH", "BUN_INSTALL", "TMPDIR", "LANG", "LC_ALL"]) {
+    const value = env[name];
+    if (value !== undefined) result[name] = value;
+  }
+  return result;
+}
+
+/**
+ * The RUNNING rung for a one-shot CLI. "Running" cannot mean a resident
+ * process here: repos starts, answers, and exits. It means this verification
+ * call successfully launched the exact installed executable on this host.
+ *
+ * The installed identity is checked first, the pinned path is launched through
+ * the same Bun runtime as the verifier with the side-effect-free --version
+ * path, and the bytes are digested again afterwards. A path swap or mutation
+ * during the probe therefore cannot turn a different build into PASS.
+ */
+export function evaluateRunningRung(options: RunningRungOptions): Rung {
+  const rung = (status: RungStatus, detail: string): Rung => ({ rung: "RUNNING", status, detail });
+  const installed = evaluateInstalledRung(options);
+  if (installed.status !== "PASS") {
+    const prefix = installed.status === "UNKNOWN" ? "not asked" : "not run";
+    return rung(installed.status, `${prefix}: installed artefact is not verified: ${installed.detail}`);
+  }
+  if (!options.expectedPackageVersion) {
+    return rung("UNKNOWN", "not asked: the verified package version is unavailable");
+  }
+
+  const root = options.installRoot ?? defaultInstallRoot();
+  if (!root) {
+    return rung("UNKNOWN", "not asked: no install root could be resolved (set BUN_INSTALL or --install-root)");
+  }
+  const packageDir = join(root, ...options.packageName.split("/"));
+  const executablePath = join(packageDir, ...RELEASE_EXECUTABLE_PATH.split("/"));
+  const binPath = join(root, ".bin", RELEASE_CLI_BIN_NAME);
+  const descriptorPath = process.platform === "linux"
+    ? "/proc/self/fd/3"
+    : process.platform === "darwin"
+      ? "/dev/fd/3"
+      : null;
+  if (!descriptorPath) {
+    return rung("UNKNOWN", `not asked: descriptor-bound CLI execution is unsupported on ${process.platform}`);
+  }
+
+  let executableDescriptor: number | undefined;
+  let binDescriptor: number | undefined;
+  try {
+    let resolvedExecutable: string;
+    let resolvedBin: string;
+    try {
+      resolvedExecutable = realpathSync(executablePath);
+      resolvedBin = realpathSync(binPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code ?? "unknown I/O error";
+      return rung("FAIL", `installed ${RELEASE_CLI_BIN_NAME} entrypoint could not be resolved (${code})`);
+    }
+    if (resolvedBin !== resolvedExecutable) {
+      return rung(
+        "FAIL",
+        `installed entrypoint ${binPath} resolves to ${resolvedBin}, expected ${resolvedExecutable}`,
+      );
+    }
+
+    executableDescriptor = openSync(executablePath, constants.O_RDONLY | constants.O_NONBLOCK);
+    binDescriptor = openSync(binPath, constants.O_RDONLY | constants.O_NONBLOCK);
+    const executableStat = fstatSync(executableDescriptor);
+    const binStat = fstatSync(binDescriptor);
+    if (!binStat.isFile()) {
+      return rung("FAIL", `installed entrypoint ${binPath} is not a regular file`);
+    }
+    if (binStat.dev !== executableStat.dev || binStat.ino !== executableStat.ino) {
+      return rung("FAIL", `installed entrypoint ${binPath} did not open the pinned executable ${executablePath}`);
+    }
+    if ((binStat.mode & 0o111) === 0) {
+      return rung("FAIL", `installed entrypoint ${binPath} is not executable`);
+    }
+
+    const before = digestOpenedExecutable(binDescriptor);
+    if (!before.ok) {
+      return rung("FAIL", `installed entrypoint ${binPath} is ${before.reason} before the run probe`);
+    }
+    if (before.sha256 !== options.expectedExecutableSha256) {
+      return rung(
+        "FAIL",
+        `installed entrypoint ${binPath} changed before the run probe: sha256 ${before.sha256}, expected ${options.expectedExecutableSha256}`,
+      );
+    }
+
+    const probe = spawnSync(descriptorPath, ["--version"], {
+      cwd: packageDir,
+      encoding: "utf8",
+      env: runningProbeEnvironment(),
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+      stdio: ["ignore", "pipe", "pipe", binDescriptor],
+    });
+
+    const after = digestOpenedExecutable(binDescriptor);
+    if (!after.ok) {
+      return rung("FAIL", `installed entrypoint ${binPath} is ${after.reason} after the run probe`);
+    }
+    if (after.sha256 !== options.expectedExecutableSha256 || after.sha256 !== before.sha256) {
+      return rung(
+        "FAIL",
+        `opened installed executable changed during the run probe: before ${before.sha256}, after ${after.sha256}, expected ${options.expectedExecutableSha256}`,
+      );
+    }
+
+    let resolvedBinAfter: string;
+    try {
+      resolvedBinAfter = realpathSync(binPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code ?? "unknown I/O error";
+      return rung("FAIL", `installed ${RELEASE_CLI_BIN_NAME} entrypoint changed during the run probe (${code})`);
+    }
+    if (resolvedBinAfter !== resolvedExecutable) {
+      return rung(
+        "FAIL",
+        `installed entrypoint changed during the run probe: ${binPath} now resolves to ${resolvedBinAfter}`,
+      );
+    }
+
+    if (probe.error) {
+      const code = (probe.error as NodeJS.ErrnoException).code ?? probe.error.name;
+      return rung("FAIL", `exact installed CLI could not complete the bounded --version probe (${code})`);
+    }
+    if (probe.status !== 0) {
+      const outcome = probe.signal ? `signal ${probe.signal}` : `status ${String(probe.status)}`;
+      return rung("FAIL", `exact installed CLI --version probe exited with ${outcome}`);
+    }
+    const actualVersion = String(probe.stdout ?? "").trim();
+    if (actualVersion !== options.expectedPackageVersion) {
+      return rung(
+        "FAIL",
+        `exact installed CLI reported version ${JSON.stringify(actualVersion)}, expected ${JSON.stringify(options.expectedPackageVersion)}`,
+      );
+    }
+
+    return rung(
+      "PASS",
+      `${hostname()} launched ${binPath} through its verified descriptor with --version: exit 0, version ${actualVersion}, executable sha256 ${after.sha256} before and after`,
+    );
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    const message = error instanceof Error ? error.message : String(error);
+    return rung("FAIL", `installed entrypoint could not be opened for the run probe: ${code ?? message}`);
+  } finally {
+    for (const descriptor of [binDescriptor, executableDescriptor]) {
+      if (descriptor !== undefined) {
+        try {
+          closeSync(descriptor);
+        } catch {
+          // A close error cannot change the already classified probe result.
+        }
+      }
+    }
+  }
+}
+
 /**
  * Classify a provenance failure onto the rung it actually belongs to.
  * verifyReleaseProvenance binds the package bytes first, then the source
@@ -257,6 +468,15 @@ function safeInstalledRung(options: InstalledRungOptions): Rung {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { rung: "INSTALLED", status: "FAIL", detail: `install could not be inspected: ${message}` };
+  }
+}
+
+function safeRunningRung(options: RunningRungOptions): Rung {
+  try {
+    return evaluateRunningRung(options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { rung: "RUNNING", status: "FAIL", detail: `run probe could not be completed: ${message}` };
   }
 }
 
@@ -315,12 +535,27 @@ export function buildShipChainReport(
         expectedExecutableSha256: installed.expectedExecutableSha256,
         installRoot: installed.installRoot,
       });
+  const runningRung: Rung = !installed
+    ? { rung: "RUNNING", status: "UNKNOWN", detail: UNASKED_RUNNING }
+    : !packageName
+      ? {
+        rung: "RUNNING",
+        status: "UNKNOWN",
+        detail: "not asked: package name unknown (pass --installed-package to probe a failed provenance candidate)",
+      }
+      : safeRunningRung({
+        packageName,
+        expectedCommit: installed.expectedCommit,
+        expectedExecutableSha256: installed.expectedExecutableSha256,
+        expectedPackageVersion: receipt?.package_version,
+        installRoot: installed.installRoot,
+      });
 
   return finish([
     merged,
     published,
     installedRung,
-    { rung: "RUNNING", status: "UNKNOWN", detail: UNASKED_RUNNING },
+    runningRung,
   ], receipt);
 }
 

@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -51,8 +58,12 @@ function runReportInChild(installRoot: string, expectedExecutableSha256: string)
 function installTree(options: { commit?: string; executable: Buffer; withProvenance?: boolean }): string {
   const root = mkdtempSync(join(tmpdir(), "rungs-"));
   const packageDir = join(root, "@hasna", "repos");
+  const executablePath = join(packageDir, "dist", "cli", "index.js");
   mkdirSync(join(packageDir, "dist", "cli"), { recursive: true });
-  writeFileSync(join(packageDir, "dist", "cli", "index.js"), options.executable);
+  mkdirSync(join(root, ".bin"), { recursive: true });
+  writeFileSync(executablePath, options.executable);
+  chmodSync(executablePath, 0o755);
+  symlinkSync("../@hasna/repos/dist/cli/index.js", join(root, ".bin", "repos"));
   if (options.withProvenance !== false) {
     writeFileSync(join(packageDir, "dist", "release-provenance.json"), JSON.stringify({
       schema: RELEASE_PROVENANCE_SCHEMA,
@@ -83,7 +94,7 @@ describe("ship chain report", () => {
     const report = buildShipChainReport(() => receipt);
     expect(rung(report, "MERGED").status).toBe("PASS");
     expect(rung(report, "PUBLISHED").status).toBe("PASS");
-    // RUNNING has no probe mechanism, so the whole chain must stay unverified.
+    // No install context was supplied, so RUNNING must stay explicitly UNKNOWN.
     expect(rung(report, "RUNNING").status).toBe("UNKNOWN");
     expect(report.verified).toBe(false);
   });
@@ -103,6 +114,153 @@ describe("ship chain report", () => {
     });
     expect(rung(report, "MERGED").status).toBe("FAIL");
     expect(rung(report, "PUBLISHED").status).toBe("PASS");
+  });
+
+  it("PASSes RUNNING only after executing the exact digest-matched installed CLI", () => {
+    const executable = Buffer.from(`#!/usr/bin/env bun
+      if (process.argv.includes("--version")) {
+        process.stdout.write("9.9.9\\n");
+        process.exit(0);
+      }
+      process.exit(2);
+    `);
+    const installRoot = installTree({ executable });
+
+    const report = buildShipChainReport(() => ({
+      ...receipt,
+      executable_sha256: digest(executable),
+    }), {
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(executable),
+      installRoot,
+    });
+
+    expect(rung(report, "INSTALLED").status).toBe("PASS");
+    expect(rung(report, "RUNNING")).toMatchObject({ status: "PASS" });
+    expect(report.rungs.map((entry) => `${entry.rung} ${entry.status}`)).toEqual([
+      "MERGED PASS",
+      "PUBLISHED PASS",
+      "INSTALLED PASS",
+      "RUNNING PASS",
+    ]);
+    expect(report.verified).toBe(true);
+  });
+
+  it("FAILs RUNNING when the installed CLI entrypoint is not executable", () => {
+    const executable = Buffer.from(`#!/usr/bin/env bun
+      process.stdout.write("9.9.9\\n");
+    `);
+    const installRoot = installTree({ executable });
+    chmodSync(join(installRoot, "@hasna", "repos", "dist", "cli", "index.js"), 0o644);
+
+    const report = buildShipChainReport(() => ({
+      ...receipt,
+      executable_sha256: digest(executable),
+    }), {
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(executable),
+      installRoot,
+    });
+
+    expect(rung(report, "INSTALLED").status).toBe("PASS");
+    expect(rung(report, "RUNNING").status).toBe("FAIL");
+    expect(report.verified).toBe(false);
+  });
+
+  it("FAILs RUNNING when the installed repos bin link is broken", () => {
+    const executable = Buffer.from(`#!/usr/bin/env bun
+      process.stdout.write("9.9.9\\n");
+    `);
+    const installRoot = installTree({ executable });
+    const binPath = join(installRoot, ".bin", "repos");
+    unlinkSync(binPath);
+    symlinkSync("../@hasna/repos/dist/cli/missing.js", binPath);
+
+    const report = buildShipChainReport(() => ({
+      ...receipt,
+      executable_sha256: digest(executable),
+    }), {
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(executable),
+      installRoot,
+    });
+
+    expect(rung(report, "INSTALLED").status).toBe("PASS");
+    expect(rung(report, "RUNNING").status).toBe("FAIL");
+    expect(report.verified).toBe(false);
+  });
+
+  it("executes RUNNING through one verified descriptor instead of reopening the pathname", () => {
+    const executable = Buffer.from(`#!/usr/bin/env bun
+      import { readlinkSync } from "node:fs";
+      const descriptor = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
+      let pinned = false;
+      try {
+        pinned = readlinkSync(descriptor).endsWith("/@hasna/repos/dist/cli/index.js");
+      } catch {}
+      process.stdout.write(pinned ? "9.9.9\\n" : "descriptor-missing\\n");
+    `);
+    const installRoot = installTree({ executable });
+
+    const report = buildShipChainReport(() => ({
+      ...receipt,
+      executable_sha256: digest(executable),
+    }), {
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(executable),
+      installRoot,
+    });
+
+    expect(rung(report, "INSTALLED").status).toBe("PASS");
+    expect(rung(report, "RUNNING")).toMatchObject({ status: "PASS" });
+    expect(report.verified).toBe(true);
+  });
+
+  it("FAILs RUNNING when the installed bytes match but the exact CLI cannot execute", () => {
+    const executable = Buffer.from(`throw new Error("fixture cannot run");`);
+    const installRoot = installTree({ executable });
+
+    const report = buildShipChainReport(() => ({
+      ...receipt,
+      executable_sha256: digest(executable),
+    }), {
+      expectedCommit: commit,
+      expectedExecutableSha256: digest(executable),
+      installRoot,
+    });
+
+    expect(rung(report, "INSTALLED").status).toBe("PASS");
+    expect(rung(report, "RUNNING").status).toBe("FAIL");
+    expect(report.verified).toBe(false);
+  });
+
+  it("FAILs RUNNING for a commit that was never deployed to this host", () => {
+    const executable = Buffer.from(`#!/usr/bin/env bun
+      if (process.argv.includes("--version")) {
+        process.stdout.write("9.9.9\\n");
+        process.exit(0);
+      }
+      process.exit(2);
+    `);
+    const installRoot = installTree({ executable });
+    const neverDeployedCommit = "f".repeat(40);
+
+    const report = buildShipChainReport(
+      () => ({
+        ...receipt,
+        exact_commit: neverDeployedCommit,
+        executable_sha256: digest(executable),
+      }),
+      {
+        expectedCommit: neverDeployedCommit,
+        expectedExecutableSha256: digest(executable),
+        installRoot,
+      },
+    );
+
+    expect(rung(report, "INSTALLED").status).toBe("FAIL");
+    expect(rung(report, "RUNNING").status).toBe("FAIL");
+    expect(report.verified).toBe(false);
   });
 });
 

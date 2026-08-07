@@ -54,9 +54,16 @@ describe("entrypoint help/version flags", () => {
   test("release verifier exposes help and version without requiring verification options", () => {
     const help = runScript("src/release/verify-provenance.ts", "--help");
     const version = runScript("src/release/verify-provenance.ts", "--version");
+    const helpOutput = new TextDecoder().decode(help.stdout);
 
     expect(help.exitCode).toBe(0);
-    expect(new TextDecoder().decode(help.stdout)).toContain("Usage: repos-verify-release [options]");
+    expect(helpOutput).toContain("Usage: repos-verify-release [options]");
+    for (const name of ["MERGED", "PUBLISHED", "INSTALLED", "RUNNING"]) {
+      expect(helpOutput).toContain(name);
+    }
+    expect(helpOutput).toContain("freshly launched that exact installed CLI with --version");
+    expect(helpOutput).toContain("digest matched before and after execution");
+    expect(helpOutput).not.toContain("NOT IMPLEMENTED");
     expect(version.exitCode).toBe(0);
     expect(new TextDecoder().decode(version.stdout).trim()).toBe(PACKAGE_VERSION);
   });
