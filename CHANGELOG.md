@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.42
+
+Fixes `repos repo --remote <org>/<name>` resolving to a stale `_factory_src` scratch clone at
+exit code 0 while reporting it healthy (todos c0ac7e9b-8df1-4cd6-9e65-55e3b626b8f0).
+
+- `getRepoByRemote` now drops foreign copies — a separate clone of the remote, with its own
+  object store and its own HEAD (`_factory_src`, `/dev/shm`) — before every other rule, so a
+  hollow canonical checkout can no longer leave a mirror as the sole surviving candidate.
+- A worktree is explicitly NOT a foreign copy: it is another view of the same clone, so a live
+  worktree still wins over a hollow primary, which is what the previous ordering existed for.
+- When every indexed checkout of a remote is foreign, the lookup returns null rather than
+  scratch data, matching the by-name contract `getRepo` already follows. Measured on the
+  station01 registry: zero remotes are made up only of foreign copies.
+- Regressions assert both directions, at the unit level with injected usability and end to end
+  through the CLI over real git fixtures, plus the unresolved-`--remote` exit status.
+
 ## 0.1.41
 
 Fixes `repos search <query>` crashing when user input contains hyphens or embedded double
