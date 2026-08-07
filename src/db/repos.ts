@@ -180,8 +180,10 @@ export class AmbiguousRemoteError extends Error {
  * first. Automation needs a lookup that either matches exactly or fails.
  *
  * Accepts `github.com/org/name`, `org/name`, or any supported remote URL form.
- * Returns null when nothing matches, and throws when a single remote has
- * multiple local checkouts and no primary can be distinguished.
+ * Returns null when nothing matches — including when every indexed checkout of
+ * the remote is a foreign scratch clone (see `FOREIGN_COPY_SEGMENTS`) — and
+ * throws when a single remote has multiple local checkouts and no primary can
+ * be distinguished.
  */
 export function getRepoByRemote(
   remote: string,
@@ -196,7 +198,26 @@ export function getRepoByRemote(
     .query("SELECT * FROM repos WHERE remote_url = ? COLLATE NOCASE ORDER BY id ASC")
     .all(normalized) as Repo[]).map(sanitizeRepoForOutput);
   if (rows.length === 0) return null;
-  if (opts.allowAmbiguous) return rows[0]!;
+
+  // A FOREIGN COPY — a `_factory_src` scratch clone or a `/dev/shm` build copy —
+  // is dropped here, before every other rule, because it is a separate
+  // repository that merely shares this remote and can be arbitrarily stale.
+  // Dropping it FIRST is the whole fix for todos c0ac7e9b: previously the
+  // usability filter below removed a hollow canonical checkout, left the mirror
+  // as the sole candidate, and the single-candidate early return handed it back
+  // at exit code 0 with `checkout_health: usable` — a two-and-a-half-month-old
+  // tree reported as the answer. Note this cannot be fixed by moving the
+  // derived-path filter further down instead: a worktree is derived too, and a
+  // live worktree winning over a hollow primary is deliberate.
+  const own = rows.filter((row) => !isForeignCheckoutPath(row.path));
+  // Every checkout of the remote is a scratch clone. Refuse, as the by-name
+  // lookup in `getRepo` already does, rather than hand back scratch data under
+  // an exact-match contract; the caller's not-found path is a message it can
+  // act on, and `listReposByRemote` still enumerates the rows. Measured
+  // read-only on the station01 registry 2026-08-07: 60 foreign rows across 60
+  // of 283 remotes, and ZERO remotes made up only of them.
+  if (own.length === 0) return null;
+  if (opts.allowAmbiguous) return own[0]!;
 
   // A row whose path git cannot open is never the right answer while a working
   // checkout of the same remote exists. On this machine 1056 of 1581 rows are in
@@ -205,11 +226,11 @@ export function getRepoByRemote(
   // hand. Narrow to what actually works FIRST, before preferring a primary
   // clone over a derived copy: a live worktree beats a hollow primary.
   const isUsable = opts.isUsableCheckout ?? ((path: string) => classifyCheckout(path).usable);
-  const usable = rows.filter((row) => isUsable(row.path));
+  const usable = own.filter((row) => isUsable(row.path));
   // When nothing is usable, keep answering from the full set: the caller still
   // needs the row to be told what is wrong with it, and the CLI reports the
   // health verdict rather than pretending the path works.
-  const candidates = usable.length > 0 ? usable : rows;
+  const candidates = usable.length > 0 ? usable : own;
   if (candidates.length === 1) return candidates[0]!;
 
   // A worktree or throwaway build copy is never the answer when a real checkout
@@ -233,6 +254,29 @@ const DERIVED_CHECKOUT_SEGMENTS = ["worktrees", ".worktrees", "_factory_src"] as
 const DERIVED_CHECKOUT_PREFIXES = ["/dev/shm/"] as const;
 
 /**
+ * The subset of the markers above that identifies a SEPARATE CLONE of the
+ * remote rather than another view of the same clone.
+ *
+ * "Derived" covers two things that behave nothing alike when a caller asks
+ * "where is this remote checked out":
+ *   - a WORKTREE shares the canonical checkout's object store, so its HEAD
+ *     cannot silently drift away from the repository it belongs to. A live
+ *     worktree beating a hollow primary is correct, and `getRepoByRemote`
+ *     depends on it.
+ *   - a `_factory_src` factory scratch clone or a `/dev/shm` build copy is its
+ *     OWN repository with its OWN object store and its own HEAD, which goes
+ *     stale the moment nothing refreshes it — measured at two and a half months
+ *     on `_factory_src/iapp-takumi` (todos c0ac7e9b). It is never the answer,
+ *     not even when it is the only row git can open, because "the only copy I
+ *     can read" and "the copy you asked for" are different claims.
+ *
+ * Declared as a subset of `DERIVED_CHECKOUT_SEGMENTS` so that renaming a marker
+ * there fails to typecheck here rather than silently emptying this predicate.
+ */
+const FOREIGN_COPY_SEGMENTS: readonly (typeof DERIVED_CHECKOUT_SEGMENTS)[number][] = ["_factory_src"];
+const FOREIGN_COPY_PREFIXES: readonly (typeof DERIVED_CHECKOUT_PREFIXES)[number][] = ["/dev/shm/"];
+
+/**
  * SQLite's LIKE is ASCII case-insensitive and treats `%` and `_` as wildcards.
  * Every marker embedded in a LIKE pattern below is run through
  * `escapeLikeMarker()` first (with a matching `ESCAPE '\'` clause), so a
@@ -253,14 +297,35 @@ for (const marker of [...DERIVED_CHECKOUT_SEGMENTS, ...DERIVED_CHECKOUT_PREFIXES
   assertLikeSafeMarker(marker);
 }
 
-/** Paths that are copies of a checkout rather than the checkout itself. */
-export function isDerivedCheckoutPath(path: string): boolean {
+/**
+ * A path matches when a segment marker appears as a whole path segment, or a
+ * prefix marker starts the path. Shared by both predicates below so the two
+ * cannot drift into different definitions of the same match.
+ */
+function matchesCheckoutMarkers(
+  path: string,
+  segments: readonly string[],
+  prefixes: readonly string[],
+): boolean {
   const lower = path.toLowerCase();
-  const segments = DERIVED_CHECKOUT_SEGMENTS.some((segment) => {
+  const hasSegment = segments.some((segment) => {
     const escaped = segment.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`(^|/)${escaped}/`).test(lower);
   });
-  return segments || DERIVED_CHECKOUT_PREFIXES.some((prefix) => lower.startsWith(prefix.toLowerCase()));
+  return hasSegment || prefixes.some((prefix) => lower.startsWith(prefix.toLowerCase()));
+}
+
+/** Paths that are copies of a checkout rather than the checkout itself. */
+export function isDerivedCheckoutPath(path: string): boolean {
+  return matchesCheckoutMarkers(path, DERIVED_CHECKOUT_SEGMENTS, DERIVED_CHECKOUT_PREFIXES);
+}
+
+/**
+ * Paths that are a SEPARATE clone of the remote — a strict subset of
+ * `isDerivedCheckoutPath`. See `FOREIGN_COPY_SEGMENTS` for why the two differ.
+ */
+export function isForeignCheckoutPath(path: string): boolean {
+  return matchesCheckoutMarkers(path, FOREIGN_COPY_SEGMENTS, FOREIGN_COPY_PREFIXES);
 }
 
 /**

@@ -261,6 +261,46 @@ describe("--remote prefers a checkout that works", () => {
       .toBe("hollow-git-dir");
   });
 
+  test("never resolves to a _factory_src mirror, even when it is the only checkout git can open (todos c0ac7e9b)", () => {
+    // Measured on the live registry 2026-08-07, repos 0.1.40:
+    //   repos repo --remote hasnaxyz/iapp-takumi --json
+    //     rc=0  path .../_factory_src/iapp-takumi  checkout_health usable  HEAD 2026-05-24
+    // A separate clone, two and a half months stale, returned as success. The
+    // usability filter dropped the hollow canonical, and the single-candidate
+    // early return fired before the derived-path exclusion could reject it.
+    tempDir = mkdtempSync(join(tmpdir(), "repos-guard-remote-mirror-"));
+    const gutted = makeHollowCheckout("iapp-takumi");
+    const mirror = makeCheckout("_factory_src/iapp-takumi");
+    const dbPath = seed([
+      { name: "iapp-takumi", path: gutted, remote: "github.com/hasnaxyz/iapp-takumi" },
+      { name: "iapp-takumi", path: mirror, remote: "github.com/hasnaxyz/iapp-takumi" },
+    ]);
+
+    const result = runCli(dbPath, ["repo", "--remote", "github.com/hasnaxyz/iapp-takumi", "--json"]);
+    const record = JSON.parse(result.stdout) as { path: string; checkout_health: { state: string } };
+    expect(record.path).not.toBe(mirror);
+    expect(record.path).toBe(gutted);
+    // And the hollow canonical it does return is reported as broken rather than
+    // as success, which is the whole difference from the measured behaviour.
+    expect(record.checkout_health.state).toBe("hollow-git-dir");
+    expect(result.code).toBe(1);
+  });
+
+  test("exits non-zero and names the remote when nothing matches (todos c0ac7e9b, original title)", () => {
+    // The row was filed as "--remote EXITS 0 WHILE REFUSING to resolve", so the
+    // refusal's exit status is pinned here rather than left to be re-measured.
+    tempDir = mkdtempSync(join(tmpdir(), "repos-guard-remote-missing-"));
+    const dbPath = seed([{ name: "open-thing", path: makeCheckout("open-thing"), remote: "github.com/hasna/thing" }]);
+
+    const hit = runCli(dbPath, ["repo", "--remote", "github.com/hasna/thing", "--json"]);
+    expect(hit.code).toBe(0);
+
+    const miss = runCli(dbPath, ["repo", "--remote", "github.com/hasna/no-such-repo", "--json"]);
+    expect(miss.code).toBe(1);
+    expect(miss.stderr).toContain("No indexed repo has remote 'github.com/hasna/no-such-repo'");
+    expect(miss.stdout).toBe("");
+  });
+
   test("reports the remote as ambiguous only among checkouts that work", () => {
     tempDir = mkdtempSync(join(tmpdir(), "repos-guard-remote-ambiguous-"));
     const one = makeCheckout("live-one");

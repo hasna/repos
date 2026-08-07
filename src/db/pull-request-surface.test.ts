@@ -13,6 +13,7 @@ import {
   countRepos,
   listPullRequestsWithRepo,
   isDerivedCheckoutPath,
+  isForeignCheckoutPath,
   assertLikeSafeMarker,
   AmbiguousRemoteError,
   type PullRequestInput,
@@ -422,6 +423,86 @@ describe("deterministic repo targeting", () => {
 
     expect(() => getRepoByRemote("github.com/hasna/codewith")).toThrow(AmbiguousRemoteError);
     expect(getRepoByRemote("github.com/hasna/codewith", { allowAmbiguous: true })!.path).toBe("/w/one");
+  });
+});
+
+/**
+ * todos c0ac7e9b (A3-00208). `repos repo --remote hasnaxyz/iapp-takumi` returned
+ * `_factory_src/iapp-takumi` — a mirror whose HEAD was two and a half months
+ * stale — at exit code 0, reporting `checkout_health: usable`. A refusal you can
+ * see is survivable; a confident wrong answer is not.
+ *
+ * Precondition: the canonical checkout is hollow (unusable) AND a `_factory_src`
+ * mirror of the same remote is indexed. The usability filter dropped the hollow
+ * canonical, leaving exactly one candidate, and the single-candidate early
+ * return fired BEFORE the derived-path exclusion could reject the mirror.
+ *
+ * Both directions are asserted here, because the obvious fix — moving the
+ * existing derived-path exclusion above the early return — passes the first and
+ * breaks the second. A worktree is "derived" too, and it is a legitimate answer.
+ */
+describe("a foreign clone is never the answer for a remote (todos c0ac7e9b)", () => {
+  /** The takumi shape: hollow canonical, live mirror. */
+  const hollowCanonicalLiveMirror = { isUsableCheckout: (path: string) => path.includes("_factory_src") };
+  /** The same shape with a worktree in the mirror's place. */
+  const hollowCanonicalLiveWorktree = { isUsableCheckout: (path: string) => path.includes("worktrees") };
+
+  it("does not resolve to a _factory_src mirror when the canonical checkout is hollow", () => {
+    upsertRepo({ path: "/w/hasnaxyz/iapp-takumi", name: "iapp-takumi", org: "hasnaxyz", remote_url: "github.com/hasnaxyz/iapp-takumi" });
+    upsertRepo({ path: "/w/hasna/opensource/_factory_src/iapp-takumi", name: "iapp-takumi", org: "hasnaxyz", remote_url: "github.com/hasnaxyz/iapp-takumi" });
+
+    // The hollow canonical is still the right row to hand back: the caller needs
+    // it to be told what is wrong with it, and the CLI exits non-zero on the
+    // health verdict. What it must never be is the mirror.
+    expect(getRepoByRemote("hasnaxyz/iapp-takumi", hollowCanonicalLiveMirror)!.path)
+      .toBe("/w/hasnaxyz/iapp-takumi");
+  });
+
+  it("STILL resolves to a live worktree when the canonical checkout is hollow", () => {
+    // The direction a naive reorder breaks. A worktree shares the canonical
+    // repo's object store — it is another view of the same clone, not a stale
+    // copy of it — so beating a hollow primary is correct and must keep working.
+    upsertRepo({ path: "/w/open-thing", name: "open-thing", org: "hasna", remote_url: "github.com/hasna/thing" });
+    upsertRepo({ path: "/home/u/.hasna/repos/worktrees/thing/pr1", name: "pr1", org: "hasna", remote_url: "github.com/hasna/thing" });
+
+    expect(getRepoByRemote("hasna/thing", hollowCanonicalLiveWorktree)!.path)
+      .toBe("/home/u/.hasna/repos/worktrees/thing/pr1");
+  });
+
+  it("still resolves a healthy canonical checkout past both a worktree and a mirror", () => {
+    upsertRepo({ path: "/w/open-loops", name: "open-loops", org: "hasna", remote_url: "github.com/hasna/loops" });
+    upsertRepo({ path: "/home/u/.hasna/repos/worktrees/loops/pr1", name: "pr1", org: "hasna", remote_url: "github.com/hasna/loops" });
+    upsertRepo({ path: "/w/_factory_src/loops", name: "loops", org: "hasna", remote_url: "github.com/hasna/loops" });
+
+    expect(getRepoByRemote("hasna/loops", { isUsableCheckout: () => true })!.path).toBe("/w/open-loops");
+    // Nothing is hidden: every checkout is still enumerable by remote.
+    expect(listReposByRemote("hasna/loops")).toHaveLength(3);
+  });
+
+  it("returns null rather than a scratch clone when every checkout is foreign", () => {
+    // Measured read-only on the station01 registry 2026-08-07: 60 of 1219 rows
+    // with a remote are foreign copies, spread over 60 of 283 remotes, and ZERO
+    // remotes consist only of them — so this refusal takes nothing away there.
+    // It matches getRepo()'s by-name contract, which already returns null rather
+    // than hand back scratch-clone data.
+    upsertRepo({ path: "/w/_factory_src/otp", name: "otp", org: "hasna", remote_url: "github.com/hasna/otp" });
+    upsertRepo({ path: "/dev/shm/build/otp", name: "otp", org: "hasna", remote_url: "github.com/hasna/otp" });
+
+    expect(getRepoByRemote("hasna/otp", { isUsableCheckout: () => true })).toBeNull();
+    // allowAmbiguous opts out of the ambiguity THROW, not into scratch data.
+    expect(getRepoByRemote("hasna/otp", { allowAmbiguous: true })).toBeNull();
+    // The rows themselves remain reachable by remote and by exact path.
+    expect(listReposByRemote("hasna/otp")).toHaveLength(2);
+  });
+
+  it("classifies foreign copies as a strict subset of derived checkouts", () => {
+    expect(isForeignCheckoutPath("/home/u/workspace/hasna/opensource/_factory_src/loops")).toBe(true);
+    expect(isForeignCheckoutPath("/DEV/SHM/build/codewith")).toBe(true);
+    // A worktree is derived but NOT foreign — that gap is the whole fix.
+    expect(isForeignCheckoutPath("/home/u/.hasna/repos/worktrees/codewith/a")).toBe(false);
+    expect(isDerivedCheckoutPath("/home/u/.hasna/repos/worktrees/codewith/a")).toBe(true);
+    expect(isForeignCheckoutPath("/home/u/workspace/open-codewith")).toBe(false);
+    expect(isForeignCheckoutPath("/home/u/workspace/_factory_srcish/loops")).toBe(false);
   });
 });
 
