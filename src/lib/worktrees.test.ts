@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { closeDb, getDb } from "../db/database.js";
 import {
   WorktreeError,
@@ -72,7 +72,12 @@ function commit(repoPath: string, file: string, body: string): string {
  * An origin plus a clone of it, a registry row for the clone, and a worktree
  * root — the minimum shape every verb operates on.
  */
-function seed(opts: { repoName?: string; withOrigin?: boolean } = {}) {
+function seed(opts: {
+  repoName?: string;
+  withOrigin?: boolean;
+  cloneRelativePath?: string;
+  indexedRemote?: string;
+} = {}) {
   const repoName = opts.repoName ?? "open-fixture";
   tempDir = mkdtempSync(join(tmpdir(), "repos-worktree-"));
   const root = join(tempDir, "worktrees");
@@ -88,7 +93,8 @@ function seed(opts: { repoName?: string; withOrigin?: boolean } = {}) {
   git(seedPath, ["remote", "add", "origin", originPath]);
   git(seedPath, ["push", "-u", "origin", "main"]);
 
-  const clonePath = join(tempDir, "clone");
+  const clonePath = join(tempDir, opts.cloneRelativePath ?? "clone");
+  mkdirSync(dirname(clonePath), { recursive: true });
   if (opts.withOrigin === false) {
     git(tempDir, ["clone", originPath, clonePath]);
     git(clonePath, ["remote", "remove", "origin"]);
@@ -100,7 +106,7 @@ function seed(opts: { repoName?: string; withOrigin?: boolean } = {}) {
   const db = getDb(dbPath);
   db.prepare(
     "INSERT INTO repos (path, name, org, remote_url, default_branch, updated_at) VALUES (?, ?, 'hasna', ?, 'main', ?)",
-  ).run(clonePath, repoName, `github.com/hasna/${repoName}`, "2026-07-01 00:00:00");
+  ).run(clonePath, repoName, opts.indexedRemote ?? `github.com/hasna/${repoName}`, "2026-07-01 00:00:00");
 
   return { root, originPath, seedPath, clonePath, dbPath, db, repoName, firstSha };
 }
@@ -180,6 +186,20 @@ describe("worktree name and path computation", () => {
 });
 
 describe("addWorktree", () => {
+  test("refuses a mismatched managed checkout before creating a branch, directory, or lease", () => {
+    const { root, clonePath, db } = seed({
+      repoName: "iapp-fixture",
+      cloneRelativePath: join("workspace", "hasnaxyz", "internalapp", "iapp-fixture"),
+      indexedRemote: "github.com/hasna/fixture",
+    });
+
+    expect(codeOf(() => addWorktree({ repo: clonePath, name: "identity-mismatch" })))
+      .toBe("REPO_IDENTITY_MISMATCH");
+    expect(readdirSync(root)).toEqual([]);
+    expect(git(clonePath, ["branch", "--list", "identity-mismatch"])).toBe("");
+    expect((db.query("SELECT COUNT(*) AS count FROM worktree_leases").get() as { count: number }).count).toBe(0);
+  });
+
   test("places the worktree at the computed canonical path and records a lease", () => {
     const { root, clonePath, repoName } = seed();
     const result = addWorktree({ repo: repoName, task: "a321ba13" });

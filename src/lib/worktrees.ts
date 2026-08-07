@@ -64,7 +64,12 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getDb } from "../db/database.js";
-import { AmbiguousRepoNameError, getRepo, isDerivedCheckoutPath } from "../db/repos.js";
+import {
+  AmbiguousRepoNameError,
+  RepoIdentityMismatchError,
+  getRepo,
+  isDerivedCheckoutPath,
+} from "../db/repos.js";
 import type { Repo } from "../types/index.js";
 import { resolveTrustedAccountHome } from "./account-home.js";
 import { classifyCheckout, describeCheckoutRemedy } from "./checkout-health.js";
@@ -100,6 +105,7 @@ export type WorktreeErrorCode =
   | "BRANCH_EXISTS"
   | "REPO_NOT_FOUND"
   | "AMBIGUOUS_REPO"
+  | "REPO_IDENTITY_MISMATCH"
   | "PARENT_CHECKOUT_BROKEN"
   | "WORKTREE_PATH_OCCUPIED"
   | "PATH_OUTSIDE_ROOT"
@@ -357,6 +363,9 @@ function resolveRepo(input: string): Repo {
   } catch (error) {
     if (error instanceof AmbiguousRepoNameError) {
       fail("AMBIGUOUS_REPO", error.message, { repo: input });
+    }
+    if (error instanceof RepoIdentityMismatchError) {
+      fail("REPO_IDENTITY_MISMATCH", error.message, { repo: input, path: error.mismatch.path });
     }
     throw error;
   }

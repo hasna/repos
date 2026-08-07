@@ -208,14 +208,20 @@ export function getManagedRepoIdentityMismatch(repo: Repo): RepoIdentityMismatch
   };
 }
 
+function requireManagedRepoIdentity(repo: Repo): Repo {
+  const mismatch = getManagedRepoIdentityMismatch(repo);
+  if (mismatch) throw new RepoIdentityMismatchError(mismatch);
+  return repo;
+}
+
 export function getRepo(idOrPath: string | number): Repo | null {
   const db = getDb();
   if (typeof idOrPath === "number") {
     const row = db.query("SELECT * FROM repos WHERE id = ?").get(idOrPath) as Repo | null;
-    return row ? sanitizeRepoForOutput(row) : null;
+    return row ? requireManagedRepoIdentity(sanitizeRepoForOutput(row)) : null;
   }
   const byPath = db.query("SELECT * FROM repos WHERE path = ?").get(idOrPath) as Repo | null;
-  if (byPath) return sanitizeRepoForOutput(byPath);
+  if (byPath) return requireManagedRepoIdentity(sanitizeRepoForOutput(byPath));
 
   const primary = (db
     .query(`SELECT * FROM repos WHERE name = ? AND ${nonDerivedCheckoutSql("path")} ORDER BY id`)
