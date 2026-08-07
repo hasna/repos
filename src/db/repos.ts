@@ -403,11 +403,20 @@ export function deleteRepo(id: number): boolean {
   return result.changes > 0;
 }
 
+function buildFtsQuery(query: string): string {
+  return query
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((term) => `"${term.replaceAll('"', '""')}"`)
+    .join(" ");
+}
+
 export function searchRepos(query: string, limit = 20): Repo[] {
   const db = getDb();
   const ids = db
     .query("SELECT rowid FROM fts_repos WHERE fts_repos MATCH ? LIMIT ?")
-    .all(query, limit) as { rowid: number }[];
+    .all(buildFtsQuery(query), limit) as { rowid: number }[];
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
   return (db.query(`SELECT * FROM repos WHERE id IN (${placeholders})`).all(...ids.map((r) => r.rowid)) as Repo[])
@@ -460,7 +469,7 @@ export function searchCommits(query: string, limit = 20): Array<Commit & { repo_
     WHERE fts_commits MATCH ?
     ORDER BY c.date DESC
     LIMIT ?
-  `).all(query, limit) as Array<Commit & { repo_name: string; repo_path: string }>;
+  `).all(buildFtsQuery(query), limit) as Array<Commit & { repo_name: string; repo_path: string }>;
 }
 
 // ── Branches ──
@@ -927,7 +936,7 @@ export function searchPullRequests(query: string, limit = 20): Array<PullRequest
     WHERE fts_prs MATCH ?
     ORDER BY pr.created_at DESC
     LIMIT ?
-  `).all(query, limit) as Array<PullRequest & { repo_name: string }>;
+  `).all(buildFtsQuery(query), limit) as Array<PullRequest & { repo_name: string }>;
 }
 
 // ── Unified Search ──
