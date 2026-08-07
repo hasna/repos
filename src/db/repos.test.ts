@@ -412,6 +412,53 @@ describe("pull requests", () => {
   });
 });
 
+describe("FTS query escaping", () => {
+  it("treats embedded double quotes as literal input across search surfaces", () => {
+    const repo = upsertRepo({
+      path: "/tmp/quoted-search",
+      name: "quoted-search",
+      description: 'handle "quoted" repository search',
+    });
+    bulkInsertCommits([
+      {
+        repo_id: repo.id,
+        sha: "quoted-commit",
+        author_name: "Test",
+        author_email: "test@test.com",
+        date: "2026-01-01T00:00:00Z",
+        message: 'handle "quoted" commit search',
+        files_changed: 1,
+        insertions: 1,
+        deletions: 0,
+      },
+    ]);
+    bulkInsertPullRequests([
+      {
+        repo_id: repo.id,
+        number: 42,
+        title: 'handle "quoted" pull request search',
+        state: "open",
+        author: "test",
+        created_at: "2026-01-01",
+        updated_at: null,
+        merged_at: null,
+        closed_at: null,
+        url: "",
+        base_branch: "main",
+        head_branch: "quoted-search",
+        additions: 1,
+        deletions: 0,
+        changed_files: 1,
+      },
+    ]);
+
+    const query = 'handle "quoted"';
+    expect(searchRepos(query).map((result) => result.name)).toEqual(["quoted-search"]);
+    expect(searchCommits(query).map((result) => result.sha)).toEqual(["quoted-commit"]);
+    expect(searchPullRequests(query).map((result) => result.number)).toEqual([42]);
+  });
+});
+
 describe("unified search", () => {
   it("should search across entities", () => {
     const repo = upsertRepo({ path: "/tmp/test-platform", name: "test-platform", description: "platform for testing" });
