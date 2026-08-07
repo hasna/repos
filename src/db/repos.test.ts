@@ -237,6 +237,18 @@ describe("repos", () => {
     expect(results[0]!.name).toBe("open-todos");
   });
 
+  it("treats punctuation in repo search queries as literal text", () => {
+    upsertRepo({
+      path: "/tmp/repo-project-familiarization",
+      name: "repo-project-familiarization",
+      description: "repository familiarization",
+    });
+
+    expect(searchRepos("repo-project-familiarization").map((repo) => repo.name))
+      .toEqual(["repo-project-familiarization"]);
+    expect(searchRepos("missing-repo-project-familiarization")).toEqual([]);
+  });
+
   it("sanitizes contaminated direct rows at list, get, FTS search, and unified search outputs", () => {
     const unsafe = `https://${["member", "phrase"].join(":")}@git.example.test/team/tool.git?query=marker#fragment`;
     db.query("INSERT INTO repos (path, name, remote_url) VALUES ('/tmp/unsafe', 'unsafeoutput', ?)").run(unsafe);
